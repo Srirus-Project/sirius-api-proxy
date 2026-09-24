@@ -9,11 +9,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::{header::HeaderMap, Request};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
-};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
@@ -57,7 +54,7 @@ struct State {
 
 pub struct GameClient {
     config: Config,
-    http: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    http: Client<crate::transport::TlsConnector, Full<Bytes>>,
     protocol: RwLock<Arc<ProtocolBundle>>,
     reload_lock: Mutex<()>,
     accounts: std::sync::Mutex<crate::accounts::Pool>,
@@ -88,11 +85,20 @@ impl GameClient {
         let builder = HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
             .map_err(|_| AppError::Config("TLS provider initialization failed"))?;
+        let transport = crate::transport::Connector::new(&config.upstream)?;
         let connector = if test_http {
-            builder.https_or_http().enable_http2().build()
+            builder
+                .https_or_http()
+                .enable_http2()
+                .wrap_connector(transport)
         } else {
-            builder.https_only().enable_http2().build()
+            builder
+                .https_only()
+                .enable_http2()
+                .wrap_connector(transport)
         };
+        let connector =
+            crate::transport::TlsConnector::new(connector, config.upstream.connect_timeout_ms);
         let http = Client::builder(TokioExecutor::new())
             .http2_only(true)
             .build(connector);
@@ -555,7 +561,7 @@ impl GameClient {
                     .map_err(|_| AppError::Protocol)?,
             )
             .await
-            .map_err(|_| AppError::Transport)?;
+            .map_err(crate::transport::classify)?;
         let http_ok = response.status().is_success();
         let mut metadata = response.headers().clone();
         let content_ok = header(&metadata, "content-type")

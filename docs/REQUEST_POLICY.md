@@ -7,6 +7,7 @@ Master CDN downloads have their separate existing limits.
 
 | Field | Default | Allowed values |
 | --- | --- | --- |
+| `connect_timeout_ms` | 10000 | 100..300000 |
 | `timeout_ms` | 20000 | 100..300000 |
 | `max_response_bytes` | 8388608 | 1024..134217728 |
 | `max_inflight` | 64 | 1..4096 |
@@ -44,5 +45,5 @@ does not penalize account health. This policy does not add registration or mutat
 
 No real credentials are needed for policy tests: local HTTP/2 fixtures verify exact
 attempt counts, deadline headers, admission behavior and valid oversized wire data.
-HTTP proxy transport, inbound TLS, access logs and forwarding trust remain separate
-restoration items; this configuration does not claim to implement them.
+Optional [HTTP/HTTPS CONNECT transport](UPSTREAM_PROXY.md) is configured in the same
+regional block. Inbound TLS, access logs and forwarding trust remain separate restoration items.

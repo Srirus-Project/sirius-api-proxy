@@ -25,6 +25,8 @@ pub enum AppError {
     Timeout,
     #[error("upstream transport failed")]
     Transport,
+    #[error("upstream proxy rejected connection")]
+    Proxy,
     #[error("invalid upstream protocol response")]
     Protocol,
     #[error("game returned gRPC status {0}")]

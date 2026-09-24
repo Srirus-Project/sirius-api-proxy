@@ -10,6 +10,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
 - Version, announcements, public player profiles, song/event/challenge rankings and event decks.
 - Separate public API and internal administration tokens; private account responses stay internal.
 - Binary Protobuf over HTTP/2 unary gRPC with verified TLS, trailers, deadlines and response limits.
+- Optional per-region [HTTP/HTTPS outbound proxies](docs/UPSTREAM_PROXY.md) with scoped authentication.
 - Native Protobuf/JSON codecs generated at build time; compatible proto hot reload switches to
   dynamic codecs without restarting. Rebuilding restores the native path for the new definitions.
 - Master manifest verification, Rijndael-256 decryption, gzip/JSON validation, atomic snapshots,

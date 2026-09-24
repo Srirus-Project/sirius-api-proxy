@@ -3023,3 +3023,326 @@ fn cache_route_policy_rejects_unknown_or_private_routes_and_excessive_ttls() {
         yaml_serde::from_str(&format!("{prefix}  announcements: 0")).unwrap();
     disabled.validate().unwrap();
 }
+
+struct TunnelProxy {
+    url: String,
+    seen: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for TunnelProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn tunnel_proxy(response: Vec<u8>, forward: bool, delay: Duration) -> TunnelProxy {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let requests = seen.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let response = response.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut bytes = vec![];
+                while bytes.len() < 16384 && !bytes.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = stream.read_u8().await else {
+                        return;
+                    };
+                    bytes.push(byte);
+                }
+                let header = String::from_utf8(bytes).unwrap();
+                requests.lock().unwrap().push(header.clone());
+                tokio::time::sleep(delay).await;
+                if stream.write_all(&response).await.is_err() {
+                    return;
+                }
+                if forward {
+                    let address: std::net::SocketAddr =
+                        header.split_whitespace().nth(1).unwrap().parse().unwrap();
+                    assert!(address.ip().is_loopback());
+                    let mut upstream = tokio::net::TcpStream::connect(address).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                }
+            });
+        }
+    });
+    TunnelProxy { url, seen, task }
+}
+fn proxy_policy(url: &str) -> crate::config::UpstreamConfig {
+    let name = format!("TEST_PROXY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, url);
+    crate::config::UpstreamConfig {
+        proxy_url_env: Some(name),
+        ..Default::default()
+    }
+}
+#[tokio::test]
+async fn connect_proxy_preserves_http2_trailers_and_separates_proxy_and_account_headers() {
+    let proxy = tunnel_proxy(
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+        true,
+        Duration::ZERO,
+    )
+    .await;
+    let f = fixture(vec![
+        Reply::version(),
+        empty_profile_reply(),
+        unavailable_reply(),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.upstream = proxy_policy(&proxy.url);
+    let auth = format!("PROXY_AUTH_{}", uuid::Uuid::new_v4().simple());
+    let id = format!("PROXY_PLAYER_{}", uuid::Uuid::new_v4().simple());
+    let key = format!("{id}_KEY");
+    std::env::set_var(&auth, "Basic synthetic-proxy-only");
+    std::env::set_var(&id, "fixture-player");
+    std::env::set_var(&key, "fixture-account-secret");
+    cfg.upstream.proxy_authorization_env = Some(auth);
+    cfg.player_id_env = Some(id);
+    cfg.player_credential_env = Some(key);
+    let c = client(&f, cfg);
+    c.call(crate::routes::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Grpc(14))
+    ));
+    let tunnels = proxy.seen.lock().unwrap();
+    assert_eq!(tunnels.len(), 1, "HTTP/2 connection should be reused");
+    assert!(tunnels[0].starts_with(&format!(
+        "CONNECT {} HTTP/1.1\r\n",
+        f.url.strip_prefix("http://").unwrap()
+    )));
+    assert!(tunnels[0].contains("Proxy-Authorization: Basic synthetic-proxy-only\r\n"));
+    assert!(!tunnels[0].contains("fixture-account-secret"));
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[1].1["x-player-credential"], "fixture-account-secret");
+    assert!(seen
+        .iter()
+        .all(|r| !r.1.contains_key("proxy-authorization")));
+}
+#[tokio::test]
+async fn failed_proxy_never_falls_back_to_origin_and_handshake_is_bounded() {
+    for response in [
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
+        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1\r\n\r\n".to_vec(),
+        b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec(),
+        b"NOT HTTP\r\n\r\n".to_vec(),
+        [
+            b"HTTP/1.1 200 OK\r\nX: ".to_vec(),
+            vec![b'x'; 16384],
+            b"\r\n\r\n".to_vec(),
+        ]
+        .concat(),
+    ] {
+        let f = fixture(vec![]).await;
+        let proxy = tunnel_proxy(response, false, Duration::ZERO).await;
+        let mut cfg = config();
+        cfg.upstream = proxy_policy(&proxy.url);
+        cfg.upstream.anonymous_attempts = 3;
+        assert!(matches!(
+            client(&f, cfg).call(VERSION, json!({})).await,
+            Err(AppError::Proxy)
+        ));
+        assert_eq!(proxy.seen.lock().unwrap().len(), 1);
+        assert!(f.received.lock().unwrap().is_empty());
+    }
+    let f = fixture(vec![]).await;
+    let proxy = tunnel_proxy(vec![], false, Duration::from_secs(1)).await;
+    let mut cfg = config();
+    cfg.upstream = proxy_policy(&proxy.url);
+    cfg.upstream.connect_timeout_ms = 100;
+    let result = tokio::time::timeout(
+        Duration::from_millis(800),
+        client(&f, cfg).call(VERSION, json!({})),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(AppError::Transport)));
+    assert!(f.received.lock().unwrap().is_empty());
+    let mut cfg = config();
+    cfg.upstream = proxy_policy(&proxy.url);
+    cfg.upstream.timeout_ms = 100;
+    assert!(matches!(
+        client(&f, cfg).call(VERSION, json!({})).await,
+        Err(AppError::Timeout)
+    ));
+}
+#[tokio::test]
+async fn independent_clients_use_only_their_configured_proxy() {
+    let first = tunnel_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec(), true, Duration::ZERO).await;
+    let second = tunnel_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec(), true, Duration::ZERO).await;
+    let f = fixture(vec![Reply::version(), Reply::version(), Reply::version()]).await;
+    for proxy in [Some(&first), Some(&second), None] {
+        let mut cfg = config();
+        if let Some(proxy) = proxy {
+            cfg.upstream = proxy_policy(&proxy.url);
+        }
+        client(&f, cfg).call(VERSION, json!({})).await.unwrap();
+    }
+    assert_eq!(first.seen.lock().unwrap().len(), 1);
+    assert_eq!(second.seen.lock().unwrap().len(), 1);
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+#[test]
+fn proxy_configuration_rejects_unsupported_urls_and_header_injection_without_echoing_secrets() {
+    for value in [
+        "socks5://127.0.0.1:1080",
+        "http://user:secret@127.0.0.1",
+        "http://localhost/path",
+        "http://localhost?secret",
+        "https://localhost#secret",
+        " http://localhost",
+        "http://localhost\\secret",
+    ] {
+        let error = match crate::transport::Connector::new(&proxy_policy(value)) {
+            Ok(_) => panic!("invalid proxy accepted"),
+            Err(e) => e,
+        };
+        assert!(!error.to_string().contains("secret"));
+    }
+    for url in [
+        "http://127.0.0.1:8080",
+        "https://localhost:8443",
+        "http://[::1]:8080",
+    ] {
+        assert!(crate::transport::Connector::new(&proxy_policy(url)).is_ok());
+    }
+    let mut policy = crate::config::UpstreamConfig {
+        proxy_authorization_env: Some("UNUSED".into()),
+        ..Default::default()
+    };
+    assert!(policy.validate().is_err());
+    policy = proxy_policy("http://127.0.0.1:8080");
+    let name = format!("BAD_PROXY_AUTH_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, "Basic test\r\nX-Leak: secret");
+    policy.proxy_authorization_env = Some(name);
+    assert!(crate::transport::Connector::new(&policy).is_err());
+}
+
+async fn untrusted_tls_fixture() -> (String, tokio::task::JoinHandle<bool>) {
+    let cert = rustls::pki_types::CertificateDer::from(
+        include_bytes!("../tests/fixtures/untrusted-localhost.der").to_vec(),
+    );
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+        include_bytes!("../tests/fixtures/untrusted-localhost-key.der").to_vec(),
+    );
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key.into())
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(server))
+            .accept(stream)
+            .await
+            .is_err()
+    });
+    (url, task)
+}
+#[tokio::test]
+async fn proxy_and_origin_tls_both_reject_untrusted_certificates() {
+    // A proxy's TLS certificate must be checked before any CONNECT credentials.
+    let (url, rejected) = untrusted_tls_fixture().await;
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.upstream = proxy_policy(&url);
+    assert!(matches!(
+        client(&f, cfg).call(VERSION, json!({})).await,
+        Err(AppError::Transport)
+    ));
+    assert!(tokio::time::timeout(Duration::from_secs(2), rejected)
+        .await
+        .unwrap()
+        .unwrap());
+    assert!(f.received.lock().unwrap().is_empty());
+    // Origin TLS remains enabled after a successful plaintext proxy tunnel.
+    let (url, rejected) = untrusted_tls_fixture().await;
+    let proxy = tunnel_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec(), true, Duration::ZERO).await;
+    let mut cfg = config();
+    cfg.endpoint = url;
+    cfg.upstream = proxy_policy(&proxy.url);
+    let c = GameClient::new(cfg).unwrap();
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Transport)
+    ));
+    assert!(tokio::time::timeout(Duration::from_secs(2), rejected)
+        .await
+        .unwrap()
+        .unwrap());
+    assert_eq!(proxy.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn connect_authority_keeps_dns_remote_ipv6_ports_and_tunnel_bytes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower_service::Service;
+    for (target, expected) in [
+        (
+            "https://not-resolvable.invalid",
+            "not-resolvable.invalid:443",
+        ),
+        ("https://[::1]", "[::1]:443"),
+        ("https://example.invalid:9443", "example.invalid:9443"),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let policy = proxy_policy(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = vec![];
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+            }
+            assert!(String::from_utf8(header)
+                .unwrap()
+                .starts_with(&format!("CONNECT {expected} HTTP/1.1\r\n")));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\ntunnel")
+                .await
+                .unwrap();
+        });
+        let stream = crate::transport::Connector::new(&policy)
+            .unwrap()
+            .call(target.parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = TokioIo::new(stream);
+        let mut bytes = [0; 6];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"tunnel");
+        server.await.unwrap();
+    }
+}
+#[tokio::test]
+async fn origin_tls_handshake_obeys_connection_timeout() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config();
+    cfg.endpoint = format!("https://{}", listener.local_addr().unwrap());
+    cfg.upstream.connect_timeout_ms = 100;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), 22); // TLS handshake record.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let c = GameClient::new(cfg).unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(800), c.call(VERSION, json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(AppError::Transport)));
+    server.abort();
+    let _ = server.await;
+}

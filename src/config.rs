@@ -41,6 +41,9 @@ pub struct Config {
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpstreamConfig {
+    pub connect_timeout_ms: u64,
+    pub proxy_url_env: Option<String>,
+    pub proxy_authorization_env: Option<String>,
     pub timeout_ms: u64,
     pub max_response_bytes: usize,
     pub max_inflight: usize,
@@ -51,6 +54,9 @@ pub struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
+            connect_timeout_ms: 10_000,
+            proxy_url_env: None,
+            proxy_authorization_env: None,
             timeout_ms: 20_000,
             max_response_bytes: 8 * 1024 * 1024,
             max_inflight: 64,
@@ -61,7 +67,14 @@ impl Default for UpstreamConfig {
 }
 impl UpstreamConfig {
     pub fn validate(&self) -> Result<(), AppError> {
-        if !(100..=300_000).contains(&self.timeout_ms)
+        if !(100..=300_000).contains(&self.connect_timeout_ms)
+            || (self.proxy_authorization_env.is_some() && self.proxy_url_env.is_none())
+            || self.proxy_url_env.as_ref().is_some_and(|v| v.is_empty())
+            || self
+                .proxy_authorization_env
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+            || !(100..=300_000).contains(&self.timeout_ms)
             || !(1024..=128 * 1024 * 1024).contains(&self.max_response_bytes)
             || !(1..=4096).contains(&self.max_inflight)
             || !(1..=5).contains(&self.anonymous_attempts)

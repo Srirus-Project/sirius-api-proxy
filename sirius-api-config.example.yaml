@@ -39,6 +39,10 @@ account_pool:
 
 # Logical gRPC request policy, independently scoped to this region.
 upstream:
+  connect_timeout_ms: 10000
+  # Optional per-region HTTP(S) CONNECT proxy; see docs/UPSTREAM_PROXY.md.
+  # proxy_url_env: SIRIUS_JP_PROXY_URL
+  # proxy_authorization_env: SIRIUS_JP_PROXY_AUTH
   timeout_ms: 20000
   max_response_bytes: 8388608
   max_inflight: 64
