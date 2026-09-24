@@ -36,3 +36,11 @@ cdn_credential_env:
 account_pool:
   failure_threshold: 2
   cooldown_seconds: 30
+
+# Logical gRPC request policy, independently scoped to this region.
+upstream:
+  timeout_ms: 20000
+  max_response_bytes: 8388608
+  max_inflight: 64
+  anonymous_attempts: 1 # total attempts; 1 disables retries
+  retry_delay_ms: 250

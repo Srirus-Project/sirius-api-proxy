@@ -57,7 +57,7 @@ For multiple existing accounts, see [account pool and live credential rotation](
 Set `session_lock: false` to allow concurrent upstream RPCs for the same configured account;
 restart the proxy to apply the change. Upstream concurrency support is not confirmed, and
 server instability can also cause request failures. Keep the default unless testing or
-operating with that uncertainty. The 20-second request deadline includes time waiting for
+operating with that uncertainty. The default 20-second request deadline includes time waiting for
 serialization, bootstrap or protocol activation. Initial authenticated Version discovery
 remains single-flight, and protocol reload waits for all active logical calls in either mode.
 With concurrency enabled, upstream observations reflect response completion order.
@@ -132,8 +132,9 @@ Restrict internal routes at the reverse proxy as well as through their separate 
 The current JP baseline has been exercised for identity, account data, public profiles,
 announcements, song rankings, 235 Master tables and native/dynamic protocol switching.
 Event/challenge business responses and an established friendship were not covered by live testing.
-Account pooling and per-region clients are available. Multi-node coordination, response caching
-and configurable RPC retry policy remain pending in the 1.2.0 restoration ledger.
+Account pooling, per-region clients and [configurable request controls](docs/REQUEST_POLICY.md)
+are available. Multi-node coordination and response caching remain pending in the
+1.2.0 restoration ledger.
 Upstream availability is outside this service's control.
 
 ## Development and release

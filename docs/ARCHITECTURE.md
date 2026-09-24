@@ -8,7 +8,7 @@ Authenticated queries first establish the Master version; anonymous RPCs omit ac
 - `build.rs`, `src/native.rs`: generated Protobuf/JSON codecs and static RPC dispatch.
 - `src/proto_source.rs`: shared source snapshot compiler and semantic fingerprint.
 - `src/protocol.rs`: contract validation, codec selection and atomic reload.
-- `src/client.rs`: metadata, TLS, trailers, 20-second deadlines and 8 MiB response limits.
+- `src/client.rs`: metadata, TLS, trailers, configurable deadlines/concurrency/response limits and bounded anonymous retries.
 - `src/resources.rs`: compatible resource version selection and credential references.
 - `src/master.rs`, `src/rijndael.rs`: validated Master decoding and atomic local snapshots.
 - `src/master_update.rs`: manifest downloads, version rechecks, writer locking and periodic updates.

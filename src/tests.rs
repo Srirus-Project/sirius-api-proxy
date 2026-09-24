@@ -37,6 +37,7 @@ fn config() -> Config {
         endpoint: "https://api.bang-dream-on.jp".into(),
         client_version: "1.0.3".into(),
         session_lock: true,
+        upstream: Default::default(),
         api_token_env: "unused".into(),
         internal_token_env: "unused".into(),
         accounts: Vec::new(),
@@ -2472,4 +2473,167 @@ async fn pool_bootstrap_failure_and_caller_cancellation_do_not_poison_health() {
         .unwrap()
         .unwrap();
     gate.add_permits(1);
+}
+
+fn unavailable_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.trailers.insert("grpc-status", "14".parse().unwrap());
+    reply
+}
+#[tokio::test]
+async fn anonymous_retry_policy_is_bounded_and_preserves_one_deadline() {
+    let f = fixture(vec![
+        unavailable_reply(),
+        unavailable_reply(),
+        Reply::version(),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 3;
+    cfg.upstream.retry_delay_ms = 20;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    {
+        let seen = f.received.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        let budgets: Vec<u64> = seen
+            .iter()
+            .map(|r| {
+                r.1["grpc-timeout"]
+                    .to_str()
+                    .unwrap()
+                    .strip_suffix('m')
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert!(budgets[0] <= 20_000 && budgets[0] > budgets[1] && budgets[1] > budgets[2]);
+        assert!(seen
+            .iter()
+            .all(|r| !r.1.contains_key("x-player-credential")));
+        assert_ne!(seen[0].1["x-request-id"], seen[1].1["x-request-id"]);
+    }
+    let f = fixture(vec![unavailable_reply(), unavailable_reply()]).await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 2;
+    cfg.upstream.retry_delay_ms = 1;
+    assert!(matches!(
+        client(&f, cfg).call(VERSION, json!({})).await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let f = fixture(vec![unavailable_reply()]).await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 5;
+    cfg.upstream.retry_delay_ms = 1000;
+    cfg.upstream.timeout_ms = 100;
+    assert!(matches!(
+        client(&f, cfg).call(VERSION, json!({})).await,
+        Err(AppError::Timeout)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_policy_never_replays_maintenance_or_authenticated_calls() {
+    let f = fixture(vec![
+        unavailable_reply().header("x-sirius-error-code", "UNDER_MAINTENANCE")
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 5;
+    assert!(matches!(
+        client(&f, cfg).call(VERSION, json!({})).await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    let f = fixture(vec![Reply::version(), unavailable_reply()]).await;
+    let mut cfg = account_config();
+    cfg.upstream.anonymous_attempts = 5;
+    assert!(matches!(
+        client(&f, cfg)
+            .call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut first_reply = Reply::version();
+    first_reply.gate = Some(gate.clone());
+    let mut slow = Reply::version();
+    slow.delay = Duration::from_millis(400);
+    let f = fixture(vec![first_reply, slow, Reply::version()]).await;
+    let mut cfg = config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 300;
+    let c = client(&f, cfg);
+    let a = c.clone();
+    let first = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    wait_for_requests(&f, 1).await;
+    let a = c.clone();
+    let second = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert!(matches!(second.await.unwrap(), Err(AppError::Timeout)));
+    let budget: u64 = f.received.lock().unwrap()[1].1["grpc-timeout"]
+        .to_str()
+        .unwrap()
+        .strip_suffix('m')
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(budget < 250); // queue time was not reset before sending
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn configured_response_limit_is_enforced_on_valid_wire_data() {
+    let mut payload = message(
+        "app.masterdata.VersionResponse",
+        json!({"version":"fixture"}),
+    );
+    // An unknown length-delimited field is legal Protobuf; independent of decoder support.
+    payload.extend_from_slice(&[0x12, 0x80, 0x10]);
+    payload.extend(vec![b'x'; 2048]);
+    for (limit, success) in [(1024, false), (4096, true)] {
+        let mut reply = Reply::version();
+        reply.bytes = framed(payload.clone());
+        let f = fixture(vec![reply]).await;
+        let mut cfg = config();
+        cfg.upstream.max_response_bytes = limit;
+        let result = client(&f, cfg).call(VERSION, json!({})).await;
+        if success {
+            assert_eq!(result.unwrap()["version"], "fixture");
+        } else {
+            assert!(matches!(result, Err(AppError::Protocol)));
+        }
+    }
+}
+
+#[test]
+fn upstream_policy_defaults_and_bounds_are_validated() {
+    let c = config();
+    assert!(c.upstream.validate().is_ok());
+    assert_eq!(c.upstream.anonymous_attempts, 1);
+    for field in [
+        "timeout_ms",
+        "max_response_bytes",
+        "max_inflight",
+        "anonymous_attempts",
+        "retry_delay_ms",
+    ] {
+        let input = format!("{field}: 0");
+        let policy: crate::config::UpstreamConfig = yaml_serde::from_str(&input).unwrap();
+        assert!(policy.validate().is_err(), "{field}");
+    }
+    assert!(yaml_serde::from_str::<crate::config::UpstreamConfig>("ignored_option: true").is_err());
 }

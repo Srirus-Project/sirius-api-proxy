@@ -23,8 +23,6 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
-const MAX_RESPONSE: usize = 8 * 1024 * 1024;
-
 pub(crate) fn authenticated(route: &str) -> bool {
     matches!(
         route,
@@ -70,6 +68,7 @@ pub struct GameClient {
     protocol_calls: AsyncRwLock<()>,
     bootstrap_lock: Mutex<()>,
     timeout: Duration,
+    inflight: tokio::sync::Semaphore,
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
@@ -110,6 +109,8 @@ impl GameClient {
             cdn_root: config.default_cdn_root.clone(),
             credential_valid: cdn_secrets.contains_key(&config.default_cdn_root),
         };
+        let timeout = Duration::from_millis(config.upstream.timeout_ms);
+        let inflight = tokio::sync::Semaphore::new(config.upstream.max_inflight);
         Ok(Arc::new(Self {
             config,
             http,
@@ -119,7 +120,8 @@ impl GameClient {
             call_lock: Mutex::new(()),
             protocol_calls: AsyncRwLock::new(()),
             bootstrap_lock: Mutex::new(()),
-            timeout: Duration::from_secs(20),
+            timeout,
+            inflight,
             protocol: RwLock::new(Arc::new(protocol)),
             reload_lock: Mutex::new(()),
         }))
@@ -286,6 +288,10 @@ impl GameClient {
         }
         let deadline = tokio::time::Instant::now() + self.timeout;
         let result = async {
+            let _permit = tokio::time::timeout_at(deadline, self.inflight.acquire())
+                .await
+                .map_err(|_| AppError::Timeout)?
+                .map_err(|_| AppError::Transport)?;
             let _protocol_call = tokio::time::timeout_at(deadline, self.protocol_calls.read())
                 .await
                 .map_err(|_| AppError::Timeout)?;
@@ -328,14 +334,17 @@ impl GameClient {
                 {
                     let _bootstrap = self.bootstrap_lock.lock().await;
                     if self.state.lock().await.observation.master_version.is_none() {
-                        self.execute(&protocol, VERSION, json!({}), None).await?;
+                        self.execute(&protocol, VERSION, json!({}), None, deadline)
+                            .await?;
                     }
                 }
                 account_attempted = authenticated(route);
                 if route == PLAYER_DATA {
-                    self.execute(&protocol, WHOAMI, json!({}), account).await?;
+                    self.execute(&protocol, WHOAMI, json!({}), account, deadline)
+                        .await?;
                 }
-                self.execute(&protocol, route, input, account).await
+                self.execute(&protocol, route, input, account, deadline)
+                    .await
             })
             .await
             .unwrap_or(Err(AppError::Timeout));
@@ -364,7 +373,55 @@ impl GameClient {
         route: &str,
         input: Value,
         account: Option<&crate::accounts::Account>,
+        deadline: tokio::time::Instant,
     ) -> Result<Value, AppError> {
+        let attempts = if matches!(route, VERSION | ANNOUNCEMENTS | ANNOUNCEMENT | SERVER_LIST) {
+            self.config.upstream.anonymous_attempts
+        } else {
+            1
+        };
+        let mut attempt = 0;
+        loop {
+            let result = self
+                .execute_once(protocol, route, input.clone(), account, deadline)
+                .await;
+            attempt += 1;
+            if attempt >= attempts
+                || !matches!(result, Err(AppError::Transport | AppError::Grpc(14)))
+                || self.state.lock().await.observation.maintenance
+            {
+                return result;
+            }
+            // Keep retries inside the logical call's deadline, protocol generation and permit.
+            let delay = self
+                .config
+                .upstream
+                .retry_delay_ms
+                .saturating_mul(1 << (attempt - 1));
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
+    async fn execute_once(
+        &self,
+        protocol: &ProtocolBundle,
+        route: &str,
+        input: Value,
+        account: Option<&crate::accounts::Account>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, AppError> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::Timeout);
+        }
+        let grpc_timeout = format!(
+            "{}m",
+            remaining
+                .as_millis()
+                .saturating_add(u128::from(
+                    !remaining.subsec_nanos().is_multiple_of(1_000_000)
+                ))
+                .max(1)
+        );
         let encoded = protocol.encode(route, input)?;
         let mut frame = Vec::with_capacity(encoded.len() + 5);
         frame.push(0);
@@ -378,7 +435,7 @@ impl GameClient {
             )
             .header("te", "trailers")
             .header("grpc-accept-encoding", "identity")
-            .header("grpc-timeout", "20S")
+            .header("grpc-timeout", grpc_timeout)
             .header("x-platform", self.config.platform().header())
             .header("x-client-version", &self.config.client_version)
             .header("x-request-id", uuid::Uuid::new_v4().to_string());
@@ -410,7 +467,8 @@ impl GameClient {
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|_| AppError::Transport)?;
             if let Some(data) = frame.data_ref() {
-                if bytes.len() + data.len() > MAX_RESPONSE {
+                if bytes.len().saturating_add(data.len()) > self.config.upstream.max_response_bytes
+                {
                     return Err(AppError::Protocol);
                 }
                 bytes.extend_from_slice(data);

@@ -18,6 +18,8 @@ pub struct Config {
     /// Serialize logical upstream calls for the configured account by default.
     #[serde(default = "default_session_lock")]
     pub session_lock: bool,
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
     pub api_token_env: String,
     pub internal_token_env: String,
     #[serde(default)]
@@ -32,6 +34,43 @@ pub struct Config {
     pub default_cdn_root: String,
     /// Exact HTTPS roots mapped to environment variable references, never secrets.
     pub cdn_credential_env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamConfig {
+    pub timeout_ms: u64,
+    pub max_response_bytes: usize,
+    pub max_inflight: usize,
+    /// Total attempts for verified anonymous read RPCs; authenticated reads never replay.
+    pub anonymous_attempts: usize,
+    pub retry_delay_ms: u64,
+}
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: 20_000,
+            max_response_bytes: 8 * 1024 * 1024,
+            max_inflight: 64,
+            anonymous_attempts: 1,
+            retry_delay_ms: 250,
+        }
+    }
+}
+impl UpstreamConfig {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(100..=300_000).contains(&self.timeout_ms)
+            || !(1024..=128 * 1024 * 1024).contains(&self.max_response_bytes)
+            || !(1..=4096).contains(&self.max_inflight)
+            || !(1..=5).contains(&self.anonymous_attempts)
+            || !(1..=10_000).contains(&self.retry_delay_ms)
+        {
+            return Err(AppError::Config(
+                "upstream request policy exceeds supported bounds",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_session_lock() -> bool {
@@ -109,6 +148,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<(), AppError> {
         crate::accounts::validate(self)?;
+        self.upstream.validate()?;
         if self.region == crate::region::Region::Cn {
             return Err(AppError::Config(
                 "cn is reserved; no verified endpoint or protocol is available",
