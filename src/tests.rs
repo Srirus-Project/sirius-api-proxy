@@ -2666,6 +2666,7 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
 
 fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
     crate::response_cache::Config::Memory {
+        stale_while_revalidate_ms: 0,
         route_ttl_ms: BTreeMap::new(),
         ttl_ms,
         max_entries: 4,
@@ -2766,6 +2767,7 @@ async fn response_cache_does_not_store_failures_or_reuse_different_inputs() {
 async fn memory_response_cache_enforces_ttl_entry_and_total_bounds() {
     use crate::response_cache::{Cache, Config};
     let c = Cache::new(Config::Memory {
+        stale_while_revalidate_ms: 0,
         route_ttl_ms: BTreeMap::new(),
         ttl_ms: 30,
         max_entries: 1,
@@ -2784,6 +2786,7 @@ async fn memory_response_cache_enforces_ttl_entry_and_total_bounds() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert!(c.get("second").await.is_none());
     assert!(Config::Memory {
+        stale_while_revalidate_ms: 0,
         route_ttl_ms: BTreeMap::new(),
         ttl_ms: 0,
         max_entries: 1,
@@ -2842,6 +2845,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     let env = format!("SIRIUS_REDIS_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&env, url);
     let c = Cache::new(Config::Redis {
+        stale_while_revalidate_ms: 0,
         route_ttl_ms: BTreeMap::from([(crate::response_cache::Route::SongRankings, 2000)]),
         url_env: env.clone(),
         namespace: "test".into(),
@@ -2882,8 +2886,31 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
         ranking_reply(20),
     ])
     .await;
+    let stale = Cache::new(Config::Redis {
+        stale_while_revalidate_ms: 200,
+        route_ttl_ms: BTreeMap::new(),
+        url_env: env.clone(),
+        namespace: "stale-test".into(),
+        ttl_ms: 20,
+        max_entry_bytes: 4096,
+        operation_timeout_ms: 100,
+    })
+    .unwrap();
+    stale.put("value".into(), &json!({"value":1})).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(stale.get("value").await.is_none());
+    assert!(stale.get_with_state("value").await.unwrap().stale);
+    let remaining: i64 = redis::cmd("PTTL")
+        .arg("stale-test:value")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((1..=200).contains(&remaining));
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    assert!(stale.get_with_state("value").await.is_none());
     let mut first_config = account_config();
     first_config.response_cache = Config::Redis {
+        stale_while_revalidate_ms: 0,
         route_ttl_ms: BTreeMap::new(),
         url_env: env,
         namespace: "client-test".into(),
@@ -2928,6 +2955,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
 async fn route_cache_ttls_expire_independently_and_zero_bypasses_rpc_cache() {
     use crate::response_cache::{Cache, Config, Route};
     let cache = Cache::new(Config::Memory {
+        stale_while_revalidate_ms: 0,
         ttl_ms: 5000,
         max_entries: 10,
         max_bytes: 8192,
@@ -4823,4 +4851,112 @@ fn asset_outbox_rotates_blocked_jobs_across_batches_and_restarts() {
     std::fs::remove_dir(&path).unwrap();
     std::fs::write(&path, before).unwrap();
     assert_eq!(store.next_batch(16).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stale_cache_refresh_is_background_coalesced_and_keeps_public_fields() {
+    let mut delayed = ranking_reply(2);
+    delayed.delay = Duration::from_millis(300);
+    let f = fixture(vec![Reply::version(), ranking_reply(1), delayed]).await;
+    let mut cfg = account_config();
+    cfg.response_cache = memory_cache(200);
+    if let crate::response_cache::Config::Memory {
+        stale_while_revalidate_ms,
+        ..
+    } = &mut cfg.response_cache
+    {
+        *stale_while_revalidate_ms = 1000;
+    }
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    let mut calls = Vec::new();
+    for _ in 0..12 {
+        let c = c.clone();
+        calls.push(tokio::spawn(async move {
+            c.call(route, json!({"musicId":"1"})).await.unwrap()
+        }));
+    }
+    tokio::time::timeout(Duration::from_millis(200), async {
+        for call in calls {
+            let value = call.await.unwrap();
+            assert_eq!(value["players"][0]["score"], 1);
+            assert!(value.get("myRank").is_none());
+            assert!(value.get("myScore").is_none());
+        }
+    })
+    .await
+    .expect("stale callers must not wait for the session-locked refresh");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+            if value["players"][0]["score"] == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.received.lock().unwrap().len(),
+        3,
+        "one bootstrap, one fill, one refresh"
+    );
+}
+
+#[tokio::test]
+async fn stale_cache_has_a_hard_expiry_and_failure_does_not_extend_it() {
+    use crate::response_cache::{Cache, Config};
+    let mut cfg = memory_cache(20);
+    if let Config::Memory {
+        stale_while_revalidate_ms,
+        ..
+    } = &mut cfg
+    {
+        *stale_while_revalidate_ms = 80;
+    }
+    let cache = Cache::new(cfg).unwrap();
+    cache.put("expiry".into(), &json!({"value": 1})).await;
+    assert!(!cache.get_with_state("expiry").await.unwrap().stale);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(cache.get("expiry").await.is_none());
+    assert!(cache.get_with_state("expiry").await.unwrap().stale);
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    assert!(cache.get_with_state("expiry").await.is_none());
+
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        unavailable_reply(),
+        ranking_reply(3),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.response_cache = memory_cache(20);
+    if let Config::Memory {
+        stale_while_revalidate_ms,
+        ..
+    } = &mut cfg.response_cache
+    {
+        *stale_while_revalidate_ms = 100;
+    }
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        3
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 4);
 }

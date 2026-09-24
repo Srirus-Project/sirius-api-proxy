@@ -10,6 +10,7 @@ enter storage. Errors and maintenance responses are never inserted.
 response_cache:
   backend: memory
   ttl_ms: 1000
+  stale_while_revalidate_ms: 0 # opt in with a bounded nonzero window
   route_ttl_ms:
     announcements: 30000
     announcement: 30000
@@ -23,8 +24,9 @@ response_cache:
 
 Memory storage enforces both entry count and serialized-byte budgets; oversized
 entries are skipped and stored entries can be evicted. Eviction order is
-lexicographic by digest, not LRU. TTL is checked before serving. No expired response
-is returned and no failed response is stored.
+lexicographic by digest, not LRU. Freshness and hard retention expiry are checked before serving.
+By default expired responses are not returned; a configured stale window permits bounded stale
+responses as described below. Failed responses are never stored.
 
 ```yaml
 response_cache:
@@ -32,6 +34,7 @@ response_cache:
   url_env: SIRIUS_JP_CACHE_REDIS_URL
   namespace: sirius_public
   ttl_ms: 1000
+  stale_while_revalidate_ms: 0 # opt in with a bounded nonzero window
   max_entry_bytes: 1048576
   operation_timeout_ms: 100
 ```
@@ -81,8 +84,8 @@ are the entire allowlist; private/profile/deck routes cannot be added through co
 Each override accepts 0..300000 ms; 0 bypasses both lookup and insertion for that
 route. Omitted routes inherit the backend's `ttl_ms`. Effective TTL is part of the
 cache key, so processes with different policies cannot reuse a longer-lived entry
-from a common Redis namespace. The selected TTL controls both embedded expiry and
-Redis PX expiry. Restart to change configuration.
+from a common Redis namespace. The selected TTL controls freshness; Redis PX expiry includes the optional stale window.
+Both freshness TTL and stale window are part of the digest. Restart to change configuration.
 
 Concurrent misses for a key are coalesced within a region/process. The winner fills
 the cache; waiters check it again before executing. Waiting remains inside each
@@ -91,6 +94,27 @@ a winner releases its lock so another request can proceed. A fixed set of 64 loc
 stripes bounds coordination memory; digest collisions can serialize unrelated fills.
 Fresh hits do not wait for a fill lock. This is not a distributed Redis lease.
 
-The original stale-while-revalidate policy remains tracked restoration work. Expired
-entries are still never served and this implementation does not launch background
-refreshes or hide an outage behind an expired response.
+## Stale-while-revalidate
+
+Both backends accept `stale_while_revalidate_ms`, default 0 (disabled), range 0..300000.
+Between freshness expiry and TTL plus this window, return the cached public response immediately
+and attempt one background refresh per key/process. Hard-expired entries are misses and wait for
+normal request processing. Route TTL 0 still bypasses caching entirely. Changing the window changes
+cache identity. Old records without a retention timestamp retain their original freshness expiry.
+
+Refresh reservations and cache-fill coordination use separate bounded sets of 64 striped locks.
+A background task acquires normal request admission before waiting for a fill lock, preventing a
+queued refresh from blocking admitted cache misses. Stripe collisions can suppress unrelated
+refresh attempts until a later request. Multiple processes do not share a refresh lease, even on
+Redis. Cache hits do not wait for the account session lock; actual upstream refreshes still obey
+session serialization, global request admission, request deadlines, retry and account-health rules.
+
+The refresh pins the originating account by name and rechecks its complete cache scope after
+admission and session-lock acquisition. Changed credentials, protocol/Master generations or
+maintenance invalidate the scheduled work instead of refreshing another scope. Ranking-relative
+fields are stripped on stale reads as well as writes. No private/profile/deck caching is enabled.
+Successful refresh replaces the entry with a new TTL/window; failures leave its original hard
+expiry unchanged. Later stale requests may try again under normal account-health limits. A server
+outage can therefore be masked only within the explicitly configured window. Background work is
+bounded by the normal request deadline and is disposable on process shutdown; it is not a durable
+job. Cache responses keep the existing JSON contract and do not add a freshness metadata field.

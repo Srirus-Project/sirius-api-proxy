@@ -39,6 +39,8 @@ pub enum Config {
     Memory {
         ttl_ms: u64,
         #[serde(default)]
+        stale_while_revalidate_ms: u64,
+        #[serde(default)]
         route_ttl_ms: BTreeMap<Route, u64>,
         max_entries: usize,
         max_bytes: usize,
@@ -48,6 +50,8 @@ pub enum Config {
         url_env: String,
         namespace: String,
         ttl_ms: u64,
+        #[serde(default)]
+        stale_while_revalidate_ms: u64,
         #[serde(default)]
         route_ttl_ms: BTreeMap<Route, u64>,
         max_entry_bytes: usize,
@@ -60,12 +64,14 @@ impl Config {
             Self::Disabled => true,
             Self::Memory {
                 ttl_ms,
+                stale_while_revalidate_ms,
                 route_ttl_ms,
                 max_entries,
                 max_bytes,
                 max_entry_bytes,
             } => {
                 (1..=300_000).contains(ttl_ms)
+                    && *stale_while_revalidate_ms <= 300_000
                     && route_ttl_ms.values().all(|ttl| *ttl <= 300_000)
                     && (1..=100_000).contains(max_entries)
                     && (1024..=1024 * 1024 * 1024).contains(max_bytes)
@@ -76,6 +82,7 @@ impl Config {
                 url_env,
                 namespace,
                 ttl_ms,
+                stale_while_revalidate_ms,
                 route_ttl_ms,
                 max_entry_bytes,
                 operation_timeout_ms,
@@ -86,6 +93,7 @@ impl Config {
                     && namespace
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                    && *stale_while_revalidate_ms <= 300_000
                     && route_ttl_ms.values().all(|ttl| *ttl <= 300_000)
                     && (1..=300_000).contains(ttl_ms)
                     && (256..=8 * 1024 * 1024).contains(max_entry_bytes)
@@ -102,6 +110,8 @@ impl Config {
 #[derive(Serialize, Deserialize)]
 struct Entry {
     expires_ms: u64,
+    #[serde(default)]
+    retain_ms: u64,
     value: Value,
 }
 #[derive(Default)]
@@ -109,9 +119,14 @@ struct Memory {
     entries: BTreeMap<String, Vec<u8>>,
     bytes: usize,
 }
+pub struct Cached {
+    pub value: Value,
+    pub stale: bool,
+}
 pub struct Cache {
     config: Config,
     fills: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    refreshes: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
     memory: Mutex<Memory>,
     redis: Option<redis::aio::ConnectionManager>,
 }
@@ -162,6 +177,9 @@ impl Cache {
             fills: (0..64)
                 .map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
+            refreshes: (0..64)
+                .map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
             memory: Mutex::new(Memory::default()),
             redis,
         })
@@ -186,6 +204,28 @@ impl Cache {
         };
         (ttl > 0).then_some(ttl)
     }
+    pub fn stale_window(&self) -> u64 {
+        match self.config {
+            Config::Disabled => 0,
+            Config::Memory {
+                stale_while_revalidate_ms,
+                ..
+            }
+            | Config::Redis {
+                stale_while_revalidate_ms,
+                ..
+            } => stale_while_revalidate_ms,
+        }
+    }
+    pub fn try_refresh_guard(&self, key: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let hash = key.bytes().fold(0usize, |h, byte| {
+            h.wrapping_mul(31).wrapping_add(byte as usize)
+        });
+        self.refreshes[hash % self.refreshes.len()]
+            .clone()
+            .try_lock_owned()
+            .ok()
+    }
     /// Bounded striped locks coalesce fills within one region/process.
     pub async fn fill_guard(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let hash = key.bytes().fold(0usize, |h, byte| {
@@ -202,18 +242,27 @@ impl Cache {
         }
     }
     pub async fn get(&self, key: &str) -> Option<Value> {
+        self.get_with_state(key)
+            .await
+            .filter(|entry| !entry.stale)
+            .map(|entry| entry.value)
+    }
+    pub async fn get_with_state(&self, key: &str) -> Option<Cached> {
         let bytes = match &self.config {
             Config::Disabled => return None,
             Config::Memory { .. } => {
                 let mut memory = self.memory.lock().ok()?;
                 let bytes = memory.entries.get(key)?.clone();
                 let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-                if entry.expires_ms <= now_ms() {
+                if entry.retain_ms.max(entry.expires_ms) <= now_ms() {
                     memory.entries.remove(key);
                     memory.bytes -= bytes.len();
                     return None;
                 }
-                return Some(entry.value);
+                return Some(Cached {
+                    stale: entry.expires_ms <= now_ms(),
+                    value: entry.value,
+                });
             }
             Config::Redis {
                 namespace,
@@ -241,7 +290,10 @@ impl Cache {
             }
         };
         let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-        (entry.expires_ms > now_ms()).then_some(entry.value)
+        (entry.retain_ms.max(entry.expires_ms) > now_ms()).then_some(Cached {
+            stale: entry.expires_ms <= now_ms(),
+            value: entry.value,
+        })
     }
     pub async fn put(&self, key: String, value: &Value) {
         self.put_with_ttl(key, value, None).await;
@@ -261,8 +313,10 @@ impl Cache {
             } => (*ttl_ms, *max_entry_bytes),
         };
         let ttl = override_ttl.unwrap_or(ttl);
+        let expires_ms = now_ms().saturating_add(ttl);
         let Ok(bytes) = serde_json::to_vec(&Entry {
-            expires_ms: now_ms().saturating_add(ttl),
+            expires_ms,
+            retain_ms: expires_ms.saturating_add(self.stale_window()),
             value: value.clone(),
         }) else {
             return;
@@ -305,7 +359,7 @@ impl Cache {
                 cmd.arg(format!("{namespace}:{key}"))
                     .arg(bytes)
                     .arg("PX")
-                    .arg(ttl);
+                    .arg(ttl.saturating_add(self.stale_window()));
                 let _ = tokio::time::timeout(
                     Duration::from_millis(*operation_timeout_ms),
                     cmd.query_async::<()>(&mut connection),
