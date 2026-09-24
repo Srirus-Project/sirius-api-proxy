@@ -4387,3 +4387,134 @@ async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
     assert!(Client::new("https://example.com", "token\nsecret", false, 200).is_err());
     server.abort();
 }
+
+#[test]
+fn asset_outbox_preserves_ambiguous_delivery_and_terminal_identity_across_restart() {
+    use crate::{
+        asset_jobs::{Operation, Request},
+        asset_outbox::{Error, Identity, Outbox, State},
+        region::Region,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let identity = Identity {
+        destination_sha256: "a".repeat(64),
+        request: Request {
+            region: Region::Jp,
+            profile: "full".into(),
+            operation: Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "production".into(),
+        platform: "iOS".into(),
+        resource_version: "version-1".into(),
+        platform_hash: "hash-1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: true,
+    };
+    let mut store = Outbox::open(directory.path(), 2).unwrap();
+    assert!(matches!(
+        Outbox::open(directory.path(), 2),
+        Err(Error::Locked)
+    ));
+    let key = store.observe(identity.clone()).unwrap();
+    assert_eq!(store.observe(identity.clone()).unwrap(), key);
+    let id = uuid::Uuid::new_v4().to_string();
+    assert!(store.acknowledge(&key, &id).is_err());
+    store.begin_send(&key).unwrap();
+    let sending = store.entries()[&key].state.clone();
+    drop(store);
+    let mut store = Outbox::open(directory.path(), 2).unwrap();
+    assert_eq!(store.entries()[&key].state, sending);
+    store.begin_send(&key).unwrap();
+    assert_eq!(store.entries()[&key].state, sending);
+    store.acknowledge(&key, &id).unwrap();
+    assert!(store
+        .acknowledge(&key, &uuid::Uuid::new_v4().to_string())
+        .is_err());
+    assert!(store
+        .complete(
+            &key,
+            &uuid::Uuid::new_v4().to_string(),
+            &"b".repeat(64),
+            None
+        )
+        .is_err());
+    store.complete(&key, &id, &"b".repeat(64), None).unwrap();
+    assert!(store.begin_send(&key).is_err());
+    drop(store);
+    let mut store = Outbox::open(directory.path(), 2).unwrap();
+    assert_eq!(store.observe(identity.clone()).unwrap(), key);
+    assert!(matches!(
+        store.entries()[&key].state,
+        State::Completed { .. }
+    ));
+    let mut revised = identity.clone();
+    revised.profile_revision = "2".into();
+    let second = store.observe(revised).unwrap();
+    assert_ne!(second, key);
+    store.fail(&second, "job_pruned").unwrap();
+    assert!(store.begin_send(&second).is_err());
+    let mut next = identity.clone();
+    next.resource_version = "version-2".into();
+    assert!(matches!(store.observe(next), Err(Error::Full)));
+    for variant in 0..6 {
+        let mut other = identity.clone();
+        match variant {
+            0 => other.request.region = Region::En,
+            1 => other.destination_sha256 = "c".repeat(64),
+            2 => other.request.profile = "subset".into(),
+            3 => other.environment = "review".into(),
+            4 => other.platform = "Android".into(),
+            _ => other.require_full_export = false,
+        }
+        assert_ne!(identity.key().unwrap(), other.key().unwrap());
+    }
+}
+
+#[test]
+fn asset_outbox_failed_writes_and_corrupt_state_never_acknowledge_dispatch() {
+    use crate::{
+        asset_jobs::{Operation, Request},
+        asset_outbox::{Error, Identity, Outbox, State},
+        region::Region,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let identity = Identity {
+        destination_sha256: "a".repeat(64),
+        request: Request {
+            region: Region::Jp,
+            profile: "full".into(),
+            operation: Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "production".into(),
+        platform: "iOS".into(),
+        resource_version: "version-1".into(),
+        platform_hash: "hash-1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let mut store = Outbox::open(directory.path(), 2).unwrap();
+    let key = store.observe(identity.clone()).unwrap();
+    let path = directory.path().join("outbox.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(matches!(store.begin_send(&key), Err(Error::Storage)));
+    assert_eq!(store.entries()[&key].state, State::Pending);
+    std::fs::remove_dir(&path).unwrap();
+    store.begin_send(&key).unwrap();
+    drop(store);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["entries"][&key]["identity"]["resource_version"] = "tampered".into();
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(matches!(
+        Outbox::open(directory.path(), 2),
+        Err(Error::Storage)
+    ));
+    let mut invalid = identity;
+    invalid.request.region = Region::Cn;
+    assert!(matches!(invalid.key(), Err(Error::Invalid)));
+}

@@ -26,8 +26,22 @@ The updater token is unrelated to game credentials, public API tokens and snapsh
 This module is not yet wired into deployment configuration or a background worker. No new
 operator setting is exposed until it actually starts durable dispatch/reconciliation.
 
-The owner still needs a single-owner persisted per-region/per-target outbox, stable identity
-keys, bounded retry/reconciliation, restart recovery, explicit failed/cancelled/pruned-job
+`asset_outbox::Outbox` now persists stable dispatch identities with exclusive process ownership.
+Identity includes a destination digest, request region/profile/operation, explicit profile revision,
+environment/platform/resource version/platform hash and required output scope. New observations
+are committed before becoming pending work; sending is committed before network side effects.
+The original first-send timestamp survives retries/restart so later reconciliation can enforce
+an ambiguity window rather than silently replaying old keys. Acknowledgement pins one job UUID;
+completion pins its catalog digest and optional publication UUID. Failed identities remain reserved.
+
+The outbox provides transitions, not scheduling or proof of successful remote output: its caller
+must validate receipts and scope before committing completion. History has an explicit capacity
+(1–100,000 entries) and no automatic pruning. A full history fails rather than forgetting a known
+identity and redispatching it. Operator-controlled compaction/recovery still needs integration.
+Writes use synced temporary files and atomic replacement; process restart is tested, but this is
+not a claim of power-loss durability across every filesystem. Corrupt state fails closed.
+
+The owner still needs bounded retry/reconciliation, explicit failed/cancelled/pruned-job
 handling and receipt scope checks. HTTP 202 means accepted, not exported or published.
 Matching must include environment/platform/resource version/platform hash; requested full
 export and storage requirements must be checked independently of terminal status.
