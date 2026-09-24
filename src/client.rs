@@ -239,6 +239,27 @@ impl GameClient {
             password: password.clone(),
         })
     }
+    pub async fn refresh_resource_snapshot(&self) -> Result<ResourceSnapshot, AppError> {
+        let started = Utc::now();
+        self.call(VERSION, json!({})).await?;
+        let state = self.state.lock().await;
+        if state.snapshot_stale
+            || state.observation.maintenance
+            || state.observation.grpc_status != Some(0)
+        {
+            return Err(AppError::SnapshotUnavailable);
+        }
+        let snapshot = state
+            .snapshot
+            .clone()
+            .ok_or(AppError::SnapshotUnavailable)?;
+        if snapshot.observed_at < started
+            || !(0..=300).contains(&(Utc::now() - snapshot.observed_at).num_seconds())
+        {
+            return Err(AppError::SnapshotUnavailable);
+        }
+        Ok(snapshot)
+    }
     pub async fn snapshot(&self) -> Result<Value, AppError> {
         let s = self.state.lock().await;
         let snapshot = s.snapshot.as_ref().ok_or(AppError::SnapshotUnavailable)?;

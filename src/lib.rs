@@ -34,3 +34,5 @@ pub mod application_log;
 pub mod asset_jobs;
 
 pub mod asset_outbox;
+
+pub mod asset_dispatch;

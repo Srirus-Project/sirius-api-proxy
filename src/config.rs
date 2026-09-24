@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub asset_dispatch: Option<crate::asset_dispatch::Config>,
+    #[serde(default)]
     pub logging: Option<crate::application_log::Config>,
     #[serde(default)]
     pub region: crate::region::Region,
@@ -170,6 +172,9 @@ impl Config {
         }
     }
     pub fn validate(&self) -> Result<(), AppError> {
+        if let Some(dispatch) = &self.asset_dispatch {
+            dispatch.validate()?;
+        }
         if let Some(log) = &self.logging {
             log.validate()
                 .map_err(|_| AppError::Config("invalid application logging configuration"))?;

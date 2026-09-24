@@ -84,3 +84,19 @@ response_cache:
 #   format: json
 #   output: {type: file, path: ./logs/application.log, rotation: daily, max_files: 7}
 #   queue_capacity: 4096
+
+# Optional per-region automatic asset update owner. See docs/ASSET_DISPATCH.md.
+# asset_dispatch:
+#   state_directory: ./state/jp-assets
+#   interval_seconds: 60
+#   request_timeout_ms: 10000
+#   history_capacity: 10000
+#   targets:
+#     - origin: https://asset-updater.example.com
+#       token_env: SIRIUS_ASSET_UPDATER_TOKEN
+#       allow_http: false
+#       profile: jp-full
+#       profile_revision: "1"
+#       require_full_catalog: true
+#       require_full_export: true
+#       require_publication: true

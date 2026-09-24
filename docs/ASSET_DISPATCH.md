@@ -21,35 +21,74 @@ have bounded connection/whole-request deadlines and a 64 KiB streamed response l
 errors expose the numeric HTTP status only, never the response body, destination or token.
 The updater token is unrelated to game credentials, public API tokens and snapshot tokens.
 
-## Pending integration
+## Background worker configuration
 
-This module is not yet wired into deployment configuration or a background worker. No new
-operator setting is exposed until it actually starts durable dispatch/reconciliation.
+`asset_dispatch` is optional and belongs to each region configuration (including single-region
+legacy deployments). It runs once after listener startup, then waits the configured interval
+between cycles. Normal public/internal snapshot reads and refreshes never directly enqueue work.
+Each cycle requests a fresh game Version observation, records configured destination/profile
+identities, and reconciles up to 16 nonterminal entries. A failed game refresh still permits polling
+previously submitted work. Shutdown cancels requests; pre-send state makes interrupted POSTs visible.
 
-`asset_outbox::Outbox` now persists stable dispatch identities with exclusive process ownership.
-Identity includes a destination digest, request region/profile/operation, explicit profile revision,
-environment/platform/resource version/platform hash and required output scope. New observations
-are committed before becoming pending work; sending is committed before network side effects.
-The original first-send timestamp survives retries/restart so later reconciliation can enforce
-an ambiguity window rather than silently replaying old keys. Acknowledgement pins one job UUID;
-completion pins its catalog digest and optional publication UUID. Failed identities remain reserved.
+```yaml
+asset_dispatch:
+  state_directory: ./state/jp-assets
+  interval_seconds: 60
+  request_timeout_ms: 10000
+  history_capacity: 10000
+  targets:
+    - origin: https://asset-updater.example.com
+      token_env: SIRIUS_ASSET_UPDATER_TOKEN
+      allow_http: false
+      profile: jp-full
+      profile_revision: "1"
+      require_full_catalog: true
+      require_full_export: true
+      require_publication: true
+```
 
-The outbox provides transitions, not scheduling or proof of successful remote output: its caller
-must validate receipts and scope before committing completion. History has an explicit capacity
-(1–100,000 entries) and no automatic pruning. A full history fails rather than forgetting a known
-identity and redispatching it. Operator-controlled compaction/recovery still needs integration.
-Writes use synced temporary files and atomic replacement; process restart is tested, but this is
-not a claim of power-loss durability across every filesystem. Corrupt state fails closed.
+Set `require_publication: false` when retaining verified exports locally without a storage
+provider. Full-export requirements accept retained local files or a verified storage publication;
+validation-only export does not satisfy them. A completed job must match region, environment,
+platform, resource version and platform hash. Missing/legacy outcomes or mismatched scope are
+terminal reconciliation failures. The actual catalog digest/publication UUID are persisted only
+on a match. HTTP acceptance is not completion.
 
-The owner still needs bounded retry/reconciliation, explicit failed/cancelled/pruned-job
-handling and receipt scope checks. HTTP 202 means accepted, not exported or published.
-Matching must include environment/platform/resource version/platform hash; requested full
-export and storage requirements must be checked independently of terminal status.
+The listener configuration rejects updater tokens equal to any configured region's API, internal
+or CDN credentials. Environment references are resolved at startup. Each region needs its own state
+directory; existing state belonging to another region/environment/platform is rejected.
+Origins must be roots without credentials/query/fragment. Explicit plaintext can be used on a
+trusted private network; the bearer token is sent unencrypted in that mode. Targets are unique by
+normalized origin and profile. Bounds: 1–16 targets, 10–86,400-second intervals, 100–300,000-ms
+request deadlines, 1–100,000 retained identities.
 
-Updating a configured profile can change export semantics without changing the catalog.
-The owner's identity must include an explicit profile revision so an intentional re-export
-gets a new key. Job record retention bounds remote idempotency: do not assume an old pruned
-key can be replayed indefinitely without new work. A delayed job may process a newer snapshot;
-only its actual outcome may be recorded as completed work.
+## Durable state and recovery boundaries
 
-Full automatic dispatch, production acceptance and 1.2.0 release remain pending.
+The outbox uses exclusive process ownership and atomic file replacement. Identity includes a
+destination digest, region/profile/operation, explicit profile revision, environment/platform,
+resource version/platform hash and required scope. New observations are committed before sending;
+possible submission is persisted before POST. Known job IDs survive restart and continue polling.
+Temporary GET failures leave the job submitted for the next cycle. Terminal failures/cancellation,
+404 for a previously acknowledged job, malformed replies and removed targets are recorded as failed
+and logged with sanitized codes. They are not repeatedly exported.
+
+A POST transport failure or shutdown can leave acceptance ambiguous. Because remote job retention
+has no minimum time guarantee, the worker does **not** blindly replay such submissions after a
+restart or lost response. The next reconciliation records `submission_ambiguous`. Operators must
+inspect the updater's retained job list before intentionally requesting new execution. Use a new
+profile revision only after resolving the previous execution and deciding that a new job is needed.
+Do not delete the state directory to retry: doing so forgets completed catalog identities too.
+Automatic retry of uncertain POSTs and an administrative recovery endpoint remain future work.
+
+History has a hard capacity and no automatic pruning; a full history refuses new identities while
+existing jobs continue reconciliation. Safe operator compaction still needs implementation.
+Changing the profile revision intentionally creates a new identity. The updater resolves profiles
+at execution time, so this revision is an operator-controlled re-export marker, not an immutable
+copy of its configuration. Coordinate profile changes with active work.
+
+Writes sync temporary files before atomic replacement. Process restart is tested; power-loss
+persistence across every filesystem is not claimed. Persistence failure stops the dispatch worker
+and emits an error while the HTTP proxy remains available. Monitor these errors and inspect the
+state ledger; a dedicated dispatch health/status endpoint remains pending.
+
+Full production acceptance, completion notifications and the 1.2.0 release remain pending.

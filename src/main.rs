@@ -68,11 +68,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tls = prepared.tls;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let workers: Vec<_> = prepared
+    let mut workers: Vec<_> = prepared
         .updaters
         .into_iter()
         .map(|u| tokio::spawn(u.run(receiver.clone())))
         .collect();
+    workers.extend(
+        prepared
+            .asset_dispatchers
+            .into_iter()
+            .map(|worker| tokio::spawn(worker.run(receiver.clone()))),
+    );
     let signal_shutdown = shutdown.clone();
     tracing::info!(%listen,"Sirius API Proxy listening");
     let result = sirius_api_proxy::server::serve(listener, router, tls, async move {

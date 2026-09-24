@@ -33,6 +33,7 @@ pub struct Prepared {
     pub listen: SocketAddr,
     pub router: Router,
     pub updaters: Vec<Arc<MasterUpdater>>,
+    pub asset_dispatchers: Vec<crate::asset_dispatch::Worker>,
 }
 
 impl DeploymentConfig {
@@ -137,10 +138,33 @@ impl DeploymentConfig {
             )
             .into());
         }
+        for c in &configs {
+            if let Some(dispatch) = &c.asset_dispatch {
+                for target in &dispatch.targets {
+                    let token = secret(&target.token_env)?;
+                    if tokens
+                        .iter()
+                        .any(|(public, internal)| token == *public || token == *internal)
+                        || configs.iter().any(|config| {
+                            config
+                                .cdn_credential_env
+                                .values()
+                                .any(|name| std::env::var(name).is_ok_and(|value| value == token))
+                        })
+                    {
+                        return Err(AppError::Config("asset updater token must be distinct from API/internal/CDN credentials").into());
+                    }
+                }
+            }
+        }
         let mut router = api::health_router();
         let mut updaters = Vec::new();
+        let mut asset_dispatchers = Vec::new();
         for (c, (public, internal)) in configs.into_iter().zip(tokens) {
             let client = GameClient::new(c.clone())?;
+            if c.asset_dispatch.is_some() {
+                asset_dispatchers.push(crate::asset_dispatch::Worker::new(c, client.clone())?);
+            }
             if c.master_update.is_some() {
                 updaters.push(MasterUpdater::new(c, client.clone())?);
             }
@@ -172,6 +196,7 @@ impl DeploymentConfig {
             listen,
             router,
             updaters,
+            asset_dispatchers,
         })
     }
 }

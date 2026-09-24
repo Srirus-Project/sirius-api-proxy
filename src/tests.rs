@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        asset_dispatch: None,
         logging: None,
         region: crate::region::Region::Jp,
         platform: None,
@@ -4517,4 +4518,151 @@ fn asset_outbox_failed_writes_and_corrupt_state_never_acknowledge_dispatch() {
     let mut invalid = identity;
     invalid.request.region = Region::Cn;
     assert!(matches!(invalid.key(), Err(Error::Invalid)));
+}
+
+#[tokio::test]
+async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
+    type RemoteState = Arc<std::sync::Mutex<(Option<Value>, usize, bool)>>;
+    use crate::asset_dispatch::{Config as DispatchConfig, Target, Worker};
+    use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::any, Router};
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let remote_state = Arc::new(std::sync::Mutex::new((
+        None::<serde_json::Value>,
+        0usize,
+        false,
+    )));
+    let app=Router::new().route("/{*path}",any(|State(state):State<RemoteState>,method:axum::http::Method,headers:HeaderMap,body:axum::body::Bytes|async move{
+        assert_eq!(headers["authorization"],"Bearer dispatch-only-token");
+        let mut state=state.lock().unwrap();
+        if method==axum::http::Method::POST {
+            state.1+=1;
+            let request:Value=serde_json::from_slice(&body).unwrap();
+            let key=headers["idempotency-key"].as_bytes();
+            state.0=Some(json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,"status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key))}));
+            return (axum::http::StatusCode::ACCEPTED,axum::Json(state.0.clone().unwrap())).into_response();
+        }
+        let mut job=state.0.clone().unwrap();
+        if state.2 {
+            job["status"]="completed".into();
+            job["outcome"]=json!({"verification":{"region":"jp","environment":"release","platform":"iOS","resource_version":"r1","platform_hash":"hash1","catalog_sha256":"a".repeat(64),"catalog_verified":true,"full_catalog":true},"export":{"full_export":true,"retained":true,"files":1,"bytes":10},"publication_id":null});
+        }
+        (axum::http::StatusCode::OK,axum::Json(job)).into_response()
+    })).with_state(remote_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let remote = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let game = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let mut cfg = config();
+    let token = format!("SIRIUS_DISPATCH_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "dispatch-only-token");
+    cfg.asset_dispatch = Some(DispatchConfig {
+        state_directory: directory.path().join("outbox"),
+        interval_seconds: 10,
+        request_timeout_ms: 1000,
+        history_capacity: 100,
+        targets: vec![Target {
+            origin,
+            token_env: token.clone(),
+            allow_http: true,
+            profile: "full".into(),
+            profile_revision: "1".into(),
+            require_full_catalog: true,
+            require_full_export: true,
+            require_publication: false,
+        }],
+    });
+    let gc = client(&game, cfg.clone());
+    let worker = Worker::new(&cfg, gc.clone()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let path = directory.path().join("outbox/outbox.json");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if v["entries"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|v| v["state"]["state"] == "submitted")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    assert_eq!(remote_state.lock().unwrap().1, 1);
+    let snapshot = gc.snapshot().await.unwrap();
+    assert_eq!(snapshot["stale"], false);
+    remote_state.lock().unwrap().2 = true;
+    let mut restarted = Worker::new(&cfg, gc.clone()).unwrap();
+    restarted.reconcile().await.unwrap();
+    restarted.reconcile().await.unwrap();
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        value["entries"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["state"]["state"],
+        "completed"
+    );
+    assert_eq!(remote_state.lock().unwrap().1, 1);
+    // A delayed job that processed an older catalog must not complete the new identity.
+    let newer = crate::resources::ResourceSnapshot {
+        schema_version: 2,
+        region: crate::region::Region::Jp,
+        environment: "release".into(),
+        platform: "iOS",
+        client_version: "1.0.3".into(),
+        protocol_version: "1.0.3".into(),
+        master_version: None,
+        resource_version: "r2".into(),
+        platform_hash: "hash2".into(),
+        effective_cdn_root: String::new(),
+        credential_ref: String::new(),
+        observed_at: chrono::Utc::now(),
+        source: "remote",
+    };
+    restarted.observe(&newer).unwrap();
+    restarted.reconcile().await.unwrap();
+    restarted.reconcile().await.unwrap();
+    restarted.observe(&newer).unwrap();
+    restarted.reconcile().await.unwrap();
+    assert_eq!(remote_state.lock().unwrap().1, 2);
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(value["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|v| v["state"]["code"] == "outcome_mismatch"));
+    drop(restarted);
+    // Crash after persisting sending but before acknowledgement is not a safe replay.
+    let mut outbox = crate::asset_outbox::Outbox::open(path.parent().unwrap(), 100).unwrap();
+    let mut identity = outbox.entries().values().next().unwrap().identity.clone();
+    identity.profile_revision = "ambiguous".into();
+    let ambiguous = outbox.observe(identity).unwrap();
+    outbox.begin_send(&ambiguous).unwrap();
+    drop(outbox);
+    let mut restarted = Worker::new(&cfg, gc.clone()).unwrap();
+    restarted.reconcile().await.unwrap();
+    assert_eq!(remote_state.lock().unwrap().1, 2);
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        value["entries"][&ambiguous]["state"]["code"],
+        "submission_ambiguous"
+    );
+    drop(restarted);
+    cfg.environment = "review".into();
+    assert!(Worker::new(&cfg, gc).is_err());
+    remote.abort();
+    std::env::remove_var(token);
 }
