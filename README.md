@@ -133,8 +133,8 @@ The current JP baseline has been exercised for identity, account data, public pr
 announcements, song rankings, 235 Master tables and native/dynamic protocol switching.
 Event/challenge business responses and an established friendship were not covered by live testing.
 Account pooling, per-region clients and [configurable request controls](docs/REQUEST_POLICY.md)
-are available. Multi-node coordination and response caching remain pending in the
-1.2.0 restoration ledger.
+and [scoped response caching](docs/RESPONSE_CACHE.md) are available. Multi-node
+coordination and remaining cache refresh policies are tracked in the 1.2.0 restoration ledger.
 Upstream availability is outside this service's control.
 
 ## Development and release

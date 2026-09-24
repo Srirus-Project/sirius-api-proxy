@@ -44,3 +44,8 @@ upstream:
   max_inflight: 64
   anonymous_attempts: 1 # total attempts; 1 disables retries
   retry_delay_ms: 250
+
+# Public announcement/ranking response cache; defaults to disabled.
+# See docs/RESPONSE_CACHE.md for memory and Redis configuration.
+response_cache:
+  backend: disabled

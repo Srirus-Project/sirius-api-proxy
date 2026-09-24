@@ -38,6 +38,7 @@ fn config() -> Config {
         client_version: "1.0.3".into(),
         session_lock: true,
         upstream: Default::default(),
+        response_cache: Default::default(),
         api_token_env: "unused".into(),
         internal_token_env: "unused".into(),
         accounts: Vec::new(),
@@ -2636,4 +2637,245 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
         assert!(policy.validate().is_err(), "{field}");
     }
     assert!(yaml_serde::from_str::<crate::config::UpstreamConfig>("ignored_option: true").is_err());
+}
+
+fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
+    crate::response_cache::Config::Memory {
+        ttl_ms,
+        max_entries: 4,
+        max_bytes: 8192,
+        max_entry_bytes: 4096,
+    }
+}
+fn ranking_reply(score: i32) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message(
+        "app.livemusic.GetRankingResponse",
+        json!({"myRank":123,"players":[{"score":score}]}),
+    ));
+    reply
+}
+#[tokio::test]
+async fn response_cache_hits_are_public_and_account_protocol_reload_invalidate() {
+    let bundle = copy_protocol_bundle();
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        ranking_reply(2),
+        Reply::version(),
+        ranking_reply(3),
+        whoami_reply("ranking-account"),
+        whoami_reply("ranking-account"),
+        empty_profile_reply(),
+        empty_profile_reply(),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.response_cache = memory_cache(5000);
+    cfg.protocol_directory = bundle.path().into();
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    for _ in 0..2 {
+        let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+        assert!(value.get("myRank").is_none());
+        assert_eq!(value["players"][0]["score"], 1);
+    }
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    c.reload_accounts().await.unwrap();
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        2
+    );
+    edit_version_proto(
+        bundle.path(),
+        "string version = 1;",
+        "string version = 1;\n string extra = 2;",
+    );
+    c.reload_protocol().await.unwrap();
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        3
+    );
+    for _ in 0..2 {
+        c.call(crate::client::WHOAMI, json!({})).await.unwrap();
+    }
+    for _ in 0..2 {
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"2"}))
+            .await
+            .unwrap();
+    }
+    assert_eq!(f.received.lock().unwrap().len(), 9);
+}
+
+#[tokio::test]
+async fn response_cache_does_not_store_failures_or_reuse_different_inputs() {
+    let f = fixture(vec![
+        Reply::version(),
+        unavailable_reply(),
+        ranking_reply(1),
+        ranking_reply(2),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.response_cache = memory_cache(5000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    assert!(c.call(route, json!({"musicId":"1"})).await.is_err());
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    assert_eq!(
+        c.call(route, json!({"musicId":"2"})).await.unwrap()["players"][0]["score"],
+        2
+    );
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn memory_response_cache_enforces_ttl_entry_and_total_bounds() {
+    use crate::response_cache::{Cache, Config};
+    let c = Cache::new(Config::Memory {
+        ttl_ms: 30,
+        max_entries: 1,
+        max_bytes: 1024,
+        max_entry_bytes: 512,
+    })
+    .unwrap();
+    c.put("first".into(), &json!({"value":1})).await;
+    assert_eq!(c.get("first").await.unwrap()["value"], 1);
+    c.put("second".into(), &json!({"value":2})).await;
+    assert!(c.get("first").await.is_none());
+    assert_eq!(c.get("second").await.unwrap()["value"], 2);
+    c.put("oversized".into(), &json!({"value":"x".repeat(1024)}))
+        .await;
+    assert!(c.get("oversized").await.is_none());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(c.get("second").await.is_none());
+    assert!(Config::Memory {
+        ttl_ms: 0,
+        max_entries: 1,
+        max_bytes: 1024,
+        max_entry_bytes: 512
+    }
+    .validate()
+    .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires SIRIUS_TEST_REDIS_SERVER to run an isolated local Redis instance"]
+async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
+    use crate::response_cache::{Cache, Config};
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut server = Child(
+        std::process::Command::new(std::env::var("SIRIUS_TEST_REDIS_SERVER").unwrap())
+            .args([
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--dir",
+                root.path().to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let url = format!("redis://127.0.0.1:{port}/");
+    let raw = redis::Client::open(url.clone()).unwrap();
+    let mut ready = None;
+    for _ in 0..50 {
+        if let Ok(c) = raw.get_multiplexed_async_connection().await {
+            ready = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut connection = ready.expect("Redis became ready");
+    let env = format!("SIRIUS_REDIS_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, url);
+    let c = Cache::new(Config::Redis {
+        url_env: env.clone(),
+        namespace: "test".into(),
+        ttl_ms: 100,
+        max_entry_bytes: 1024,
+        operation_timeout_ms: 100,
+    })
+    .unwrap();
+    c.put("safe".into(), &json!({"value":42})).await;
+    assert_eq!(c.get("safe").await.unwrap()["value"], 42);
+    let _: () = redis::cmd("SET")
+        .arg("test:oversized")
+        .arg("x".repeat(100_000))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(c.get("oversized").await.is_none());
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(c.get("safe").await.is_none());
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(10),
+        Reply::version(),
+        ranking_reply(20),
+    ])
+    .await;
+    let mut first_config = account_config();
+    first_config.response_cache = Config::Redis {
+        url_env: env,
+        namespace: "client-test".into(),
+        ttl_ms: 5000,
+        max_entry_bytes: 4096,
+        operation_timeout_ms: 100,
+    };
+    let mut second_config = account_config();
+    second_config.response_cache = first_config.response_cache.clone();
+    std::env::set_var(
+        second_config.player_id_env.as_ref().unwrap(),
+        "other-fixture-account",
+    );
+    std::env::set_var(
+        second_config.player_credential_env.as_ref().unwrap(),
+        "other-fixture-credential",
+    );
+    let first = client(&f, first_config);
+    let second = client(&f, second_config);
+    let route = crate::client::MUSIC_RANKING;
+    for _ in 0..2 {
+        let result = first.call(route, json!({"musicId":"1"})).await.unwrap();
+        assert_eq!(result["players"][0]["score"], 10);
+        assert!(result.get("myRank").is_none());
+    }
+    assert_eq!(
+        second.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        20
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert!(c.get("outage").await.is_none());
+        c.put("outage".into(), &json!({"value":1})).await;
+    })
+    .await
+    .unwrap();
 }

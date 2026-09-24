@@ -20,6 +20,8 @@ pub struct Config {
     pub session_lock: bool,
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub response_cache: crate::response_cache::Config,
     pub api_token_env: String,
     pub internal_token_env: String,
     #[serde(default)]
@@ -149,6 +151,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), AppError> {
         crate::accounts::validate(self)?;
         self.upstream.validate()?;
+        self.response_cache.validate()?;
         if self.region == crate::region::Region::Cn {
             return Err(AppError::Config(
                 "cn is reserved; no verified endpoint or protocol is available",

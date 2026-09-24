@@ -69,6 +69,7 @@ pub struct GameClient {
     bootstrap_lock: Mutex<()>,
     timeout: Duration,
     inflight: tokio::sync::Semaphore,
+    response_cache: crate::response_cache::Cache,
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
@@ -111,6 +112,7 @@ impl GameClient {
         };
         let timeout = Duration::from_millis(config.upstream.timeout_ms);
         let inflight = tokio::sync::Semaphore::new(config.upstream.max_inflight);
+        let response_cache = crate::response_cache::Cache::new(config.response_cache.clone())?;
         Ok(Arc::new(Self {
             config,
             http,
@@ -122,6 +124,7 @@ impl GameClient {
             bootstrap_lock: Mutex::new(()),
             timeout,
             inflight,
+            response_cache,
             protocol: RwLock::new(Arc::new(protocol)),
             reload_lock: Mutex::new(()),
         }))
@@ -338,13 +341,53 @@ impl GameClient {
                             .await?;
                     }
                 }
+                let cache_key = self
+                    .response_cache_key(&protocol, route, &input, account)
+                    .await?;
+                if let Some(key) = &cache_key {
+                    let budget =
+                        deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+                    if let Ok(Some(mut value)) =
+                        tokio::time::timeout(budget, self.response_cache.get(key)).await
+                    {
+                        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
+                            if let Some(object) = value.as_object_mut() {
+                                object.remove("myRank");
+                                object.remove("myScore");
+                            }
+                        }
+                        return Ok(value);
+                    }
+                }
                 account_attempted = authenticated(route);
                 if route == PLAYER_DATA {
                     self.execute(&protocol, WHOAMI, json!({}), account, deadline)
                         .await?;
                 }
-                self.execute(&protocol, route, input, account, deadline)
-                    .await
+                let response = self
+                    .execute(&protocol, route, input, account, deadline)
+                    .await;
+                if account_attempted {
+                    if let Some(lease) = &lease {
+                        lease.report(&response, &self.config.account_pool);
+                    }
+                    account_attempted = false;
+                }
+                let mut value = response?;
+                if let Some(key) = cache_key {
+                    // Account-relative ranking fields must never enter shared response storage.
+                    if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("myRank");
+                            object.remove("myScore");
+                        }
+                    }
+                    let budget =
+                        deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+                    let _ =
+                        tokio::time::timeout(budget, self.response_cache.put(key, &value)).await;
+                }
+                Ok(value)
             })
             .await
             .unwrap_or(Err(AppError::Timeout));
@@ -366,6 +409,45 @@ impl GameClient {
             s.observation.observed_at = Some(Utc::now());
         }
         result
+    }
+    async fn response_cache_key(
+        &self,
+        protocol: &ProtocolBundle,
+        route: &str,
+        input: &Value,
+        account: Option<&crate::accounts::Account>,
+    ) -> Result<Option<String>, AppError> {
+        if !self.response_cache.enabled()
+            || !matches!(
+                route,
+                ANNOUNCEMENTS | ANNOUNCEMENT | EVENT_RANKING | MUSIC_RANKING | CHALLENGE_RANKING
+            )
+        {
+            return Ok(None);
+        }
+        let state = self.state.lock().await;
+        if state.observation.maintenance {
+            return Ok(None);
+        }
+        let master = state.observation.master_version.clone();
+        drop(state);
+        let generation = self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)?
+            .generation;
+        use sha2::{Digest, Sha256};
+        let account_scope = account.map(|a| {
+            let bytes =
+                serde_json::to_vec(&(&a.player_id, &a.credential)).expect("strings serialize");
+            format!("{:x}", Sha256::digest(bytes))
+        });
+        let scope = json!({"schema":1,"region":self.config.region,"environment":self.config.environment,
+            "endpoint":self.config.endpoint,"platform":self.config.platform(),"client":self.config.client_version,
+            "protocol":protocol.status.sha256,"protocol_generation":protocol.status.generation,
+            "account":account_scope,"account_generation":generation,"master":master,"route":route,"input":input});
+        let bytes = serde_json::to_vec(&scope).map_err(|_| AppError::Protocol)?;
+        Ok(Some(format!("{:x}", Sha256::digest(bytes))))
     }
     async fn execute(
         &self,
