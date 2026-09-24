@@ -27,7 +27,10 @@ The updater token is unrelated to game credentials, public API tokens and snapsh
 legacy deployments). It runs once after listener startup, then waits the configured interval
 between cycles. Normal public/internal snapshot reads and refreshes never directly enqueue work.
 Each cycle requests a fresh game Version observation, records configured destination/profile
-identities, and reconciles up to 16 nonterminal entries. A failed game refresh still permits polling
+identities, and reconciles up to 16 nonterminal entries using a persisted rotating cursor.
+Long-running or unavailable jobs cannot permanently monopolize the first batch. Selection is
+committed before network work; restart continues after the previous batch, and interrupted work
+returns on a later rotation. A failed game refresh still permits polling
 previously submitted work. Shutdown cancels requests; pre-send state makes interrupted POSTs visible.
 
 ```yaml

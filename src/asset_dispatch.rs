@@ -190,14 +190,7 @@ impl Worker {
         Ok(())
     }
     pub async fn reconcile(&mut self) -> Result<(), crate::asset_outbox::Error> {
-        let entries: Vec<_> = self
-            .outbox
-            .entries()
-            .iter()
-            .filter(|(_, e)| !matches!(e.state, State::Completed { .. } | State::Failed { .. }))
-            .take(16)
-            .map(|(k, e)| (k.clone(), e.clone()))
-            .collect();
+        let entries = self.outbox.next_batch(16)?;
         for (key, entry) in entries {
             let Some(remote) = self.remotes.iter().find(|r| {
                 r.digest == entry.identity.destination_sha256

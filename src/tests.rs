@@ -4745,3 +4745,82 @@ fn asset_outbox_adoption_recovers_existing_work_without_resetting_history() {
     assert!(store.adopt(&other, &id).is_err());
     assert_eq!(store.entries().len(), 2);
 }
+
+#[test]
+fn asset_outbox_rotates_blocked_jobs_across_batches_and_restarts() {
+    use crate::{
+        asset_jobs::{Operation, Request},
+        asset_outbox::{Error, Identity, Outbox},
+        region::Region,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let identity = Identity {
+        destination_sha256: "a".repeat(64),
+        request: Request {
+            region: Region::Jp,
+            profile: "full".into(),
+            operation: Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "release".into(),
+        platform: "iOS".into(),
+        resource_version: "r1".into(),
+        platform_hash: "h1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let mut store = Outbox::open(directory.path(), 100).unwrap();
+    assert!(store.next_batch(16).unwrap().is_empty());
+    assert!(matches!(store.next_batch(0), Err(Error::Invalid)));
+    assert!(matches!(store.next_batch(257), Err(Error::Invalid)));
+    for i in 0..35 {
+        let mut identity = identity.clone();
+        identity.resource_version = format!("r{i}");
+        let key = store.observe(identity).unwrap();
+        store.begin_send(&key).unwrap();
+        store
+            .acknowledge(&key, &uuid::Uuid::new_v4().to_string())
+            .unwrap();
+    }
+    let first = store.next_batch(16).unwrap();
+    assert_eq!(first.len(), 16);
+    let expected: Vec<_> = store.entries().keys().cloned().collect();
+    assert_eq!(
+        first.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        expected[..16]
+    );
+    drop(store);
+    let mut store = Outbox::open(directory.path(), 100).unwrap();
+    let second = store.next_batch(16).unwrap();
+    assert_eq!(
+        second.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        expected[16..32]
+    );
+    let third = store.next_batch(16).unwrap();
+    assert_eq!(third[0].0, expected[32]);
+    assert_eq!(third[3].0, expected[0]);
+    let visited: std::collections::HashSet<_> = first
+        .iter()
+        .chain(second.iter())
+        .chain(third.iter())
+        .map(|(key, _)| key.clone())
+        .collect();
+    assert_eq!(visited.len(), 35); // None of the jobs had to complete for later work to advance.
+    for key in &expected {
+        store.fail(key, "job_failed").unwrap();
+    }
+    assert!(store.next_batch(16).unwrap().is_empty());
+    let mut added = identity;
+    added.resource_version = "new".into();
+    let key = store.observe(added).unwrap();
+    assert_eq!(store.next_batch(16).unwrap()[0].0, key);
+    let before = std::fs::read(directory.path().join("outbox.json")).unwrap();
+    let path = directory.path().join("outbox.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(matches!(store.next_batch(16), Err(Error::Storage)));
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, before).unwrap();
+    assert_eq!(store.next_batch(16).unwrap().len(), 1);
+}

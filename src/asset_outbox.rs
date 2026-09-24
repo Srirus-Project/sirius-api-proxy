@@ -90,6 +90,8 @@ pub struct Entry {
 #[serde(deny_unknown_fields)]
 struct Ledger {
     schema_version: u8,
+    #[serde(default)]
+    reconciliation_cursor: Option<String>,
     entries: BTreeMap<String, Entry>,
 }
 pub struct Outbox {
@@ -117,11 +119,18 @@ impl Outbox {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::Storage)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger {
                 schema_version: 1,
+                reconciliation_cursor: None,
                 entries: BTreeMap::new(),
             },
             Err(_) => return Err(Error::Storage),
         };
-        if ledger.schema_version != 1 || ledger.entries.len() > capacity {
+        if ledger.schema_version != 1
+            || ledger.entries.len() > capacity
+            || ledger
+                .reconciliation_cursor
+                .as_ref()
+                .is_some_and(|key| !ledger.entries.contains_key(key))
+        {
             return Err(Error::Storage);
         }
         for (key, entry) in &ledger.entries {
@@ -142,6 +151,38 @@ impl Outbox {
     }
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.ledger.entries
+    }
+    /// Rotate across nonterminal work. Persist selection before any network side effect so
+    /// restarting cannot repeatedly favor the same blocked prefix of the ledger.
+    pub fn next_batch(&mut self, limit: usize) -> Result<Vec<(String, Entry)>, Error> {
+        if !(1..=256).contains(&limit) {
+            return Err(Error::Invalid);
+        }
+        let cursor = self.ledger.reconciliation_cursor.as_ref();
+        let after = self
+            .ledger
+            .entries
+            .iter()
+            .filter(|(key, _)| cursor.is_none_or(|cursor| *key > cursor));
+        let before = self
+            .ledger
+            .entries
+            .iter()
+            .filter(|(key, _)| cursor.is_some_and(|cursor| *key <= cursor));
+        let batch: Vec<_> = after
+            .chain(before)
+            .filter(|(_, entry)| {
+                !matches!(entry.state, State::Completed { .. } | State::Failed { .. })
+            })
+            .take(limit)
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        if let Some((key, _)) = batch.last() {
+            let mut ledger = self.ledger.clone();
+            ledger.reconciliation_cursor = Some(key.clone());
+            self.commit(ledger)?;
+        }
+        Ok(batch)
     }
     /// Reobserving any known identity preserves its state, including terminal failures.
     pub fn observe(&mut self, identity: Identity) -> Result<String, Error> {
