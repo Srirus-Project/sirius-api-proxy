@@ -244,6 +244,16 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), MasterError> {
     file.sync_all()?;
     Ok(())
 }
+// Unix supports fsync on directory handles. Windows File::open cannot open a
+// directory as a normal file. Every data file and CURRENT is still synced
+// through its writable handle before atomic publication on all platforms.
+fn sync_directory(path: &Path) -> Result<(), MasterError> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 /// Import the client bundled/encrypted directory. Publish only after every table
 /// passes size, SHA-256, cipher padding, gzip and JSON validation.
 pub fn import_directory(
@@ -298,7 +308,7 @@ pub(crate) fn prepare_directory(
         &staging.path().join("receipt.json"),
         &serde_json::to_vec(&receipt).map_err(|_| MasterError::Format)?,
     )?;
-    fs::File::open(staging.path())?.sync_all()?;
+    sync_directory(staging.path())?;
     Ok(PreparedImport { staging, receipt })
 }
 
@@ -306,14 +316,14 @@ impl PreparedImport {
     pub(crate) fn publish(self, output: &Path) -> Result<ImportReceipt, MasterError> {
         let snapshot = &self.receipt.snapshot;
         fs::rename(self.staging.path(), output.join(snapshot))?;
-        fs::File::open(output)?.sync_all()?;
+        sync_directory(output)?;
         let mut pointer = tempfile::NamedTempFile::new_in(output)?;
         pointer.write_all(snapshot.as_bytes())?;
         pointer.as_file().sync_all()?;
         pointer
             .persist(output.join("CURRENT"))
             .map_err(|err| MasterError::Io(err.error))?;
-        fs::File::open(output)?.sync_all()?;
+        sync_directory(output)?;
         Ok(self.receipt)
     }
 }

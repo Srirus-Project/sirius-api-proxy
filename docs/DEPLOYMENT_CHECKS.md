@@ -34,3 +34,6 @@ and image build context. Credential rotation requires updating secrets and resta
 The current JP baseline covers identity, public/non-friend profiles, announcements, song
 rankings, Master updates and codec switching. Established-friendship, event and challenge
 business responses still need valid live data; do not invent IDs to claim those checks passed.
+
+All snapshot files and the CURRENT pointer are flushed before publication. Unix additionally
+flushes parent directory handles; Windows retains atomic publication without a POSIX directory-fsync step.
