@@ -6,7 +6,7 @@ remove regions you do not operate. Replace Global CDN placeholders with verified
 server-list roots and supply the corresponding environment secrets.
 
 The top-level `listen` binds one HTTP listener, or HTTPS when [top-level TLS](LISTENER_TLS.md) is configured. `regions` maps region names to the
-same client settings used by a single-region file, excluding `listen` and `tls`. Each map
+same client settings used by a single-region file, excluding `listen`, `tls` and `access_log`. Each map
 key must match its client's region. Empty maps, unknown settings, nested listeners,
 CN and mismatched known service roots fail at startup before binding the listener.
 Paths remain relative to the process working directory, as in single-region mode.

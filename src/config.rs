@@ -14,6 +14,8 @@ pub struct Config {
     pub listen: Option<SocketAddr>,
     #[serde(default)]
     pub tls: Option<crate::server::TlsConfig>,
+    #[serde(default)]
+    pub access_log: Option<crate::access_log::Config>,
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,
@@ -167,6 +169,10 @@ impl Config {
         if let Some(tls) = &self.tls {
             tls.validate()
                 .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;
+        }
+        if let Some(log) = &self.access_log {
+            log.validate()
+                .map_err(|_| AppError::Config("invalid access log configuration"))?;
         }
         crate::accounts::validate(self)?;
         self.upstream.validate()?;

@@ -26,3 +26,5 @@ pub mod response_cache;
 mod transport;
 
 pub mod server;
+
+pub mod access_log;

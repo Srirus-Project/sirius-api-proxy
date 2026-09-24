@@ -16,12 +16,14 @@ pub struct MultiConfig {
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: Option<crate::server::TlsConfig>,
+    #[serde(default)]
+    pub access_log: Option<crate::access_log::Config>,
     pub regions: BTreeMap<String, Config>,
 }
 
 pub enum DeploymentConfig {
     Single(Box<Config>),
-    Multi(MultiConfig),
+    Multi(Box<MultiConfig>),
 }
 
 pub struct Prepared {
@@ -61,6 +63,10 @@ impl DeploymentConfig {
                     tls.validate()
                         .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;
                 }
+                if let Some(log) = &m.access_log {
+                    log.validate()
+                        .map_err(|_| AppError::Config("invalid access log configuration"))?;
+                }
                 if m.regions.is_empty() || m.regions.len() > 4 {
                     return Err(AppError::Config(
                         "configure one to four operational regions",
@@ -72,9 +78,9 @@ impl DeploymentConfig {
                             "region map key must equal the explicit region identity",
                         ));
                     }
-                    if c.listen.is_some() || c.tls.is_some() {
+                    if c.listen.is_some() || c.tls.is_some() || c.access_log.is_some() {
                         return Err(AppError::Config(
-                            "listen and tls belong at the deployment root, not inside regions",
+                            "listen, tls and access_log belong at the deployment root, not inside regions",
                         ));
                     }
                     c.validate()?;
@@ -142,6 +148,13 @@ impl DeploymentConfig {
                 &api_prefix,
                 &internal_prefix,
             ));
+        }
+        let access = match self {
+            Self::Single(c) => c.access_log.as_ref(),
+            Self::Multi(m) => m.access_log.as_ref(),
+        };
+        if let Some(config) = access {
+            router = crate::access_log::AccessLog::new(config.clone())?.wrap(router);
         }
         Ok(Prepared {
             tls,

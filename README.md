@@ -152,3 +152,5 @@ runtime protocol bundle, examples, documentation and licenses. See [release prep
 Repository visibility and workflow activation are separate from preparing a release.
 
 For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
+
+Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
