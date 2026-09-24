@@ -332,7 +332,7 @@ impl MasterUpdater {
                 result = self.update_once() => {
                     match result {
                         Ok(_) => tracing::info!("Master update check completed"),
-                        Err(error) => tracing::warn!(error=%error,"Master update failed; keeping installed snapshot"),
+                        Err(error) => tracing::warn!(error_code=%error,"Master update failed; keeping installed snapshot"),
                     }
                 }
             }

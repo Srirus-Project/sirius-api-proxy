@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
+    #[serde(default)]
     pub region: crate::region::Region,
     #[serde(default)]
     pub platform: Option<crate::region::Platform>,
@@ -168,6 +170,10 @@ impl Config {
         }
     }
     pub fn validate(&self) -> Result<(), AppError> {
+        if let Some(log) = &self.logging {
+            log.validate()
+                .map_err(|_| AppError::Config("invalid application logging configuration"))?;
+        }
         if let Some(tls) = &self.tls {
             tls.validate()
                 .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;

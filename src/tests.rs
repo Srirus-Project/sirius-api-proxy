@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        logging: None,
         region: crate::region::Region::Jp,
         platform: None,
         protocol_directory: crate::config::default_protocol_directory(),
@@ -2024,6 +2025,7 @@ fn deployment_rejects_ambiguous_region_and_token_scope() {
         region::Region,
     };
     let mut m = MultiConfig {
+        logging: None,
         tls: None,
         access_log: None,
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -2083,6 +2085,7 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         configs.insert(region.name().into(), c);
     }
     let deployment = DeploymentConfig::Multi(Box::new(MultiConfig {
+        logging: None,
         tls: None,
         access_log: None,
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -3612,6 +3615,7 @@ fn deployment_tls_is_top_level_and_invalid_material_fails_preparation() {
     let mut region = regional_config(crate::region::Region::Jp);
     region.tls = Some(tls.clone());
     let mut deployment = MultiConfig {
+        logging: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
@@ -4118,4 +4122,114 @@ async fn master_proxy_invalid_secrets_fail_before_any_network_request() {
     assert!(MasterUpdater::new(&cfg, client(&game, cfg.clone())).is_err());
     assert!(cdn.received.lock().unwrap().is_empty());
     assert!(game.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn application_logging_filters_levels_fields_and_dependency_targets_and_flushes_on_drop() {
+    use crate::{
+        access_log::{Format, Output, Rotation},
+        application_log,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("application.log");
+    for _ in 0..2 {
+        let config = application_log::Config {
+            level: application_log::Level::Info,
+            format: Format::Json,
+            output: Output::File {
+                path: path.clone(),
+                rotation: Rotation::Never,
+                max_files: 7,
+            },
+            queue_capacity: 128,
+        };
+        let (subscriber, guard) = config.subscriber().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("debug-must-not-appear");
+            tracing::info!(target: "reqwest::connect", "dependency-secret-must-not-appear");
+            tracing::info!(
+                authorization = "credential-must-not-appear",
+                body = "body-must-not-appear",
+                completed = 7_u64,
+                stage = "verify\nforged-line",
+                "safe application event"
+            );
+            tracing::warn!(error_code = "synthetic_failure", "safe failure event");
+        });
+        drop(guard);
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["fields"]["completed"].as_u64(), Some(7));
+    assert_eq!(
+        rows[0]["fields"]["stage"].as_str(),
+        Some("verify\nforged-line")
+    );
+    assert_eq!(rows[1]["level"].as_str(), Some("WARN"));
+    assert!(!text.contains("must-not-appear"));
+    assert!(!text.contains("\nforged-line"));
+    assert!(rows
+        .iter()
+        .all(|row| row["queue_dropped_records"].as_u64() == Some(0)));
+}
+
+#[test]
+fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
+    use crate::{
+        access_log::{Format, Output, Rotation},
+        application_log,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("events.log");
+    let mut config = application_log::Config {
+        level: application_log::Level::Off,
+        format: Format::Text,
+        output: Output::File {
+            path: path.clone(),
+            rotation: Rotation::Never,
+            max_files: 3,
+        },
+        queue_capacity: 32,
+    };
+    let (subscriber, guard) = config.subscriber().unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::error!("off-must-not-appear");
+    });
+    drop(guard);
+    assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+    config.level = application_log::Level::Trace;
+    let (subscriber, guard) = config.subscriber().unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::trace!(stage = "雪".repeat(2000), "bounded application event");
+    });
+    drop(guard);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("TRACE"));
+    assert!(text.len() < 1400);
+    config.queue_capacity = 0;
+    assert!(config.validate().is_err());
+    config.queue_capacity = 32;
+    let blocked = root.path().join("blocked");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    config.output = Output::File {
+        path: blocked.join("must-not-appear.log"),
+        rotation: Rotation::Never,
+        max_files: 3,
+    };
+    let error = config.subscriber().err().unwrap().to_string();
+    assert!(!error.contains("must-not-appear"));
+    for yaml in [
+        "level: verbose",
+        "queue_capacity: 65537",
+        "output: {type: stderr, path: ignored}",
+        "output: {type: file, path: log, max_files: 0}",
+    ] {
+        assert!(!yaml_serde::from_str::<application_log::Config>(yaml)
+            .is_ok_and(|c| c.validate().is_ok()));
+    }
 }

@@ -1,11 +1,25 @@
 use sirius_api_proxy::{client::GameClient, deployment::DeploymentConfig};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let path = if args.is_empty() || args == ["master-update"] {
+        Some(std::path::PathBuf::from(
+            std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into()),
+        ))
+    } else {
+        None
+    };
+    let _logging = sirius_api_proxy::application_log::Config::from_file(path.as_deref())?.init()?;
+    let result = run().await;
+    if result.is_err() {
+        tracing::error!(
+            error_code = "operation_failed",
+            "Sirius API Proxy stopped with an error"
+        );
+    }
+    result
+}
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == ["--version"] {
         println!("sirius-api-proxy {}", env!("CARGO_PKG_VERSION"));

@@ -28,3 +28,5 @@ mod transport;
 pub mod server;
 
 pub mod access_log;
+
+pub mod application_log;

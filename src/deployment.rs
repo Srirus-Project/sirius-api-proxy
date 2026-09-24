@@ -13,6 +13,8 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultiConfig {
+    #[serde(default)]
+    pub logging: Option<crate::application_log::Config>,
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: Option<crate::server::TlsConfig>,
@@ -59,6 +61,11 @@ impl DeploymentConfig {
         match self {
             Self::Single(c) => c.validate(),
             Self::Multi(m) => {
+                if let Some(log) = &m.logging {
+                    log.validate().map_err(|_| {
+                        AppError::Config("invalid application logging configuration")
+                    })?;
+                }
                 if let Some(tls) = &m.tls {
                     tls.validate()
                         .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;
@@ -78,9 +85,13 @@ impl DeploymentConfig {
                             "region map key must equal the explicit region identity",
                         ));
                     }
-                    if c.listen.is_some() || c.tls.is_some() || c.access_log.is_some() {
+                    if c.listen.is_some()
+                        || c.tls.is_some()
+                        || c.access_log.is_some()
+                        || c.logging.is_some()
+                    {
                         return Err(AppError::Config(
-                            "listen, tls and access_log belong at the deployment root, not inside regions",
+                            "listen, tls, logging and access_log belong at the deployment root, not inside regions",
                         ));
                     }
                     c.validate()?;
