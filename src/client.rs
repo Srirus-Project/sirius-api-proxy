@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
@@ -64,8 +64,10 @@ pub struct GameClient {
     account: Option<(String, String)>,
     cdn_secrets: BTreeMap<String, String>,
     state: Mutex<State>,
-    // One configured account; serialize calls to keep version/credential observations ordered.
+    // Optional account serialization, independent of the protocol activation barrier.
     call_lock: Mutex<()>,
+    protocol_calls: AsyncRwLock<()>,
+    bootstrap_lock: Mutex<()>,
     timeout: Duration,
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
@@ -115,6 +117,8 @@ impl GameClient {
             cdn_secrets,
             state: Mutex::new(state),
             call_lock: Mutex::new(()),
+            protocol_calls: AsyncRwLock::new(()),
+            bootstrap_lock: Mutex::new(()),
             timeout: Duration::from_secs(20),
             protocol: RwLock::new(Arc::new(protocol)),
             reload_lock: Mutex::new(()),
@@ -143,8 +147,8 @@ impl GameClient {
             .await
             .map_err(|_| AppError::ProtocolDefinition)??;
         // Compiling does not pause RPCs. Activation waits for the current logical
-        // call (including Version/Whoami bootstrap) to finish using its old bundle.
-        let _call = self.call_lock.lock().await;
+        // calls (including Version/Whoami bootstrap) to finish using their old bundle.
+        let _calls = self.protocol_calls.write().await;
         let current = self
             .protocol
             .read()
@@ -227,7 +231,12 @@ impl GameClient {
             return Err(AppError::AccountUnavailable);
         }
         let result = tokio::time::timeout(self.timeout, async {
-            let _guard = self.call_lock.lock().await;
+            let _guard = if self.config.session_lock {
+                Some(self.call_lock.lock().await)
+            } else {
+                None
+            };
+            let _protocol_call = self.protocol_calls.read().await;
             let protocol = self
                 .protocol
                 .read()
@@ -235,7 +244,11 @@ impl GameClient {
                 .clone();
             if authenticated(route) && self.state.lock().await.observation.master_version.is_none()
             {
-                self.execute(&protocol, VERSION, json!({})).await?;
+                let _bootstrap = self.bootstrap_lock.lock().await;
+                // Another parallel caller may have initialized Version while we waited.
+                if self.state.lock().await.observation.master_version.is_none() {
+                    self.execute(&protocol, VERSION, json!({})).await?;
+                }
             }
             if route == PLAYER_DATA {
                 // Check the configured identity before returning private account data.

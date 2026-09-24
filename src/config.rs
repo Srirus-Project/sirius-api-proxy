@@ -11,6 +11,9 @@ pub struct Config {
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,
+    /// Serialize logical upstream calls for the configured account by default.
+    #[serde(default = "default_session_lock")]
+    pub session_lock: bool,
     pub api_token_env: String,
     pub internal_token_env: String,
     pub player_id_env: Option<String>,
@@ -21,6 +24,10 @@ pub struct Config {
     pub default_cdn_root: String,
     /// Exact HTTPS roots mapped to environment variable references, never secrets.
     pub cdn_credential_env: BTreeMap<String, String>,
+}
+
+fn default_session_lock() -> bool {
+    true
 }
 
 pub fn default_protocol_directory() -> std::path::PathBuf {

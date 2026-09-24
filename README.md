@@ -41,6 +41,15 @@ Player queries require an existing account: configure both `player_id_env` and
 `player_credential_env`, then provide the referenced secrets. The service does not register,
 transfer or delete accounts. Public profile IDs are different from credential player IDs.
 
+`session_lock` defaults to `true`, including when omitted from existing configuration.
+Set `session_lock: false` to allow concurrent upstream RPCs for the same configured account;
+restart the proxy to apply the change. Upstream concurrency support is not confirmed, and
+server instability can also cause request failures. Keep the default unless testing or
+operating with that uncertainty. The 20-second request deadline includes time waiting for
+serialization, bootstrap or protocol activation. Initial authenticated Version discovery
+remains single-flight, and protocol reload waits for all active logical calls in either mode.
+With concurrency enabled, upstream observations reflect response completion order.
+
 CDN secrets are optional for API-only use. Resource snapshots become ready only when the
 observed CDN and credential match configuration. Secret values are never included in responses.
 Rotate secrets in the deployment environment and restart after a server-side credential change.

@@ -34,6 +34,7 @@ fn config() -> Config {
         environment: "release".into(),
         endpoint: "https://api.bang-dream-on.jp".into(),
         client_version: "1.0.3".into(),
+        session_lock: true,
         api_token_env: "unused".into(),
         internal_token_env: "unused".into(),
         player_id_env: None,
@@ -66,6 +67,7 @@ struct Reply {
     trailers: HeaderMap,
     http_status: u16,
     delay: Duration,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 impl Reply {
     fn version() -> Self {
@@ -81,6 +83,7 @@ impl Reply {
             )]),
             http_status: 200,
             delay: Duration::ZERO,
+            gate: None,
         }
     }
     fn header(mut self, key: &'static str, value: &str) -> Self {
@@ -122,6 +125,9 @@ async fn fixture(replies: Vec<Reply>) -> Fixture {
                             parts.headers,
                             body.to_vec(),
                         ));
+                        if let Some(gate) = &reply.gate {
+                            gate.acquire().await.unwrap().forget();
+                        }
                         tokio::time::sleep(reply.delay).await;
                         // Split the unary message across HTTP DATA frames; gRPC framing is independent.
                         let split = reply.bytes.len().min(3);
@@ -1278,8 +1284,15 @@ fn proto_sources_compile_against_independent_proxy_descriptor_baseline() {
 
 #[tokio::test]
 async fn proto_reload_switches_whole_bundle_after_inflight_call_and_invalidates_snapshot() {
+    for session_lock in [true, false] {
+        check_reload_with_inflight_call(session_lock).await;
+    }
+}
+
+async fn check_reload_with_inflight_call(session_lock: bool) {
     let directory = copy_protocol_bundle();
     let mut cfg = config();
+    cfg.session_lock = session_lock;
     cfg.protocol_directory = directory.path().into();
     // Client starts with the original source schema.
     let mut first = Reply::version().header("x-asset-version", r#"{"version":"v1","iOS":"h1"}"#);
@@ -1672,4 +1685,100 @@ fn master_versions_accept_version_hash_without_allowing_arbitrary_paths() {
         assert!(!crate::master::safe_version(version));
     }
     assert!(!crate::master::safe_component("version/hash"));
+}
+
+#[test]
+fn session_lock_defaults_on_and_accepts_explicit_opt_out() {
+    let source = include_str!("../sirius-api-config.example.yaml");
+    let omitted = source.replace("session_lock: true", "");
+    assert!(
+        yaml_serde::from_str::<Config>(&omitted)
+            .unwrap()
+            .session_lock
+    );
+    let opted_out = source.replace("session_lock: true", "session_lock: false");
+    assert!(
+        !yaml_serde::from_str::<Config>(&opted_out)
+            .unwrap()
+            .session_lock
+    );
+}
+
+async fn wait_for_requests(f: &Fixture, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.received.lock().unwrap().len() < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn session_lock_controls_overlap_of_different_authenticated_apis() {
+    use crate::client::{PROFILE, WHOAMI};
+    for locked in [true, false] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut identity = whoami_reply("ranking-account");
+        identity.gate = Some(gate.clone());
+        let mut profile = Reply::version();
+        profile.bytes = framed(message("app.friend.FindByProfileIDResponse", json!({})));
+        let f = fixture(vec![Reply::version(), identity, profile]).await;
+        let mut cfg = account_config();
+        cfg.session_lock = locked;
+        let c = client(&f, cfg);
+        c.call(VERSION, json!({})).await.unwrap();
+        let first_client = c.clone();
+        let first = tokio::spawn(async move { first_client.call(WHOAMI, json!({})).await });
+        wait_for_requests(&f, 2).await;
+        let second_client = c.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .call(PROFILE, json!({"playerProfileId":"123"}))
+                .await
+        });
+        if locked {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(f.received.lock().unwrap().len(), 2);
+            assert!(!second.is_finished());
+        } else {
+            wait_for_requests(&f, 3).await;
+            // The second request reached the server while Whoami is still blocked.
+            assert!(!first.is_finished());
+        }
+        gate.add_permits(1);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(f.received.lock().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn unlocked_authenticated_bootstrap_is_single_flight() {
+    use crate::client::WHOAMI;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut version = Reply::version();
+    version.gate = Some(gate.clone());
+    let f = fixture(vec![
+        version,
+        whoami_reply("ranking-account"),
+        whoami_reply("ranking-account"),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    let c = client(&f, cfg);
+    let a = c.clone();
+    let first = tokio::spawn(async move { a.call(WHOAMI, json!({})).await });
+    wait_for_requests(&f, 1).await;
+    let b = c.clone();
+    let second = tokio::spawn(async move { b.call(WHOAMI, json!({})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    let received = f.received.lock().unwrap();
+    assert_eq!(received.len(), 3);
+    assert_eq!(received.iter().filter(|r| r.0 == VERSION).count(), 1);
 }

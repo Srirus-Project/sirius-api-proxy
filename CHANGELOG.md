@@ -2,6 +2,7 @@
 
 ## 1.0.0 — prepared, not published
 
+- Add a default-on `session_lock` configuration switch for upstream RPC serialization.
 - Initial public-release candidate for BanG Dream! Our Notes.
 - Replace the pre-release Viola codename with Sirius configuration filenames,
   SIRIUS_* environment variables and container user names. Old names are not aliases.

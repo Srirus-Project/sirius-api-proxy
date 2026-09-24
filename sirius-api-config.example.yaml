@@ -2,6 +2,9 @@ listen: 127.0.0.1:9999
 environment: release
 endpoint: https://api.bang-dream-on.jp
 client_version: 1.0.3
+# Serialize upstream calls for the configured account. Restart after changing.
+# Set false to allow concurrent calls; upstream concurrency support is unconfirmed.
+session_lock: true
 protocol_directory: ./protocol/sirius/1.0.3
 api_token_env: SIRIUS_API_TOKEN
 internal_token_env: SIRIUS_INTERNAL_TOKEN
