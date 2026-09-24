@@ -4233,3 +4233,157 @@ fn application_logging_off_text_bounds_and_invalid_output_are_enforced() {
             .is_ok_and(|c| c.validate().is_ok()));
     }
 }
+
+#[tokio::test]
+async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
+    use crate::asset_jobs::{Client, Error, Operation, Request, Status};
+    use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::any, Router};
+    use sha2::{Digest, Sha256};
+    let id = uuid::Uuid::new_v4().to_string();
+    let request = Request {
+        region: crate::region::Region::Jp,
+        profile: "full".into(),
+        operation: Operation::Update,
+    };
+    let queued = serde_json::json!({"id":id,"request":request,"status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(b"key-1"))});
+    let state = std::sync::Arc::new(std::sync::Mutex::new((
+        axum::http::StatusCode::ACCEPTED,
+        queued.clone(),
+        0u64,
+    )));
+    let app = Router::new()
+        .route(
+            "/{*path}",
+            any(
+                |State(state): State<
+                    std::sync::Arc<
+                        std::sync::Mutex<(axum::http::StatusCode, serde_json::Value, u64)>,
+                    >,
+                >,
+                 method: axum::http::Method,
+                 headers: HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    assert_eq!(headers["authorization"], "Bearer fixture-updater-only");
+                    assert!(!headers.contains_key("proxy-authorization"));
+                    if method == axum::http::Method::POST {
+                        assert_eq!(headers["idempotency-key"], "key-1");
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["region"],
+                            "jp"
+                        );
+                    }
+                    let (status, value, delay) = state.lock().unwrap().clone();
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    (
+                        status,
+                        [("location", "http://127.0.0.1:1/forbidden")],
+                        axum::Json(value),
+                    )
+                        .into_response()
+                },
+            ),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = Client::new(&root, "fixture-updater-only", true, 200).unwrap();
+    let job = client.submit(&request, "key-1").await.unwrap();
+    assert_eq!(job.id, id);
+    assert_eq!(job.status, Status::Queued);
+    state.lock().unwrap().0 = axum::http::StatusCode::OK;
+    assert_eq!(client.get(&id, &request).await.unwrap().id, id);
+    let mut completed = queued.clone();
+    completed["status"] = "completed".into();
+    completed["outcome"] = serde_json::json!({"verification":{"region":"jp","platform":"iOS","environment":"production","resource_version":"version-1","platform_hash":"hash-1","catalog_sha256":"a".repeat(64),"full_catalog":true,"catalog_verified":true},"export":{"full_export":true,"retained":false,"files":2,"bytes":16},"publication_id":uuid::Uuid::new_v4().to_string()});
+    state.lock().unwrap().1 = completed.clone();
+    assert!(
+        client
+            .get(&id, &request)
+            .await
+            .unwrap()
+            .outcome
+            .unwrap()
+            .verification
+            .full_catalog
+    );
+    for bad in [
+        {
+            let mut v = completed.clone();
+            v["outcome"]["verification"]["region"] = "en".into();
+            v
+        },
+        {
+            let mut v = completed.clone();
+            v["outcome"]["verification"]["catalog_sha256"] = "not-sha".into();
+            v
+        },
+        {
+            let mut v = completed.clone();
+            v["status"] = "failed".into();
+            v
+        },
+        {
+            let mut v = queued.clone();
+            v["id"] = uuid::Uuid::new_v4().to_string().into();
+            v
+        },
+        {
+            let mut v = queued.clone();
+            v["request"]["profile"] = "other".into();
+            v
+        },
+        serde_json::json!({"padding":"x".repeat(65537)}),
+    ] {
+        state.lock().unwrap().1 = bad;
+        assert!(matches!(
+            client.get(&id, &request).await,
+            Err(Error::Protocol)
+        ));
+    }
+    *state.lock().unwrap() = (axum::http::StatusCode::ACCEPTED, queued.clone(), 0);
+    state.lock().unwrap().1["idempotency_sha256"] = "b".repeat(64).into();
+    assert!(matches!(
+        client.submit(&request, "key-1").await,
+        Err(Error::Protocol)
+    ));
+    for status in [302, 401, 404, 409, 429, 503] {
+        *state.lock().unwrap() = (
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            serde_json::json!({"secret":"never-forward-this"}),
+            0,
+        );
+        let error = client.submit(&request, "key-1").await.unwrap_err();
+        assert!(matches!(error,Error::Status(code) if code==status));
+        assert!(!error.to_string().contains("never-forward"));
+    }
+    *state.lock().unwrap() = (axum::http::StatusCode::OK, queued, 1000);
+    assert!(matches!(
+        client.get(&id, &request).await,
+        Err(Error::Transport)
+    ));
+    assert!(matches!(
+        client.get("../other", &request).await,
+        Err(Error::Config)
+    ));
+    assert!(matches!(
+        client.submit(&request, "bad key").await,
+        Err(Error::Config)
+    ));
+    let mut reserved = request.clone();
+    reserved.region = crate::region::Region::Cn;
+    assert!(matches!(
+        client.submit(&reserved, "key-1").await,
+        Err(Error::Config)
+    ));
+    assert!(Client::new(&root, "token", false, 200).is_err());
+    for root in [
+        "https://user:pass@example.com",
+        "https://example.com/path",
+        "https://example.com?token=value",
+    ] {
+        assert!(Client::new(root, "token", false, 200).is_err());
+    }
+    assert!(Client::new("https://example.com", "token\nsecret", false, 200).is_err());
+    server.abort();
+}
