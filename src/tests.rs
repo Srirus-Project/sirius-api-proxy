@@ -39,6 +39,8 @@ fn config() -> Config {
         session_lock: true,
         api_token_env: "unused".into(),
         internal_token_env: "unused".into(),
+        accounts: Vec::new(),
+        account_pool: Default::default(),
         player_id_env: None,
         player_credential_env: None,
         master_directory: None,
@@ -2182,4 +2184,292 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         assert_eq!(body["generation"], 1);
         assert_eq!(body["codec"], "native");
     }
+}
+
+fn pool_config() -> Config {
+    let mut c = config();
+    for name in ["one", "two"] {
+        let id = format!("SIRIUS_POOL_{}", uuid::Uuid::new_v4().simple());
+        let key = format!("{id}_KEY");
+        std::env::set_var(&id, format!("player-{name}"));
+        std::env::set_var(&key, format!("secret-{name}"));
+        c.accounts.push(crate::accounts::AccountConfig {
+            name: name.into(),
+            player_id_env: Some(id),
+            credential_env: Some(key),
+            credentials_file: None,
+        });
+    }
+    c
+}
+fn empty_profile_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message("app.friend.FindByProfileIDResponse", json!({})));
+    reply
+}
+
+#[tokio::test]
+async fn pool_balances_accounts_and_keeps_each_session_serialized() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        blocked,
+        empty_profile_reply(),
+        whoami_reply("player-one"),
+    ])
+    .await;
+    let c = client(&f, pool_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let a = c.clone();
+    let first = tokio::spawn(async move {
+        a.call(crate::client::PROFILE, json!({"playerProfileId":"123"}))
+            .await
+    });
+    wait_for_requests(&f, 2).await;
+    // A different account can complete while account one is blocked.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"456"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!first.is_finished());
+    let a = c.clone();
+    let same = tokio::spawn(async move { a.call_account("one", crate::client::WHOAMI).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    same.await.unwrap().unwrap();
+    let seen = f.received.lock().unwrap();
+    assert!(!seen[0].1.contains_key("x-player-id"));
+    assert_eq!(seen[1].1["x-player-id"], "player-one");
+    assert_eq!(seen[2].1["x-player-id"], "player-two");
+    assert_eq!(seen[3].1["x-player-id"], "player-one");
+    let status = c.account_status().unwrap().to_string();
+    assert!(!status.contains("player-one"));
+    assert!(!status.contains("secret-one"));
+}
+
+#[tokio::test]
+async fn pool_disables_failed_auth_without_replaying_request_or_changing_private_identity() {
+    let mut denied = empty_profile_reply();
+    denied.trailers.insert("grpc-status", "16".parse().unwrap());
+    let f = fixture(vec![Reply::version(), denied, empty_profile_reply()]).await;
+    let c = client(&f, pool_config());
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Grpc(16))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2); // no failover retry
+    assert_eq!(c.account_status().unwrap()["accounts"][0]["disabled"], true);
+    assert!(matches!(
+        c.call(crate::client::WHOAMI, json!({})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"2"}))
+        .await
+        .unwrap();
+    assert_eq!(f.received.lock().unwrap()[2].1["x-player-id"], "player-two");
+    assert!(matches!(
+        c.call_account("missing", crate::client::WHOAMI).await,
+        Err(AppError::NotFound)
+    ));
+    let app = api::router(c, "public".into(), "private".into());
+    for (path, method, token, expected) in [
+        ("/internal/v1/accounts", "GET", "public", 401),
+        ("/internal/v1/accounts/reload", "POST", "public", 401),
+        (
+            "/internal/v1/accounts/one/player-data",
+            "GET",
+            "public",
+            401,
+        ),
+        ("/internal/v1/accounts", "GET", "private", 200),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+}
+
+fn write_account_file(path: &std::path::Path, player: &str, key: &str) {
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+    use std::io::Write;
+    write!(temp, "{}", json!({"player_id":player,"credential":key})).unwrap();
+    temp.persist(path).unwrap();
+}
+
+#[tokio::test]
+async fn pool_reload_drains_active_calls_and_rolls_back_invalid_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.json");
+    write_account_file(&path, "old-player", "old-key");
+    let mut cfg = config();
+    cfg.accounts.push(crate::accounts::AccountConfig {
+        name: "primary".into(),
+        player_id_env: None,
+        credential_env: None,
+        credentials_file: Some(path.clone()),
+    });
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut identity = whoami_reply("old-player");
+    identity.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        identity,
+        whoami_reply("new-player"),
+        whoami_reply("new-player"),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    let a = c.clone();
+    let first = tokio::spawn(async move { a.call_account("primary", crate::client::WHOAMI).await });
+    wait_for_requests(&f, 2).await;
+    write_account_file(&path, "new-player", "new-key");
+    let a = c.clone();
+    let reload = tokio::spawn(async move { a.reload_accounts().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!reload.is_finished());
+    assert_eq!(c.account_status().unwrap()["generation"], 1);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert_eq!(reload.await.unwrap().unwrap()["generation"], 2);
+    c.call_account("primary", crate::client::WHOAMI)
+        .await
+        .unwrap();
+    std::fs::write(&path, "invalid-secret-file").unwrap();
+    assert!(c.reload_accounts().await.is_err());
+    assert_eq!(c.account_status().unwrap()["generation"], 2);
+    c.call_account("primary", crate::client::WHOAMI)
+        .await
+        .unwrap();
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen[1].1["x-player-credential"], "old-key");
+    assert_eq!(seen[2].1["x-player-credential"], "new-key");
+    assert_eq!(seen[3].1["x-player-credential"], "new-key");
+}
+
+#[tokio::test]
+async fn pool_timeout_cools_down_and_recovers_without_losing_reservations() {
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg.account_pool.failure_threshold = 1;
+    cfg.account_pool.cooldown_seconds = 1;
+    let mut slow = empty_profile_reply();
+    slow.delay = Duration::from_millis(500);
+    let f = fixture(vec![Reply::version(), slow, empty_profile_reply()]).await;
+    let mut c = client(&f, cfg);
+    GameClient::set_test_timeout(&mut c, Duration::from_millis(100));
+    c.call(VERSION, json!({})).await.unwrap();
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Timeout)
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["active_calls"], 0);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 1);
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::AccountUnavailable)
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        0
+    );
+}
+
+#[test]
+fn pool_rejects_duplicate_identity_mixed_sources_and_unsafe_credentials_files() {
+    let mut cfg = pool_config();
+    cfg.player_id_env = Some("legacy".into());
+    assert!(cfg.validate().is_err());
+    cfg.player_id_env = None;
+    cfg.accounts[1].name = "one".into();
+    assert!(cfg.validate().is_err());
+    cfg.accounts[1].name = "two".into();
+    std::env::set_var(
+        cfg.accounts[1].player_id_env.as_ref().unwrap(),
+        "player-one",
+    );
+    assert!(crate::accounts::Pool::load(&cfg, 1).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials.json");
+    write_account_file(&path, "file-player", "file-key");
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].credentials_file = Some(path.clone());
+    assert!(cfg.validate().is_err());
+    cfg.accounts[0].player_id_env = None;
+    cfg.accounts[0].credential_env = None;
+    assert!(crate::accounts::Pool::load(&cfg, 1).is_ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(crate::accounts::Pool::load(&cfg, 1).is_err());
+    }
+}
+
+#[tokio::test]
+async fn pool_bootstrap_failure_and_caller_cancellation_do_not_poison_health() {
+    let mut failed_version = Reply::version();
+    failed_version
+        .trailers
+        .insert("grpc-status", "16".parse().unwrap());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![failed_version, Reply::version(), blocked]).await;
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    let c = client(&f, cfg);
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Grpc(16))
+    ));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["disabled"],
+        false
+    );
+    let a = c.clone();
+    let task = tokio::spawn(async move {
+        a.call(crate::client::PROFILE, json!({"playerProfileId":"2"}))
+            .await
+    });
+    wait_for_requests(&f, 3).await;
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        1
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["active_calls"], 0);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    tokio::time::timeout(Duration::from_secs(2), c.reload_accounts())
+        .await
+        .unwrap()
+        .unwrap();
+    gate.add_permits(1);
 }

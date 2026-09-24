@@ -80,6 +80,10 @@ pub fn router_at(
         .route("/protocol/reload", post(protocol_reload))
         .route("/resources/snapshot", get(snapshot))
         .route("/account", get(account))
+        .route("/accounts", get(accounts))
+        .route("/accounts/reload", post(reload_accounts))
+        .route("/accounts/{name}/identity", get(named_account))
+        .route("/accounts/{name}/player-data", get(named_player_data))
         .route("/master-data/updater", get(master_update_status))
         .route("/account/player-data", get(player_data))
         .route_layer(middleware::from_fn_with_state(
@@ -197,6 +201,25 @@ async fn profile(
 }
 async fn snapshot(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
     c.snapshot().await.map(Json)
+}
+
+async fn accounts(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
+    c.account_status().map(Json)
+}
+async fn reload_accounts(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
+    c.reload_accounts().await.map(Json)
+}
+async fn named_account(
+    State(c): State<Arc<GameClient>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    c.call_account(&name, WHOAMI).await.map(Json)
+}
+async fn named_player_data(
+    State(c): State<Arc<GameClient>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    c.call_account(&name, PLAYER_DATA).await.map(Json)
 }
 
 async fn account(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {

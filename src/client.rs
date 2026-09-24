@@ -62,7 +62,7 @@ pub struct GameClient {
     http: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     protocol: RwLock<Arc<ProtocolBundle>>,
     reload_lock: Mutex<()>,
-    account: Option<(String, String)>,
+    accounts: std::sync::Mutex<crate::accounts::Pool>,
     cdn_secrets: BTreeMap<String, String>,
     state: Mutex<State>,
     // Optional account serialization, independent of the protocol activation barrier.
@@ -96,11 +96,7 @@ impl GameClient {
         let http = Client::builder(TokioExecutor::new())
             .http2_only(true)
             .build(connector);
-        let account = match (&config.player_id_env, &config.player_credential_env) {
-            (Some(id), Some(credential)) => Some((secret(id)?, secret(credential)?)),
-            (None, None) => None,
-            _ => return Err(AppError::Config("both account references required")),
-        };
+        let accounts = crate::accounts::Pool::load(&config, 1)?;
         let cdn_secrets = config
             .cdn_credential_env
             .iter()
@@ -117,7 +113,7 @@ impl GameClient {
         Ok(Arc::new(Self {
             config,
             http,
-            account,
+            accounts: std::sync::Mutex::new(accounts),
             cdn_secrets,
             state: Mutex::new(state),
             call_lock: Mutex::new(()),
@@ -238,45 +234,119 @@ impl GameClient {
         let stale = s.snapshot_stale || (Utc::now() - snapshot.observed_at).num_seconds() > 300;
         Ok(json!({"snapshot":snapshot,"stale":stale}))
     }
+    pub fn account_status(&self) -> Result<Value, AppError> {
+        let pool = self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)?;
+        Ok(json!({"generation": pool.generation, "accounts": pool.status()}))
+    }
+    pub async fn reload_accounts(&self) -> Result<Value, AppError> {
+        let _reload = self.reload_lock.lock().await;
+        let generation = self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)?
+            .generation
+            .checked_add(1)
+            .ok_or(AppError::AccountUnavailable)?;
+        let config = self.config.clone();
+        let candidate =
+            tokio::task::spawn_blocking(move || crate::accounts::Pool::load(&config, generation))
+                .await
+                .map_err(|_| AppError::AccountUnavailable)??;
+        // Activation drains logical calls before replacing locks and credentials.
+        let _calls = self.protocol_calls.write().await;
+        *self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)? = candidate;
+        self.account_status()
+    }
     pub async fn call(&self, route: &str, input: Value) -> Result<Value, AppError> {
-        // No generic passthrough: only these read operations are supported.
+        self.call_selected(route, input, None).await
+    }
+    pub async fn call_account(&self, name: &str, route: &str) -> Result<Value, AppError> {
+        if !matches!(route, WHOAMI | PLAYER_DATA) {
+            return Err(AppError::InvalidRequest);
+        }
+        self.call_selected(route, json!({}), Some(name)).await
+    }
+    async fn call_selected(
+        &self,
+        route: &str,
+        input: Value,
+        name: Option<&str>,
+    ) -> Result<Value, AppError> {
         if !crate::routes::ROUTES.contains(&route) && route != crate::routes::SERVER_LIST {
             return Err(AppError::InvalidRequest);
         }
         if !self.supported_routes().contains(&route) {
             return Err(AppError::UnsupportedRegionOperation);
         }
-        if authenticated(route) && self.account.is_none() {
-            return Err(AppError::AccountUnavailable);
-        }
-        let result = tokio::time::timeout(self.timeout, async {
-            let _guard = if self.config.session_lock {
-                Some(self.call_lock.lock().await)
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let result = async {
+            let _protocol_call = tokio::time::timeout_at(deadline, self.protocol_calls.read())
+                .await
+                .map_err(|_| AppError::Timeout)?;
+            let lease = if authenticated(route) {
+                Some(
+                    self.accounts
+                        .lock()
+                        .map_err(|_| AppError::AccountUnavailable)?
+                        .select(name, matches!(route, WHOAMI | PLAYER_DATA))?,
+                )
             } else {
                 None
             };
-            let _protocol_call = self.protocol_calls.read().await;
-            let protocol = self
-                .protocol
-                .read()
-                .map_err(|_| AppError::ProtocolDefinition)?
-                .clone();
-            if authenticated(route) && self.state.lock().await.observation.master_version.is_none()
-            {
-                let _bootstrap = self.bootstrap_lock.lock().await;
-                // Another parallel caller may have initialized Version while we waited.
-                if self.state.lock().await.observation.master_version.is_none() {
-                    self.execute(&protocol, VERSION, json!({})).await?;
+            let account = lease.as_ref().map(|l| l.account.as_ref());
+            let _guard = tokio::time::timeout_at(deadline, async {
+                if self.config.session_lock {
+                    Some(match account {
+                        Some(a) => a.lock.lock().await,
+                        None => self.call_lock.lock().await,
+                    })
+                } else {
+                    None
+                }
+            })
+            .await
+            .map_err(|_| AppError::Timeout)?;
+            if account.is_some_and(|a| !a.available()) {
+                return Err(AppError::AccountUnavailable);
+            }
+
+            let mut account_attempted = false;
+            let result = tokio::time::timeout_at(deadline, async {
+                let protocol = self
+                    .protocol
+                    .read()
+                    .map_err(|_| AppError::ProtocolDefinition)?
+                    .clone();
+                if authenticated(route)
+                    && self.state.lock().await.observation.master_version.is_none()
+                {
+                    let _bootstrap = self.bootstrap_lock.lock().await;
+                    if self.state.lock().await.observation.master_version.is_none() {
+                        self.execute(&protocol, VERSION, json!({}), None).await?;
+                    }
+                }
+                account_attempted = authenticated(route);
+                if route == PLAYER_DATA {
+                    self.execute(&protocol, WHOAMI, json!({}), account).await?;
+                }
+                self.execute(&protocol, route, input, account).await
+            })
+            .await
+            .unwrap_or(Err(AppError::Timeout));
+            if account_attempted {
+                if let Some(lease) = &lease {
+                    lease.report(&result, &self.config.account_pool);
                 }
             }
-            if route == PLAYER_DATA {
-                // Check the configured identity before returning private account data.
-                self.execute(&protocol, WHOAMI, json!({})).await?;
-            }
-            self.execute(&protocol, route, input).await
-        })
+            result
+        }
         .await;
-        let result = result.unwrap_or(Err(AppError::Timeout));
         if matches!(
             result,
             Err(AppError::Timeout | AppError::Transport | AppError::Protocol)
@@ -293,6 +363,7 @@ impl GameClient {
         protocol: &ProtocolBundle,
         route: &str,
         input: Value,
+        account: Option<&crate::accounts::Account>,
     ) -> Result<Value, AppError> {
         let encoded = protocol.encode(route, input)?;
         let mut frame = Vec::with_capacity(encoded.len() + 5);
@@ -316,10 +387,10 @@ impl GameClient {
         }
         // Anonymous endpoints never receive game credentials.
         if authenticated(route) {
-            let (id, credential) = self.account.as_ref().ok_or(AppError::AccountUnavailable)?;
+            let account = account.ok_or(AppError::AccountUnavailable)?;
             request = request
-                .header("x-player-id", id)
-                .header("x-player-credential", credential);
+                .header("x-player-id", &account.player_id)
+                .header("x-player-credential", &account.credential);
         }
         let response = self
             .http
@@ -373,7 +444,7 @@ impl GameClient {
         let value = protocol.decode(route, &bytes[5..])?;
         if route == WHOAMI
             && value.get("playerId").and_then(Value::as_str)
-                != self.account.as_ref().map(|(id, _)| id.as_str())
+                != account.map(|a| a.player_id.as_str())
         {
             return Err(AppError::Protocol);
         }

@@ -20,6 +20,10 @@ pub struct Config {
     pub session_lock: bool,
     pub api_token_env: String,
     pub internal_token_env: String,
+    #[serde(default)]
+    pub accounts: Vec<crate::accounts::AccountConfig>,
+    #[serde(default)]
+    pub account_pool: crate::accounts::PoolPolicy,
     pub player_id_env: Option<String>,
     pub player_credential_env: Option<String>,
     /// Optional immutable Master JSON snapshot store written by master-import.
@@ -104,6 +108,7 @@ impl Config {
         }
     }
     pub fn validate(&self) -> Result<(), AppError> {
+        crate::accounts::validate(self)?;
         if self.region == crate::region::Region::Cn {
             return Err(AppError::Config(
                 "cn is reserved; no verified endpoint or protocol is available",

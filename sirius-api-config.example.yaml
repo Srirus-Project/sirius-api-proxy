@@ -26,3 +26,13 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 default_cdn_root: https://static.bang-dream-on.jp
 cdn_credential_env:
   https://static.bang-dream-on.jp: SIRIUS_CDN_CREDENTIAL
+
+# Optional existing-account pool replaces the legacy account references above.
+# See docs/ACCOUNTS.md for credential files, reload and failure policy.
+# accounts:
+#   - name: primary
+#     player_id_env: SIRIUS_JP_PRIMARY_ID
+#     credential_env: SIRIUS_JP_PRIMARY_CREDENTIAL
+account_pool:
+  failure_threshold: 2
+  cooldown_seconds: 30

@@ -47,9 +47,11 @@ For one process serving multiple regions, see [multi-region configuration](docs/
 Keep the bundled `protocol/` directory beside the executable and run from that directory,
 or configure an absolute `protocol_directory`. No external protoc, Redis or database is needed.
 
-Player queries require an existing account: configure both `player_id_env` and
+Player queries require an existing account: use `accounts`, or configure both `player_id_env` and
 `player_credential_env`, then provide the referenced secrets. The service does not register,
 transfer or delete accounts. Public profile IDs are different from credential player IDs.
+
+For multiple existing accounts, see [account pool and live credential rotation](docs/ACCOUNTS.md).
 
 `session_lock` defaults to `true`, including when omitted from existing configuration.
 Set `session_lock: false` to allow concurrent upstream RPCs for the same configured account;
@@ -130,7 +132,8 @@ Restrict internal routes at the reverse proxy as well as through their separate 
 The current JP baseline has been exercised for identity, account data, public profiles,
 announcements, song rankings, 235 Master tables and native/dynamic protocol switching.
 Event/challenge business responses and an established friendship were not covered by live testing.
-No account pool, multi-node coordination, response cache or automatic RPC retries are provided.
+Account pooling and per-region clients are available. Multi-node coordination, response caching
+and configurable RPC retry policy remain pending in the 1.2.0 restoration ledger.
 Upstream availability is outside this service's control.
 
 ## Development and release
