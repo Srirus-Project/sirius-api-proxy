@@ -1,0 +1,22 @@
+listen: 127.0.0.1:9999
+environment: release
+endpoint: https://api.bang-dream-on.jp
+client_version: 1.0.3
+protocol_directory: ./protocol/sirius/1.0.3
+api_token_env: SIRIUS_API_TOKEN
+internal_token_env: SIRIUS_INTERNAL_TOKEN
+# Optional existing game account; both references must be set together.
+# player_id_env: SIRIUS_PLAYER_ID
+# player_credential_env: SIRIUS_PLAYER_CREDENTIAL
+# Local JSON snapshots; populate using master-import before enabling.
+# master_directory: ./master-data
+# Enable only when CDN username/password and Master key/IV are configured.
+# Runs once on startup, then waits this interval after each completed attempt.
+# master_update:
+#   username_env: SIRIUS_CDN_USERNAME
+#   key_hex_env: SIRIUS_MASTER_KEY_HEX
+#   iv_hex_env: SIRIUS_MASTER_IV_HEX
+#   interval_seconds: 300
+default_cdn_root: https://static.bang-dream-on.jp
+cdn_credential_env:
+  https://static.bang-dream-on.jp: SIRIUS_CDN_CREDENTIAL

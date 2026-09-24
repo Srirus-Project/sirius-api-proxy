@@ -1,0 +1,10 @@
+syntax = "proto3";
+package entity;
+
+message ExshopPayment {
+  int64 claim_id = 1;
+  int64 shop_id = 2;
+}
+message PersonalNotification {
+  repeated .entity.ExshopPayment ex_shop_payments = 1;
+}

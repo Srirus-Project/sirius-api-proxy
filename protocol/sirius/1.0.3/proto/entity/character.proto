@@ -1,0 +1,19 @@
+syntax = "proto3";
+package entity;
+
+message CharacterRank {
+  int64 character_id = 1;
+  int32 exp = 2;
+}
+message CharacterFriendship {
+  int64 friendship_id = 1;
+  int32 exp = 2;
+}
+message CharacterRankReward {
+  int64 reward_id = 1;
+  bool gained = 2;
+}
+message CharacterFriendshipRankReward {
+  int64 friendship_id = 1;
+  int64 reward_id = 2;
+}

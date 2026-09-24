@@ -1,0 +1,40 @@
+syntax = "proto3";
+package entity;
+
+message Deck {
+  int32 id = 1;
+  string name = 2;
+  repeated .entity.DeckCard cards = 3;
+  int32 total_power = 4;
+}
+message DeckCard {
+  int32 slot_index = 1;
+  int32 performance_order_index = 2;
+  int64 member_card_id = 3;
+  int64 support_card_id = 4;
+}
+message DeckDetail {
+  int32 id = 1;
+  string name = 2;
+  repeated .entity.DeckCardDetail cards = 3;
+  int32 total_power = 4;
+}
+message DeckMemberCardDetail {
+  int64 card_id = 1;
+  int32 exp = 2;
+  int32 awake_count = 3;
+  int32 card_rank = 4;
+  int32 live_skill_level = 5;
+  int32 performance_skill_level = 6;
+}
+message DeckSupportCardDetail {
+  int64 card_id = 1;
+  int32 exp = 2;
+  int32 rank = 3;
+}
+message DeckCardDetail {
+  int32 slot_index = 1;
+  int32 performance_order_index = 2;
+  .entity.DeckMemberCardDetail member_card = 3;
+  .entity.DeckSupportCardDetail support_card = 4;
+}

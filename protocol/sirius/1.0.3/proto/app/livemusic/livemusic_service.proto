@@ -1,0 +1,20 @@
+syntax = "proto3";
+package app.livemusic;
+import "entity/deck.proto";
+import "entity/player_profile.proto";
+
+message GetRankingRequest {
+  int64 music_id = 1;
+}
+message LiveRankingPlayer {
+  .entity.PlayerSimpleProfile player_data = 1;
+  int32 score = 3;
+  .entity.DeckDetail high_score_deck = 4;
+}
+message GetRankingResponse {
+  repeated .app.livemusic.LiveRankingPlayer players = 1;
+  int32 my_rank = 2;
+}
+service LiveMusicService {
+  rpc GetRanking (.app.livemusic.GetRankingRequest) returns (.app.livemusic.GetRankingResponse);
+}

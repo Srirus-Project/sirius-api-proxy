@@ -1,0 +1,6 @@
+syntax = "proto3";
+package entity;
+
+message TutorialProgress {
+  int64 finished_at = 1;
+}

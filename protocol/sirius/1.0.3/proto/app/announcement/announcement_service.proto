@@ -1,0 +1,31 @@
+syntax = "proto3";
+package app.announcement;
+import "entity/announcement.proto";
+import "entity/method_options/method_options.proto";
+
+message GetListRequest {
+  .app.announcement.Tab selected_tab = 1;
+}
+message GetListResponse {
+  repeated .entity.Announcement announcements = 1;
+  repeated .entity.AnnouncementExternalContent external_contents = 2;
+}
+message GetRequest {
+  int64 id = 1;
+}
+message GetResponse {
+  .entity.Announcement announcement = 1;
+}
+enum Tab {
+  ALL = 0;
+  OPENING_EVENTS = 1;
+  BUG = 2;
+}
+service AnnouncementService {
+  rpc GetList (.app.announcement.GetListRequest) returns (.app.announcement.GetListResponse) {
+    option (entity.method_options.skip_authentication) = true;
+  }
+  rpc Get (.app.announcement.GetRequest) returns (.app.announcement.GetResponse) {
+    option (entity.method_options.skip_authentication) = true;
+  }
+}

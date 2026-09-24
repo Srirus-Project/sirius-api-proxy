@@ -1,0 +1,12 @@
+syntax = "proto3";
+package entity;
+
+message MonthlyPassState {
+  int64 monthly_pass_id = 1;
+  int64 purchased_at = 2;
+  int64 expire_at = 3;
+  int32 last_daily_reward_day_number = 4;
+  int32 group_purchase_count = 5;
+  int64 free_gacha_used_at = 6;
+  bool is_extension_purchased = 7;
+}

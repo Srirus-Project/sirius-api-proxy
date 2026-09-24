@@ -1,0 +1,7 @@
+syntax = "proto3";
+package entity;
+
+message MusicPuzzle {
+  int64 music_id = 1;
+  string result_json = 2;
+}

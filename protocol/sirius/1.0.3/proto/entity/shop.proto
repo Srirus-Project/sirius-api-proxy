@@ -1,0 +1,15 @@
+syntax = "proto3";
+package entity;
+
+message PurchaseTransaction {
+  .entity.PurchasePlatform platform = 1;
+  string receipt_id = 2;
+  int64 shop_id = 3;
+}
+enum PurchasePlatform {
+  PURCHASE_PLATFORM_NONE = 0;
+  PURCHASE_PLATFORM_APPLE = 1;
+  PURCHASE_PLATFORM_ANDROID = 2;
+  PURCHASE_PLATFORM_EXTERNAL = 3;
+  PURCHASE_PLATFORM_DEBUG = 99;
+}

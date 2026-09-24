@@ -1,0 +1,14 @@
+syntax = "proto3";
+package app.friend;
+import "entity/player_profile.proto";
+
+message FindByProfileIDRequest {
+  int64 player_profile_id = 1;
+}
+message FindByProfileIDResponse {
+  .entity.PlayerSimpleProfile player_profile = 2;
+  reserved 1;
+}
+service FriendService {
+  rpc FindByProfileID (.app.friend.FindByProfileIDRequest) returns (.app.friend.FindByProfileIDResponse);
+}

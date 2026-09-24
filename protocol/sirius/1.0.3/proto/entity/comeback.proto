@@ -1,0 +1,8 @@
+syntax = "proto3";
+package entity;
+
+message Comeback {
+  int64 last_login_date = 1;
+  int64 comeback_at = 2;
+  int32 comeback_days = 3;
+}

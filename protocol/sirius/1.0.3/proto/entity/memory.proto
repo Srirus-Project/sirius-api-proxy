@@ -1,0 +1,17 @@
+syntax = "proto3";
+package entity;
+
+message MemoryMusics {
+  int64 memory_music_bonus_group = 1;
+}
+message MemoryMembers {
+  int64 member_card_id = 1;
+}
+message MemorySupports {
+  int64 support_card_id = 1;
+}
+message MemoryStatus {
+  repeated .entity.MemoryMusics memory_musics = 1;
+  repeated .entity.MemoryMembers memory_members = 2;
+  repeated .entity.MemorySupports memory_supports = 3;
+}

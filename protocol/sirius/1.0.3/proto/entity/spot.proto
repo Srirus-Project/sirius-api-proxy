@@ -1,0 +1,7 @@
+syntax = "proto3";
+package entity;
+
+message Spot {
+  int64 id = 1;
+  optional int64 got_at = 2;
+}

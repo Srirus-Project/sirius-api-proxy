@@ -1,0 +1,6 @@
+syntax = "proto3";
+package entity;
+
+message CarouselHelp {
+  int64 master_id = 1;
+}
