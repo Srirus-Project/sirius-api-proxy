@@ -2641,6 +2641,7 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
 
 fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
     crate::response_cache::Config::Memory {
+        route_ttl_ms: BTreeMap::new(),
         ttl_ms,
         max_entries: 4,
         max_bytes: 8192,
@@ -2740,6 +2741,7 @@ async fn response_cache_does_not_store_failures_or_reuse_different_inputs() {
 async fn memory_response_cache_enforces_ttl_entry_and_total_bounds() {
     use crate::response_cache::{Cache, Config};
     let c = Cache::new(Config::Memory {
+        route_ttl_ms: BTreeMap::new(),
         ttl_ms: 30,
         max_entries: 1,
         max_bytes: 1024,
@@ -2757,6 +2759,7 @@ async fn memory_response_cache_enforces_ttl_entry_and_total_bounds() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert!(c.get("second").await.is_none());
     assert!(Config::Memory {
+        route_ttl_ms: BTreeMap::new(),
         ttl_ms: 0,
         max_entries: 1,
         max_bytes: 1024,
@@ -2814,6 +2817,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     let env = format!("SIRIUS_REDIS_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&env, url);
     let c = Cache::new(Config::Redis {
+        route_ttl_ms: BTreeMap::from([(crate::response_cache::Route::SongRankings, 2000)]),
         url_env: env.clone(),
         namespace: "test".into(),
         ttl_ms: 100,
@@ -2823,6 +2827,12 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     .unwrap();
     c.put("safe".into(), &json!({"value":42})).await;
     assert_eq!(c.get("safe").await.unwrap()["value"], 42);
+    c.put_route(
+        crate::client::MUSIC_RANKING,
+        "override".into(),
+        &json!({"value":43}),
+    )
+    .await;
     let _: () = redis::cmd("SET")
         .arg("test:oversized")
         .arg("x".repeat(100_000))
@@ -2832,6 +2842,14 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     assert!(c.get("oversized").await.is_none());
     tokio::time::sleep(Duration::from_millis(120)).await;
     assert!(c.get("safe").await.is_none());
+    assert_eq!(c.get("override").await.unwrap()["value"], 43);
+    let remaining: i64 = redis::cmd("PTTL")
+        .arg("test:override")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((100..=2000).contains(&remaining));
+
     let f = fixture(vec![
         Reply::version(),
         ranking_reply(10),
@@ -2841,6 +2859,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     .await;
     let mut first_config = account_config();
     first_config.response_cache = Config::Redis {
+        route_ttl_ms: BTreeMap::new(),
         url_env: env,
         namespace: "client-test".into(),
         ttl_ms: 5000,
@@ -2878,4 +2897,129 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn route_cache_ttls_expire_independently_and_zero_bypasses_rpc_cache() {
+    use crate::response_cache::{Cache, Config, Route};
+    let cache = Cache::new(Config::Memory {
+        ttl_ms: 5000,
+        max_entries: 10,
+        max_bytes: 8192,
+        max_entry_bytes: 4096,
+        route_ttl_ms: BTreeMap::from([(Route::Announcement, 20), (Route::EventRankings, 0)]),
+    })
+    .unwrap();
+    cache
+        .put_route(ANNOUNCEMENT, "short".into(), &json!({"value":1}))
+        .await;
+    cache
+        .put_route(
+            crate::client::MUSIC_RANKING,
+            "long".into(),
+            &json!({"value":2}),
+        )
+        .await;
+    cache
+        .put_route(
+            crate::client::EVENT_RANKING,
+            "disabled".into(),
+            &json!({"value":3}),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(cache.get("short").await.is_none());
+    assert!(cache.get("disabled").await.is_none());
+    assert_eq!(cache.get("long").await.unwrap()["value"], 2);
+    assert!(cache.ttl(crate::client::PROFILE).is_none());
+    assert!(cache.ttl(crate::client::PLAYER_DATA).is_none());
+    let f = fixture(vec![Reply::version(), ranking_reply(1), ranking_reply(2)]).await;
+    let mut cfg = account_config();
+    cfg.response_cache = memory_cache(5000);
+    if let Config::Memory { route_ttl_ms, .. } = &mut cfg.response_cache {
+        route_ttl_ms.insert(Route::SongRankings, 0);
+    }
+    let c = client(&f, cfg);
+    for score in [1, 2] {
+        assert_eq!(
+            c.call(crate::client::MUSIC_RANKING, json!({"musicId":"1"}))
+                .await
+                .unwrap()["players"][0]["score"],
+            score
+        );
+    }
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn concurrent_cache_misses_coalesce_and_cancelled_fill_releases_waiters() {
+    for cancel_first in [false, true] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut blocked = ranking_reply(1);
+        blocked.gate = Some(gate.clone());
+        let mut replies = vec![Reply::version(), blocked];
+        if cancel_first {
+            replies.push(ranking_reply(2));
+        }
+        let f = fixture(replies).await;
+        let mut cfg = account_config();
+        cfg.session_lock = false;
+        cfg.response_cache = memory_cache(5000);
+        let c = client(&f, cfg);
+        c.call(VERSION, json!({})).await.unwrap();
+        let a = c.clone();
+        let first = tokio::spawn(async move {
+            a.call(crate::client::MUSIC_RANKING, json!({"musicId":"1"}))
+                .await
+        });
+        wait_for_requests(&f, 2).await;
+        let a = c.clone();
+        let second = tokio::spawn(async move {
+            a.call(crate::client::MUSIC_RANKING, json!({"musicId":"1"}))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(f.received.lock().unwrap().len(), 2);
+        assert!(!second.is_finished());
+        if cancel_first {
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+        } else {
+            gate.add_permits(1);
+            first.await.unwrap().unwrap();
+        }
+        let value = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            value["players"][0]["score"],
+            if cancel_first { 2 } else { 1 }
+        );
+        assert_eq!(
+            f.received.lock().unwrap().len(),
+            if cancel_first { 3 } else { 2 }
+        );
+        gate.add_permits(1);
+    }
+}
+
+#[test]
+fn cache_route_policy_rejects_unknown_or_private_routes_and_excessive_ttls() {
+    let prefix = "backend: memory\nttl_ms: 1000\nmax_entries: 4\nmax_bytes: 4096\nmax_entry_bytes: 1024\nroute_ttl_ms:\n";
+    for route in ["profile", "player_data", "arbitrary_rpc"] {
+        assert!(
+            yaml_serde::from_str::<crate::response_cache::Config>(&format!(
+                "{prefix}  {route}: 100"
+            ))
+            .is_err()
+        );
+    }
+    let too_long: crate::response_cache::Config =
+        yaml_serde::from_str(&format!("{prefix}  announcements: 300001")).unwrap();
+    assert!(too_long.validate().is_err());
+    let disabled: crate::response_cache::Config =
+        yaml_serde::from_str(&format!("{prefix}  announcements: 0")).unwrap();
+    disabled.validate().unwrap();
 }

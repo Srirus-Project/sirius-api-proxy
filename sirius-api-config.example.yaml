@@ -46,6 +46,6 @@ upstream:
   retry_delay_ms: 250
 
 # Public announcement/ranking response cache; defaults to disabled.
-# See docs/RESPONSE_CACHE.md for memory and Redis configuration.
+# See docs/RESPONSE_CACHE.md for memory/Redis and per-route TTL overrides.
 response_cache:
   backend: disabled

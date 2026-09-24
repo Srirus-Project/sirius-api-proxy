@@ -10,6 +10,12 @@ enter storage. Errors and maintenance responses are never inserted.
 response_cache:
   backend: memory
   ttl_ms: 1000
+  route_ttl_ms:
+    announcements: 30000
+    announcement: 30000
+    event_rankings: 500
+    song_rankings: 1000
+    challenge_rankings: 1000
   max_entries: 1024
   max_bytes: 33554432
   max_entry_bytes: 1048576
@@ -68,6 +74,23 @@ budget and a 256-byte..8 MiB entry cap no larger than the total. Redis entry cap
 have the same bounds and operation timeout accepts 1..2000 ms. Unknown options fail
 startup. HTTP caching headers/browser caches are separate from this server cache.
 
-This restores bounded storage and scoped fresh-response caching. Per-endpoint TTLs,
-single-flight refresh and the original stale-while-revalidate policy remain tracked
-restoration work; they are not silently represented by this initial TTL setting.
+## Per-route policy and concurrent fills
+
+Both backends accept the optional `route_ttl_ms` map shown above. These five names
+are the entire allowlist; private/profile/deck routes cannot be added through config.
+Each override accepts 0..300000 ms; 0 bypasses both lookup and insertion for that
+route. Omitted routes inherit the backend's `ttl_ms`. Effective TTL is part of the
+cache key, so processes with different policies cannot reuse a longer-lived entry
+from a common Redis namespace. The selected TTL controls both embedded expiry and
+Redis PX expiry. Restart to change configuration.
+
+Concurrent misses for a key are coalesced within a region/process. The winner fills
+the cache; waiters check it again before executing. Waiting remains inside each
+request's original deadline. Failed fills do not populate the cache, and cancelling
+a winner releases its lock so another request can proceed. A fixed set of 64 lock
+stripes bounds coordination memory; digest collisions can serialize unrelated fills.
+Fresh hits do not wait for a fill lock. This is not a distributed Redis lease.
+
+The original stale-while-revalidate policy remains tracked restoration work. Expired
+entries are still never served and this implementation does not launch background
+refreshes or hide an outage behind an expired response.

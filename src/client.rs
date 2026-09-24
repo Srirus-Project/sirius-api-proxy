@@ -345,20 +345,20 @@ impl GameClient {
                     .response_cache_key(&protocol, route, &input, account)
                     .await?;
                 if let Some(key) = &cache_key {
-                    let budget =
-                        deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
-                    if let Ok(Some(mut value)) =
-                        tokio::time::timeout(budget, self.response_cache.get(key)).await
-                    {
-                        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-                            if let Some(object) = value.as_object_mut() {
-                                object.remove("myRank");
-                                object.remove("myScore");
-                            }
-                        }
+                    if let Some(value) = self.read_cached(key, route, deadline).await {
                         return Ok(value);
                     }
                 }
+                let _fill = if let Some(key) = &cache_key {
+                    let guard = self.response_cache.fill_guard(key).await;
+                    // A preceding fill may have completed while this call waited.
+                    if let Some(value) = self.read_cached(key, route, deadline).await {
+                        return Ok(value);
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
                 account_attempted = authenticated(route);
                 if route == PLAYER_DATA {
                     self.execute(&protocol, WHOAMI, json!({}), account, deadline)
@@ -384,8 +384,11 @@ impl GameClient {
                     }
                     let budget =
                         deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
-                    let _ =
-                        tokio::time::timeout(budget, self.response_cache.put(key, &value)).await;
+                    let _ = tokio::time::timeout(
+                        budget,
+                        self.response_cache.put_route(route, key, &value),
+                    )
+                    .await;
                 }
                 Ok(value)
             })
@@ -410,6 +413,24 @@ impl GameClient {
         }
         result
     }
+    async fn read_cached(
+        &self,
+        key: &str,
+        route: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<Value> {
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+        let mut value = tokio::time::timeout(budget, self.response_cache.get(key))
+            .await
+            .ok()??;
+        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("myRank");
+                object.remove("myScore");
+            }
+        }
+        Some(value)
+    }
     async fn response_cache_key(
         &self,
         protocol: &ProtocolBundle,
@@ -417,14 +438,9 @@ impl GameClient {
         input: &Value,
         account: Option<&crate::accounts::Account>,
     ) -> Result<Option<String>, AppError> {
-        if !self.response_cache.enabled()
-            || !matches!(
-                route,
-                ANNOUNCEMENTS | ANNOUNCEMENT | EVENT_RANKING | MUSIC_RANKING | CHALLENGE_RANKING
-            )
-        {
+        let Some(ttl) = self.response_cache.ttl(route) else {
             return Ok(None);
-        }
+        };
         let state = self.state.lock().await;
         if state.observation.maintenance {
             return Ok(None);
@@ -445,7 +461,7 @@ impl GameClient {
         let scope = json!({"schema":1,"region":self.config.region,"environment":self.config.environment,
             "endpoint":self.config.endpoint,"platform":self.config.platform(),"client":self.config.client_version,
             "protocol":protocol.status.sha256,"protocol_generation":protocol.status.generation,
-            "account":account_scope,"account_generation":generation,"master":master,"route":route,"input":input});
+            "account":account_scope,"account_generation":generation,"master":master,"route":route,"input":input,"ttl_ms":ttl});
         let bytes = serde_json::to_vec(&scope).map_err(|_| AppError::Protocol)?;
         Ok(Some(format!("{:x}", Sha256::digest(bytes))))
     }

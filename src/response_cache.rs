@@ -8,6 +8,29 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Route {
+    Announcements,
+    Announcement,
+    EventRankings,
+    SongRankings,
+    ChallengeRankings,
+}
+impl Route {
+    fn from_rpc(route: &str) -> Option<Self> {
+        use crate::routes::*;
+        match route {
+            ANNOUNCEMENTS => Some(Self::Announcements),
+            ANNOUNCEMENT => Some(Self::Announcement),
+            EVENT_RANKING => Some(Self::EventRankings),
+            MUSIC_RANKING => Some(Self::SongRankings),
+            CHALLENGE_RANKING => Some(Self::ChallengeRankings),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Default)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Config {
@@ -15,6 +38,8 @@ pub enum Config {
     Disabled,
     Memory {
         ttl_ms: u64,
+        #[serde(default)]
+        route_ttl_ms: BTreeMap<Route, u64>,
         max_entries: usize,
         max_bytes: usize,
         max_entry_bytes: usize,
@@ -23,6 +48,8 @@ pub enum Config {
         url_env: String,
         namespace: String,
         ttl_ms: u64,
+        #[serde(default)]
+        route_ttl_ms: BTreeMap<Route, u64>,
         max_entry_bytes: usize,
         operation_timeout_ms: u64,
     },
@@ -33,11 +60,13 @@ impl Config {
             Self::Disabled => true,
             Self::Memory {
                 ttl_ms,
+                route_ttl_ms,
                 max_entries,
                 max_bytes,
                 max_entry_bytes,
             } => {
                 (1..=300_000).contains(ttl_ms)
+                    && route_ttl_ms.values().all(|ttl| *ttl <= 300_000)
                     && (1..=100_000).contains(max_entries)
                     && (1024..=1024 * 1024 * 1024).contains(max_bytes)
                     && (256..=8 * 1024 * 1024).contains(max_entry_bytes)
@@ -47,6 +76,7 @@ impl Config {
                 url_env,
                 namespace,
                 ttl_ms,
+                route_ttl_ms,
                 max_entry_bytes,
                 operation_timeout_ms,
             } => {
@@ -56,6 +86,7 @@ impl Config {
                     && namespace
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                    && route_ttl_ms.values().all(|ttl| *ttl <= 300_000)
                     && (1..=300_000).contains(ttl_ms)
                     && (256..=8 * 1024 * 1024).contains(max_entry_bytes)
                     && (1..=2000).contains(operation_timeout_ms)
@@ -80,6 +111,7 @@ struct Memory {
 }
 pub struct Cache {
     config: Config,
+    fills: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
     memory: Mutex<Memory>,
     redis: Option<redis::aio::ConnectionManager>,
 }
@@ -127,12 +159,47 @@ impl Cache {
         };
         Ok(Self {
             config,
+            fills: (0..64)
+                .map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
             memory: Mutex::new(Memory::default()),
             redis,
         })
     }
     pub fn enabled(&self) -> bool {
         !matches!(self.config, Config::Disabled)
+    }
+    pub fn ttl(&self, rpc: &str) -> Option<u64> {
+        let route = Route::from_rpc(rpc)?;
+        let ttl = match &self.config {
+            Config::Disabled => return None,
+            Config::Memory {
+                ttl_ms,
+                route_ttl_ms,
+                ..
+            }
+            | Config::Redis {
+                ttl_ms,
+                route_ttl_ms,
+                ..
+            } => *route_ttl_ms.get(&route).unwrap_or(ttl_ms),
+        };
+        (ttl > 0).then_some(ttl)
+    }
+    /// Bounded striped locks coalesce fills within one region/process.
+    pub async fn fill_guard(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let hash = key.bytes().fold(0usize, |h, byte| {
+            h.wrapping_mul(31).wrapping_add(byte as usize)
+        });
+        self.fills[hash % self.fills.len()]
+            .clone()
+            .lock_owned()
+            .await
+    }
+    pub async fn put_route(&self, rpc: &str, key: String, value: &Value) {
+        if let Some(ttl) = self.ttl(rpc) {
+            self.put_with_ttl(key, value, Some(ttl)).await;
+        }
     }
     pub async fn get(&self, key: &str) -> Option<Value> {
         let bytes = match &self.config {
@@ -177,6 +244,9 @@ impl Cache {
         (entry.expires_ms > now_ms()).then_some(entry.value)
     }
     pub async fn put(&self, key: String, value: &Value) {
+        self.put_with_ttl(key, value, None).await;
+    }
+    async fn put_with_ttl(&self, key: String, value: &Value, override_ttl: Option<u64>) {
         let (ttl, limit) = match &self.config {
             Config::Disabled => return,
             Config::Memory {
@@ -190,6 +260,7 @@ impl Cache {
                 ..
             } => (*ttl_ms, *max_entry_bytes),
         };
+        let ttl = override_ttl.unwrap_or(ttl);
         let Ok(bytes) = serde_json::to_vec(&Entry {
             expires_ms: now_ms().saturating_add(ttl),
             value: value.clone(),
