@@ -23,6 +23,16 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 #   key_hex_env: SIRIUS_MASTER_KEY_HEX
 #   iv_hex_env: SIRIUS_MASTER_IV_HEX
 #   interval_seconds: 300
+#   # See docs/MASTER_NETWORK.md. This client is independent of game upstream proxy.
+#   network:
+#     connect_timeout_ms: 10000
+#     request_timeout_ms: 60000
+#     update_timeout_seconds: 600
+#     attempts: 1
+#     retry_delay_ms: 250
+#     max_retry_delay_ms: 5000
+#     # proxy_url_env: SIRIUS_MASTER_PROXY_URL
+#     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION
 default_cdn_root: https://static.bang-dream-on.jp
 cdn_credential_env:
   https://static.bang-dream-on.jp: SIRIUS_CDN_CREDENTIAL

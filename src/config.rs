@@ -103,6 +103,8 @@ pub fn default_protocol_directory() -> std::path::PathBuf {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasterUpdateConfig {
+    #[serde(default)]
+    pub network: crate::master_update::Network,
     pub username_env: String,
     pub key_hex_env: String,
     pub iv_hex_env: String,
@@ -190,6 +192,10 @@ impl Config {
             ));
         }
         if let Some(update) = &self.master_update {
+            update
+                .network
+                .validate()
+                .map_err(|_| AppError::Config("invalid Master network configuration"))?;
             if self
                 .master_directory
                 .as_ref()

@@ -67,7 +67,7 @@ impl Connector {
         })
     }
 }
-fn proxy_uri(value: &str) -> Result<Uri, AppError> {
+pub(crate) fn proxy_uri(value: &str) -> Result<Uri, AppError> {
     let invalid = || AppError::Config("proxy URL must be an HTTP(S) origin without credentials");
     let url = url::Url::parse(value).map_err(|_| invalid())?;
     if value.len() > 4096

@@ -924,6 +924,7 @@ fn remote_master_config(cdn: &Fixture, directory: &std::path::Path) -> Config {
         (32..64).map(|i| format!("{i:02x}")).collect::<String>(),
     );
     cfg.master_update = Some(crate::config::MasterUpdateConfig {
+        network: Default::default(),
         username_env: format!("{name}_USER"),
         key_hex_env: format!("{name}_KEY"),
         iv_hex_env: format!("{name}_IV"),
@@ -1171,6 +1172,7 @@ async fn master_scheduler_runs_checks_then_stops_without_overlapping_writers() {
 fn updater_configuration_requires_output_and_bounded_interval() {
     let mut cfg = config();
     cfg.master_update = Some(crate::config::MasterUpdateConfig {
+        network: Default::default(),
         username_env: "U".into(),
         key_hex_env: "K".into(),
         iv_hex_env: "I".into(),
@@ -3829,4 +3831,291 @@ fn access_log_configuration_rejects_bad_trust_headers_and_unbounded_queues() {
         "output: {type: stdout, path: ignored}"
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn master_network_retries_only_transient_downloads_and_keeps_integrity_failures_terminal() {
+    use crate::master_update::MasterUpdater;
+    for (status, retry) in [
+        (429, true),
+        (503, true),
+        (403, false),
+        (407, false),
+        (302, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut failure = cdn_reply(vec![]);
+        failure.http_status = status;
+        let replies = if retry {
+            vec![
+                failure,
+                cdn_reply(remote_master_manifest()),
+                cdn_reply(master_fixture().2.to_vec()),
+            ]
+        } else {
+            vec![failure]
+        };
+        let cdn = cdn_fixture(replies).await;
+        let game = fixture(vec![Reply::version(), Reply::version()]).await;
+        let mut cfg = remote_master_config(&cdn, root.path());
+        let network = &mut cfg.master_update.as_mut().unwrap().network;
+        network.attempts = 3;
+        network.retry_delay_ms = 1;
+        let result = MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+            .unwrap()
+            .update_once()
+            .await;
+        assert_eq!(result.is_ok(), retry, "status {status}");
+        assert_eq!(
+            cdn.received.lock().unwrap().len(),
+            if retry { 3 } else { 1 }
+        );
+        assert_eq!(root.path().join("CURRENT").exists(), retry);
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut bad = master_fixture().2.to_vec();
+    bad[33] ^= 1;
+    let cdn = cdn_fixture(vec![cdn_reply(remote_master_manifest()), cdn_reply(bad)]).await;
+    let game = fixture(vec![Reply::version()]).await;
+    let mut cfg = remote_master_config(&cdn, root.path());
+    cfg.master_update.as_mut().unwrap().network.attempts = 3;
+    assert!(MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+        .unwrap()
+        .update_once()
+        .await
+        .is_err());
+    assert_eq!(cdn.received.lock().unwrap().len(), 2);
+    assert!(!root.path().join("CURRENT").exists());
+}
+
+#[tokio::test]
+async fn master_proxy_is_independent_of_game_transport_and_never_falls_back() {
+    use crate::master_update::MasterUpdater;
+    for reject in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let direct = cdn_fixture(vec![]).await;
+        let replies = if reject {
+            let mut reply = cdn_reply(vec![]);
+            reply.http_status = 407;
+            vec![reply]
+        } else {
+            vec![
+                cdn_reply(remote_master_manifest()),
+                cdn_reply(master_fixture().2.to_vec()),
+            ]
+        };
+        // An HTTP forward-proxy fixture answers absolute-form requests itself.
+        let proxy = cdn_fixture(replies).await;
+        let game = fixture(vec![Reply::version(), Reply::version()]).await;
+        let mut cfg = remote_master_config(&direct, root.path());
+        let url_env = format!("MASTER_PROXY_URL_{}", uuid::Uuid::new_v4().simple());
+        let auth_env = format!("MASTER_PROXY_AUTH_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&url_env, &proxy.url);
+        std::env::set_var(&auth_env, "Bearer proxy-only");
+        let network = &mut cfg.master_update.as_mut().unwrap().network;
+        network.proxy_url_env = Some(url_env.clone());
+        network.proxy_authorization_env = Some(auth_env.clone());
+        network.attempts = 3;
+        let result = MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+            .unwrap()
+            .update_once()
+            .await;
+        assert_eq!(result.is_ok(), !reject);
+        assert!(direct.received.lock().unwrap().is_empty());
+        for (_, headers, _) in proxy.received.lock().unwrap().iter() {
+            assert_eq!(headers["proxy-authorization"], "Bearer proxy-only");
+            assert_eq!(
+                headers["authorization"],
+                "Basic Zml4dHVyZS11c2VyOmZpeHR1cmUtY2RuLXNlY3JldA=="
+            );
+            assert!(
+                !headers.contains_key("x-player-id")
+                    && !headers.contains_key("x-player-credential")
+            );
+        }
+        for (_, headers, _) in game.received.lock().unwrap().iter() {
+            assert!(!headers.contains_key("proxy-authorization"));
+        }
+        assert_eq!(
+            proxy.received.lock().unwrap().len(),
+            if reject { 1 } else { 2 }
+        );
+        std::env::remove_var(url_env);
+        std::env::remove_var(auth_env);
+    }
+}
+
+#[tokio::test]
+async fn master_request_timeout_retries_but_whole_update_deadline_bounds_backoff() {
+    use crate::master_update::{MasterUpdater, UpdateError};
+    for whole_deadline in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut delayed = cdn_reply(remote_master_manifest());
+        delayed.delay = Duration::from_secs(2);
+        let mut unavailable = cdn_reply(vec![]);
+        unavailable.http_status = 503;
+        let cdn = cdn_fixture(if whole_deadline {
+            vec![unavailable]
+        } else {
+            vec![
+                delayed,
+                cdn_reply(remote_master_manifest()),
+                cdn_reply(master_fixture().2.to_vec()),
+            ]
+        })
+        .await;
+        let game = fixture(vec![Reply::version(), Reply::version()]).await;
+        let mut cfg = remote_master_config(&cdn, root.path());
+        let network = &mut cfg.master_update.as_mut().unwrap().network;
+        network.request_timeout_ms = 100;
+        network.attempts = 3;
+        network.retry_delay_ms = 1;
+        if whole_deadline {
+            network.update_timeout_seconds = 1;
+            network.retry_delay_ms = 5000;
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+                .unwrap()
+                .update_once(),
+        )
+        .await
+        .unwrap();
+        if whole_deadline {
+            assert!(matches!(result, Err(UpdateError::Timeout)));
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            cdn.received.lock().unwrap().len(),
+            if whole_deadline { 1 } else { 3 }
+        );
+        assert_eq!(root.path().join("CURRENT").exists(), !whole_deadline);
+        assert!(crate::master::WriterLock::acquire(root.path()).is_ok());
+    }
+}
+
+#[test]
+fn master_network_configuration_is_bounded_and_old_yaml_keeps_defaults() {
+    let old: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60",
+    )
+    .unwrap();
+    assert_eq!(old.network.attempts, 1);
+    assert_eq!(old.network.update_timeout_seconds, 600);
+    assert!(old.network.proxy_url_env.is_none());
+    for yaml in [
+        "attempts: 0",
+        "attempts: 9",
+        "request_timeout_ms: 99",
+        "connect_timeout_ms: 300001",
+        "update_timeout_seconds: 0",
+        "retry_delay_ms: 0",
+        "max_retry_delay_ms: 1",
+        "proxy_authorization_env: AUTH",
+        "proxy_url_env: 'bad name'",
+    ] {
+        let network: crate::master_update::Network = yaml_serde::from_str(yaml).unwrap();
+        assert!(network.validate().is_err(), "{yaml}");
+    }
+    assert!(yaml_serde::from_str::<crate::master_update::Network>("password: ignored").is_err());
+}
+
+#[tokio::test]
+async fn master_proxy_and_origin_tls_reject_untrusted_certificates() {
+    use crate::master_update::MasterUpdater;
+    for proxy_tls in [false, true] {
+        let (url, rejected) = untrusted_tls_fixture().await;
+        let root = tempfile::tempdir().unwrap();
+        let direct = cdn_fixture(vec![]).await;
+        let game = fixture(vec![Reply::version()]).await;
+        let mut cfg = remote_master_config(&direct, root.path());
+        let tunnel = tunnel_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec(), true, Duration::ZERO).await;
+        let reference = cfg.cdn_credential_env.values().next().unwrap().clone();
+        if !proxy_tls {
+            cfg.default_cdn_root = url.clone();
+            cfg.cdn_credential_env = BTreeMap::from([(url.clone(), reference)]);
+        }
+        let url_env = format!("MASTER_TLS_PROXY_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&url_env, if proxy_tls { &url } else { &tunnel.url });
+        cfg.master_update.as_mut().unwrap().network.proxy_url_env = Some(url_env.clone());
+        assert!(MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+            .unwrap()
+            .update_once()
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(2), rejected)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(direct.received.lock().unwrap().is_empty());
+        for request in tunnel.seen.lock().unwrap().iter() {
+            assert!(request.starts_with("CONNECT "));
+            assert!(!request.to_lowercase().contains("authorization:"));
+        }
+        std::env::remove_var(url_env);
+    }
+}
+
+#[tokio::test]
+async fn master_update_deadline_includes_waiting_for_another_update() {
+    use crate::master_update::{MasterUpdater, UpdateError};
+    let root = tempfile::tempdir().unwrap();
+    let mut delayed = cdn_reply(remote_master_manifest());
+    delayed.delay = Duration::from_secs(3);
+    let cdn = cdn_fixture(vec![delayed.clone(), delayed]).await;
+    let game = fixture(vec![Reply::version(), Reply::version()]).await;
+    let mut cfg = remote_master_config(&cdn, root.path());
+    cfg.master_update
+        .as_mut()
+        .unwrap()
+        .network
+        .update_timeout_seconds = 1;
+    let updater = MasterUpdater::new(&cfg, client(&game, cfg.clone())).unwrap();
+    let first = updater.clone();
+    let first = tokio::spawn(async move { first.update_once().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while cdn.received.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(Duration::from_millis(1500), updater.update_once())
+        .await
+        .unwrap();
+    assert!(matches!(second, Err(UpdateError::Timeout)));
+    assert!(matches!(first.await.unwrap(), Err(UpdateError::Timeout)));
+    assert!(!root.path().join("CURRENT").exists());
+    assert!(crate::master::WriterLock::acquire(root.path()).is_ok());
+}
+
+#[tokio::test]
+async fn master_proxy_invalid_secrets_fail_before_any_network_request() {
+    use crate::master_update::MasterUpdater;
+    let root = tempfile::tempdir().unwrap();
+    let cdn = cdn_fixture(vec![]).await;
+    let game = fixture(vec![]).await;
+    let mut cfg = remote_master_config(&cdn, root.path());
+    let name = format!("MASTER_INVALID_PROXY_{}", uuid::Uuid::new_v4().simple());
+    cfg.master_update.as_mut().unwrap().network.proxy_url_env = Some(name.clone());
+    for value in [
+        "http://user:private-password@localhost",
+        "https://localhost/path",
+        "socks5://localhost",
+        "https://localhost/?private-token",
+        "https://localhost/#private-token",
+    ] {
+        std::env::set_var(&name, value);
+        let error = MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, "Master updater configuration is invalid");
+    }
+    std::env::remove_var(name);
+    assert!(MasterUpdater::new(&cfg, client(&game, cfg.clone())).is_err());
+    assert!(cdn.received.lock().unwrap().is_empty());
+    assert!(game.received.lock().unwrap().is_empty());
 }
