@@ -150,3 +150,5 @@ cargo test --locked
 Tests use local fixtures and do not require the game servers. Release archives include the
 runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
 Repository visibility and workflow activation are separate from preparing a release.
+
+For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).

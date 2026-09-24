@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prepared = deployment.prepare()?;
     let listen = prepared.listen;
     let router = prepared.router;
+    let tls = prepared.tls;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let workers: Vec<_> = prepared
@@ -60,22 +61,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let signal_shutdown = shutdown.clone();
     tracing::info!(%listen,"Sirius API Proxy listening");
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            #[cfg(unix)]
-            {
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("signal handler");
-                tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            let _ = signal_shutdown.send(true);
-        })
-        .await;
+    let result = sirius_api_proxy::server::serve(listener, router, tls, async move {
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("signal handler");
+            tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = signal_shutdown.send(true);
+    })
+    .await;
     let _ = shutdown.send(true);
     for worker in workers {
         worker.await?;

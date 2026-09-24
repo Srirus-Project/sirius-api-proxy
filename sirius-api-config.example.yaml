@@ -53,3 +53,9 @@ upstream:
 # See docs/RESPONSE_CACHE.md for memory/Redis and per-route TTL overrides.
 response_cache:
   backend: disabled
+
+# Optional HTTPS listener; see docs/LISTENER_TLS.md. Restart after certificate renewal.
+# tls:
+#   certificate_file: /etc/sirius/tls/fullchain.pem
+#   private_key_file: /etc/sirius/tls/key.pem
+#   handshake_timeout_ms: 10000

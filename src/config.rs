@@ -12,6 +12,8 @@ pub struct Config {
     #[serde(default = "default_protocol_directory")]
     pub protocol_directory: std::path::PathBuf,
     pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub tls: Option<crate::server::TlsConfig>,
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,
@@ -162,6 +164,10 @@ impl Config {
         }
     }
     pub fn validate(&self) -> Result<(), AppError> {
+        if let Some(tls) = &self.tls {
+            tls.validate()
+                .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;
+        }
         crate::accounts::validate(self)?;
         self.upstream.validate()?;
         self.response_cache.validate()?;

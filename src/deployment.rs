@@ -14,6 +14,8 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 #[serde(deny_unknown_fields)]
 pub struct MultiConfig {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub tls: Option<crate::server::TlsConfig>,
     pub regions: BTreeMap<String, Config>,
 }
 
@@ -23,6 +25,7 @@ pub enum DeploymentConfig {
 }
 
 pub struct Prepared {
+    pub tls: Option<crate::server::LoadedTls>,
     pub listen: SocketAddr,
     pub router: Router,
     pub updaters: Vec<Arc<MasterUpdater>>,
@@ -54,6 +57,10 @@ impl DeploymentConfig {
         match self {
             Self::Single(c) => c.validate(),
             Self::Multi(m) => {
+                if let Some(tls) = &m.tls {
+                    tls.validate()
+                        .map_err(|_| AppError::Config("invalid listener TLS configuration"))?;
+                }
                 if m.regions.is_empty() || m.regions.len() > 4 {
                     return Err(AppError::Config(
                         "configure one to four operational regions",
@@ -65,9 +72,9 @@ impl DeploymentConfig {
                             "region map key must equal the explicit region identity",
                         ));
                     }
-                    if c.listen.is_some() {
+                    if c.listen.is_some() || c.tls.is_some() {
                         return Err(AppError::Config(
-                            "listen belongs at the deployment root, not inside regions",
+                            "listen and tls belong at the deployment root, not inside regions",
                         ));
                     }
                     c.validate()?;
@@ -79,6 +86,12 @@ impl DeploymentConfig {
 
     pub fn prepare(&self) -> Result<Prepared, Box<dyn std::error::Error>> {
         self.validate()?;
+        let tls = match self {
+            Self::Single(c) => c.tls.as_ref(),
+            Self::Multi(m) => m.tls.as_ref(),
+        }
+        .map(crate::server::TlsConfig::load)
+        .transpose()?;
         let (listen, configs, regional) = match self {
             Self::Single(c) => (
                 c.listen
@@ -131,6 +144,7 @@ impl DeploymentConfig {
             ));
         }
         Ok(Prepared {
+            tls,
             listen,
             router,
             updaters,
