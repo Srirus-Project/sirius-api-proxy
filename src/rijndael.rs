@@ -37,7 +37,7 @@ impl Rijndael256 {
     pub(crate) fn new(key: &[u8; 32]) -> Self {
         let (sbox, inverse) = boxes();
         let mut words = [[0; 4]; 120];
-        for (w, bytes) in words.iter_mut().zip(key.chunks_exact(4)) {
+        for (w, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
             w.copy_from_slice(bytes);
         }
         let mut rcon = 1;
@@ -75,8 +75,8 @@ impl Rijndael256 {
             }
             self.add_key(&mut state, round);
             if round != 0 {
-                for column in state.chunks_exact_mut(4) {
-                    let a: [u8; 4] = column.try_into().unwrap();
+                for column in state.as_chunks_mut::<4>().0 {
+                    let a = *column;
                     for row in 0..4 {
                         column[row] = mul(a[row], 14)
                             ^ mul(a[(row + 1) % 4], 11)
@@ -94,7 +94,7 @@ impl Rijndael256 {
         }
         let mut previous = iv.as_slice();
         let mut output = Vec::with_capacity(encrypted.len());
-        for block in encrypted.chunks_exact(32) {
+        for block in encrypted.as_chunks::<32>().0 {
             let plain = self.block(block);
             output.extend(plain.iter().zip(previous).map(|(a, b)| a ^ b));
             previous = block;
