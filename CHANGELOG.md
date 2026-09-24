@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 — prepared, not published
+## 1.0.0
 
 - Add a default-on `session_lock` configuration switch for upstream RPC serialization.
 - Initial public-release candidate for BanG Dream! Our Notes.
