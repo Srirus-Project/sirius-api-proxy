@@ -183,6 +183,25 @@ impl Outbox {
             _ => Err(Error::Invalid),
         })
     }
+    /// Operator recovery only: adopt existing work, never create or claim completion.
+    pub fn adopt(&mut self, key: &str, id: &str) -> Result<(), Error> {
+        if !uuid(id) {
+            return Err(Error::Invalid);
+        }
+        self.change(key, |state| match state {
+            State::Sending { .. } => Ok(State::Submitted { job_id: id.into() }),
+            State::Failed { job_id: None, code }
+                if matches!(
+                    code.as_str(),
+                    "submission_ambiguous" | "invalid_job_response"
+                ) =>
+            {
+                Ok(State::Submitted { job_id: id.into() })
+            }
+            State::Submitted { job_id } if job_id == id => Ok(state.clone()),
+            _ => Err(Error::Invalid),
+        })
+    }
     pub fn complete(
         &mut self,
         key: &str,

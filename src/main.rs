@@ -25,10 +25,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("sirius-api-proxy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("asset-dispatch-status" | "asset-dispatch-adopt")
+    ) {
+        let adopt = args[0] == "asset-dispatch-adopt";
+        if args.len() != if adopt { 4 } else { 2 } {
+            return Err("usage: sirius-api-proxy asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID".into());
+        }
+        let directory = std::path::Path::new(&args[1]);
+        if !directory.join("outbox.json").is_file() {
+            return Err("existing asset dispatch state is required".into());
+        }
+        // Exclusive ownership requires stopping the API worker before offline recovery.
+        let mut outbox = sirius_api_proxy::asset_outbox::Outbox::open(directory, 100_000)?;
+        if adopt {
+            outbox.adopt(&args[2], &args[3])?;
+            println!(
+                "{}",
+                serde_json::to_string(&outbox.entries().get(&args[2]))?
+            );
+        } else {
+            println!("{}", serde_json::to_string(outbox.entries())?);
+        }
+        return Ok(());
+    }
     if !args.is_empty() && args != ["master-update"] {
         if args.len() != 3 || args[0] != "master-import" {
             return Err(
-                "usage: sirius-api-proxy [master-update | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY]".into(),
+                "usage: sirius-api-proxy [master-update | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
             );
         }
         use sirius_api_proxy::master::{import_directory, key_from_hex, MasterDecoder};

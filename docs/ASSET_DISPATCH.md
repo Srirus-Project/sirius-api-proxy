@@ -78,7 +78,24 @@ restart or lost response. The next reconciliation records `submission_ambiguous`
 inspect the updater's retained job list before intentionally requesting new execution. Use a new
 profile revision only after resolving the previous execution and deciding that a new job is needed.
 Do not delete the state directory to retry: doing so forgets completed catalog identities too.
-Automatic retry of uncertain POSTs and an administrative recovery endpoint remain future work.
+Offline status and adoption commands are available after stopping the API process:
+
+```sh
+sirius-api-proxy asset-dispatch-status ./state/jp-assets
+sirius-api-proxy asset-dispatch-adopt ./state/jp-assets DISPATCH_KEY EXISTING_JOB_UUID
+```
+
+Inspect the updater's authenticated job list and match the job's `idempotency_sha256` to the
+SHA-256 of the dispatch key before choosing its UUID. Adoption only transitions an ambiguous
+submission (or an unacknowledged malformed response) to submitted; it does not send a request or
+mark completion. After restart, the worker validates the job key digest, request and output
+identity/scope before completion. A wrong adopted ID fails reconciliation. Already completed,
+failed-with-known-job, or pending work cannot be reassigned; repeating the same adoption is safe.
+Both commands use exclusive state ownership and reject nonexistent state directories. Status
+prints JSON without credential values. They require no game/CDN credentials or network access.
+
+An online administrative recovery/status endpoint and automatic retry of uncertain POSTs remain
+future work.
 
 History has a hard capacity and no automatic pruning; a full history refuses new identities while
 existing jobs continue reconciliation. Safe operator compaction still needs implementation.

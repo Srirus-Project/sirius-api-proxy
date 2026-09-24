@@ -10,6 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.request
 import zipfile
@@ -49,6 +50,28 @@ with tempfile.TemporaryDirectory() as tmp:
         check = subprocess.run([str(exe), "check"], cwd=root, env=env, check=True, capture_output=True, timeout=15)
         assert json.loads(check.stdout)["ready"]
     else:
+        # Offline recovery must preserve known work rather than submit another export.
+        state = root / "smoke-dispatch-state"
+        state.mkdir()
+        identity = dict(destination_sha256="a" * 64,
+                        request=dict(region="jp", profile="full", operation="update"),
+                        profile_revision="1", environment="release", platform="iOS",
+                        resource_version="r1", platform_hash="h1", require_full_catalog=True,
+                        require_full_export=True, require_publication=False)
+        key = "sirius-" + hashlib.sha256(json.dumps([1, identity], separators=(",", ":")).encode()).hexdigest()
+        (state / "outbox.json").write_text(json.dumps(dict(schema_version=1, entries={key: dict(
+            identity=identity, state=dict(state="failed", job_id=None, code="submission_ambiguous"))})))
+        def dispatch(*args):
+            result = subprocess.run([str(exe), *args], cwd=root, env=env, check=True,
+                                    capture_output=True, timeout=15)
+            return json.loads(result.stdout)
+        assert dispatch("asset-dispatch-status", str(state))[key]["state"]["code"] == "submission_ambiguous"
+        job_id = str(uuid.uuid4())
+        assert dispatch("asset-dispatch-adopt", str(state), key, job_id)["state"] == dict(state="submitted", job_id=job_id)
+        assert dispatch("asset-dispatch-status", str(state))[key]["state"]["job_id"] == job_id
+        refused = subprocess.run([str(exe), "asset-dispatch-adopt", str(state), key, str(uuid.uuid4())],
+                                 cwd=root, env=env, capture_output=True, timeout=15)
+        assert refused.returncode != 0
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]

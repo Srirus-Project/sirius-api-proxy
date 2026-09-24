@@ -223,6 +223,11 @@ impl Worker {
             };
             match result {
                 Ok(job) => {
+                    let expected = format!("{:x}", Sha256::digest(key.as_bytes()));
+                    if job.idempotency_sha256.as_deref() != Some(expected.as_str()) {
+                        self.fail(&key, "job_identity_mismatch")?;
+                        continue;
+                    }
                     if matches!(entry.state, State::Pending) {
                         self.outbox.acknowledge(&key, &job.id)?;
                     }

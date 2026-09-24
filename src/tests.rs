@@ -4661,8 +4661,87 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
         "submission_ambiguous"
     );
     drop(restarted);
+    // Adopting a real but unrelated job must never complete this dispatch identity.
+    let wrong_id = remote_state.lock().unwrap().0.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut outbox = crate::asset_outbox::Outbox::open(path.parent().unwrap(), 100).unwrap();
+    outbox.adopt(&ambiguous, &wrong_id).unwrap();
+    drop(outbox);
+    let mut restarted = Worker::new(&cfg, gc.clone()).unwrap();
+    restarted.reconcile().await.unwrap();
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        value["entries"][&ambiguous]["state"]["code"],
+        "job_identity_mismatch"
+    );
+    assert_eq!(remote_state.lock().unwrap().1, 2);
+    drop(restarted);
     cfg.environment = "review".into();
     assert!(Worker::new(&cfg, gc).is_err());
     remote.abort();
     std::env::remove_var(token);
+}
+
+#[test]
+fn asset_outbox_adoption_recovers_existing_work_without_resetting_history() {
+    use crate::{
+        asset_jobs::{Operation, Request},
+        asset_outbox::{Identity, Outbox, State},
+        region::Region,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let identity = Identity {
+        destination_sha256: "a".repeat(64),
+        request: Request {
+            region: Region::Jp,
+            profile: "full".into(),
+            operation: Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "release".into(),
+        platform: "iOS".into(),
+        resource_version: "r1".into(),
+        platform_hash: "h1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let mut store = Outbox::open(directory.path(), 10).unwrap();
+    let key = store.observe(identity.clone()).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    assert!(store.adopt(&key, &id).is_err());
+    store.begin_send(&key).unwrap();
+    store.fail(&key, "submission_ambiguous").unwrap();
+    assert!(store.adopt(&key, "../not-a-job").is_err());
+    let path = directory.path().join("outbox.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store.adopt(&key, &id).is_err());
+    assert!(matches!(store.entries()[&key].state, State::Failed { .. }));
+    std::fs::remove_dir(&path).unwrap();
+    store.adopt(&key, &id).unwrap();
+    store.adopt(&key, &id).unwrap();
+    assert!(store
+        .adopt(&key, &uuid::Uuid::new_v4().to_string())
+        .is_err());
+    drop(store);
+    let mut store = Outbox::open(directory.path(), 10).unwrap();
+    assert_eq!(
+        store.entries()[&key].state,
+        State::Submitted { job_id: id.clone() }
+    );
+    store.complete(&key, &id, &"b".repeat(64), None).unwrap();
+    assert!(store.adopt(&key, &id).is_err());
+    let mut other = identity;
+    other.resource_version = "r2".into();
+    let other = store.observe(other).unwrap();
+    store.begin_send(&other).unwrap();
+    store
+        .acknowledge(&other, &uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    store.fail(&other, "job_failed").unwrap();
+    assert!(store.adopt(&other, &id).is_err());
+    assert_eq!(store.entries().len(), 2);
 }
