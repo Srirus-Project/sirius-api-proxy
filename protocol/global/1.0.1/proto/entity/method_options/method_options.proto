@@ -1,0 +1,6 @@
+syntax = "proto3";
+package entity.method_options;
+import "google/protobuf/descriptor.proto";
+extend .google.protobuf.MethodOptions {
+  bool skip_authentication = 50001;
+}

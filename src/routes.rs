@@ -20,3 +20,13 @@ pub const ROUTES: &[&str] = &[
     WHOAMI,
     PLAYER_DATA,
 ];
+
+pub const SERVER_LIST: &str = "/app.playerlogin.PlayerLoginService/GetServerList";
+pub const GLOBAL_ROUTES: &[&str] = &[VERSION, SERVER_LIST];
+pub fn for_family(family: &str) -> &'static [&'static str] {
+    if family == "global" {
+        GLOBAL_ROUTES
+    } else {
+        ROUTES
+    }
+}

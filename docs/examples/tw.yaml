@@ -1,0 +1,17 @@
+# JSON is valid YAML. Replace the CDN placeholder with the selected server-list base URL.
+{
+  "region": "tw",
+  "platform": "Android",
+  "listen": "127.0.0.1:9999",
+  "environment": "release",
+  "endpoint": "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com",
+  "client_version": "1.0.1",
+  "session_lock": true,
+  "protocol_directory": "protocol/global/1.0.1",
+  "api_token_env": "SIRIUS_TW_API_TOKEN",
+  "internal_token_env": "SIRIUS_TW_INTERNAL_TOKEN",
+  "default_cdn_root": "https://cdn.example.invalid/prod/tw_REPLACE_FROM_SERVER_LIST",
+  "cdn_credential_env": {
+    "https://cdn.example.invalid/prod/tw_REPLACE_FROM_SERVER_LIST": "SIRIUS_TW_CDN_CREDENTIAL"
+  }
+}

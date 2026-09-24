@@ -8,13 +8,16 @@ use std::collections::BTreeMap;
 struct Release {
     version: String,
     #[serde(rename = "iOS")]
-    ios: String,
+    ios: Option<String>,
+    #[serde(rename = "Android")]
+    android: Option<String>,
     #[serde(rename = "minClientVersion")]
     minimum: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ResourceSnapshot {
     pub schema_version: u8,
+    pub region: crate::region::Region,
     pub environment: String,
     pub platform: &'static str,
     pub client_version: String,
@@ -27,7 +30,15 @@ pub struct ResourceSnapshot {
     pub observed_at: DateTime<Utc>,
     pub source: &'static str,
 }
+#[cfg(test)]
 pub(crate) fn select(raw: &str, client: &str) -> Result<(String, String), AppError> {
+    select_platform(raw, client, crate::region::Platform::Ios)
+}
+pub(crate) fn select_platform(
+    raw: &str,
+    client: &str,
+    platform: crate::region::Platform,
+) -> Result<(String, String), AppError> {
     let v: serde_json::Value = serde_json::from_str(raw).map_err(|_| AppError::Protocol)?;
     let client = Version::parse(client).map_err(|_| AppError::Protocol)?;
     let chosen = if let Some(live) = v.get("live") {
@@ -49,7 +60,12 @@ pub(crate) fn select(raw: &str, client: &str) -> Result<(String, String), AppErr
     } else {
         serde_json::from_value::<Release>(v).map_err(|_| AppError::Protocol)?
     };
-    for part in [&chosen.version, &chosen.ios] {
+    let hash = match platform {
+        crate::region::Platform::Ios => chosen.ios,
+        crate::region::Platform::Android => chosen.android,
+    }
+    .ok_or(AppError::SnapshotUnavailable)?;
+    for part in [&chosen.version, &hash] {
         if part.is_empty()
             || part.len() > 256
             || matches!(part.as_str(), "." | "..")
@@ -60,5 +76,5 @@ pub(crate) fn select(raw: &str, client: &str) -> Result<(String, String), AppErr
             return Err(AppError::Protocol);
         }
     }
-    Ok((chosen.version, chosen.ios))
+    Ok((chosen.version, hash))
 }

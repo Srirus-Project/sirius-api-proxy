@@ -35,6 +35,8 @@ pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String
     let public=Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-api-proxy","version":env!("CARGO_PKG_VERSION")}))}));
     let api = Router::new()
         .route("/api/v1/system", get(system))
+        .route("/api/v1/servers", get(servers))
+        .route("/api/v1/regions", get(regions))
         .route("/api/v1/master-data", get(master_status))
         .route("/api/v1/master-data/tables/{table}", get(master_table))
         .route("/api/v1/announcements", get(announcements))
@@ -111,13 +113,26 @@ async fn master_table(
 ) -> Result<Response, AppError> {
     master_document(c, Some(table)).await
 }
+async fn regions(State(c): State<Arc<GameClient>>) -> Json<Value> {
+    use crate::region::Region;
+    let regions=[Region::Jp,Region::Tw,Region::En,Region::Kr,Region::Cn].map(|region| json!({
+        "region":region,"area_id":region.area_id(),"protocol_family":region.family(),"reserved":region==Region::Cn,
+        "capability":if region==Region::Cn {"reserved"} else if region==Region::Jp {"jp_proxy"} else {"discovery_and_version"}
+    }));
+    Json(json!({"selected":c.region(),"regions":regions}))
+}
+async fn servers(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
+    c.call(crate::routes::SERVER_LIST, json!({}))
+        .await
+        .map(Json)
+}
 async fn system(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
     match c.call(VERSION, json!({})).await {
         Ok(_) => Ok(Json(
-            json!({"status":"available","observation":c.observation().await}),
+            json!({"status":"available","region":c.region(),"area_id":c.region().area_id(),"platform":c.platform(),"protocol_family":c.region().family(),"supported_rpcs":c.supported_routes(),"observation":c.observation().await}),
         )),
         Err(AppError::Grpc(_)) => Ok(Json(
-            json!({"status":"unavailable","observation":c.observation().await}),
+            json!({"status":"unavailable","region":c.region(),"platform":c.platform(),"observation":c.observation().await}),
         )),
         Err(e) => Err(e),
     }

@@ -8,8 +8,14 @@ pub struct SourceError;
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: String,
+    #[serde(default = "jp_family")]
+    family: String,
+}
+fn jp_family() -> String {
+    "jp".into()
 }
 pub struct Compiled {
+    pub family: String,
     pub version: String,
     pub encoded: Vec<u8>,
     pub sha256: String,
@@ -93,6 +99,9 @@ pub fn compile(directory: &Path) -> Result<Compiled, SourceError> {
     let manifest: Manifest = serde_json::from_str(&read(&directory.join("bundle.json"), 4096)?)
         .map_err(|_| SourceError)?;
     semver::Version::parse(&manifest.version).map_err(|_| SourceError)?;
+    if !matches!(manifest.family.as_str(), "jp" | "global") {
+        return invalid();
+    }
     let root = directory.join("proto");
     let mut files = BTreeMap::new();
     collect(&root, &root, 0, &mut files, &mut 0)?;
@@ -108,10 +117,13 @@ pub fn compile(directory: &Path) -> Result<Compiled, SourceError> {
         .map_err(|_| SourceError)?;
     let encoded = compiler.encode_file_descriptor_set();
     let mut hash = Sha256::new();
+    hash.update(manifest.family.as_bytes());
+    hash.update([0]);
     hash.update(manifest.version.as_bytes());
     hash.update([0]);
     hash.update(&encoded);
     Ok(Compiled {
+        family: manifest.family,
         version: manifest.version,
         encoded,
         sha256: format!("{:x}", hash.finalize()),

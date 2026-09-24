@@ -12,6 +12,7 @@ use std::{collections::HashSet, path::Path};
 pub use crate::routes::ROUTES;
 #[derive(Clone, Serialize)]
 pub struct ProtocolStatus {
+    pub family: String,
     pub version: String,
     pub sha256: String,
     pub generation: u64,
@@ -41,7 +42,7 @@ impl ProtocolBundle {
         value: serde_json::Value,
     ) -> Result<Vec<u8>, AppError> {
         if self.status.codec == "native" {
-            if let Some(encoded) = crate::native::encode(route, &value)? {
+            if let Some(encoded) = crate::native::encode(&self.status.family, route, &value)? {
                 return Ok(encoded);
             }
         }
@@ -52,7 +53,7 @@ impl ProtocolBundle {
     }
     pub(crate) fn decode(&self, route: &str, bytes: &[u8]) -> Result<serde_json::Value, AppError> {
         if self.status.codec == "native" {
-            if let Some(decoded) = crate::native::decode(route, bytes)? {
+            if let Some(decoded) = crate::native::decode(&self.status.family, route, bytes)? {
                 return Ok(decoded);
             }
         }
@@ -67,8 +68,9 @@ impl ProtocolBundle {
             crate::proto_source::compile(directory).map_err(|_| AppError::ProtocolDefinition)?;
         let pool = DescriptorPool::decode(compiled.encoded.as_slice())
             .map_err(|_| AppError::ProtocolDefinition)?;
-        validate_contract(&pool)?;
-        let codec = if compiled.sha256 == crate::native::SHA256 {
+        validate_contract(&pool, &compiled.family)?;
+        let native_sha256 = crate::native::fingerprint(&compiled.family);
+        let codec = if compiled.sha256 == native_sha256 {
             "native"
         } else {
             "dynamic"
@@ -76,6 +78,7 @@ impl ProtocolBundle {
         Ok(Self {
             pool,
             status: ProtocolStatus {
+                family: compiled.family,
                 version: compiled.version,
                 sha256: compiled.sha256,
                 generation: 1,
@@ -83,7 +86,7 @@ impl ProtocolBundle {
                 files: compiled.files,
                 source: "proto",
                 codec,
-                native_sha256: crate::native::SHA256,
+                native_sha256,
             },
         })
     }
@@ -106,11 +109,11 @@ fn field(
     }
     Ok(())
 }
-fn validate_contract(pool: &DescriptorPool) -> Result<(), AppError> {
+fn validate_contract(pool: &DescriptorPool, family: &str) -> Result<(), AppError> {
     let skip_auth = pool
         .get_extension_by_name("entity.method_options.skip_authentication")
         .ok_or(AppError::ProtocolDefinition)?;
-    for route in ROUTES {
+    for route in crate::routes::for_family(family) {
         let m = method(pool, route)?;
         if m.is_client_streaming() || m.is_server_streaming() {
             return invalid();
@@ -137,7 +140,37 @@ fn validate_contract(pool: &DescriptorPool) -> Result<(), AppError> {
             }
             MUSIC_RANKING => field(&m.input(), "musicId", Kind::Int64, false)?,
             CHALLENGE_RANKING => field(&m.input(), "challengeMusicId", Kind::Int64, false)?,
-            VERSION => field(&m.output(), "version", Kind::String, false)?,
+            VERSION => {
+                field(&m.output(), "version", Kind::String, false)?;
+                if family == "global" {
+                    field(&m.output(), "resourceVersion", Kind::String, false)?;
+                }
+            }
+            crate::routes::SERVER_LIST => {
+                let server = m
+                    .output()
+                    .get_field_by_name("servers")
+                    .ok_or(AppError::ProtocolDefinition)?;
+                let Kind::Message(info) = server.kind() else {
+                    return invalid();
+                };
+                if !server.is_list() || server.is_map() {
+                    return invalid();
+                }
+                for key in [
+                    "name",
+                    "cdnRoot",
+                    "apiServerRoot",
+                    "chatServerRoot",
+                    "atServerRoot",
+                    "liveServer",
+                    "displayName",
+                    "areaId",
+                    "ageIconSpriteName",
+                ] {
+                    field(&info, key, Kind::String, false)?;
+                }
+            }
             WHOAMI => field(&m.output(), "playerId", Kind::String, false)?,
             ANNOUNCEMENTS => {
                 let f = m
@@ -162,9 +195,14 @@ fn validate_contract(pool: &DescriptorPool) -> Result<(), AppError> {
 /// Conservative additive compatibility for every type reachable from exposed RPCs.
 /// Business routes and auth policy remain Rust code, never inferred from a new service.
 pub(crate) fn compatible(old: &DescriptorPool, new: &DescriptorPool) -> Result<(), AppError> {
+    let family = if method(old, crate::routes::SERVER_LIST).is_ok() {
+        "global"
+    } else {
+        "jp"
+    };
     let mut pending = Vec::new();
     let mut visited = HashSet::new();
-    for route in ROUTES {
+    for route in crate::routes::for_family(family) {
         let a = method(old, route)?;
         let b = method(new, route)?;
         if a.input().full_name() != b.input().full_name()

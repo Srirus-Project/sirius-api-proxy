@@ -87,4 +87,37 @@ with tempfile.TemporaryDirectory() as tmp:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+    if m["name"] == "sirius-api-proxy":
+        global_config = json.loads((root / "docs/examples/en.yaml").read_text().split("\n", 1)[1])
+        global_config.update(listen=f"127.0.0.1:{port}", api_token_env="SIRIUS_API_TOKEN", internal_token_env="SIRIUS_INTERNAL_TOKEN")
+        (root / "sirius-api-config.yaml").write_text(json.dumps(global_config))
+        proc = subprocess.Popen([str(exe)], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(100):
+                if proc.poll() is not None:
+                    raise RuntimeError(proc.stderr.read().decode())
+                try:
+                    code, protocol = request("/internal/v1/protocol", env["SIRIUS_INTERNAL_TOKEN"])
+                    break
+                except (OSError, urllib.error.URLError):
+                    time.sleep(0.1)
+            else:
+                raise RuntimeError("Global packaged server did not start")
+            assert code == 200 and protocol["codec"] == "native" and protocol["family"] == "global"
+            code, regions = request("/api/v1/regions", env["SIRIUS_API_TOKEN"])
+            assert code == 200 and regions["selected"] == "en"
+            assert next(r for r in regions["regions"] if r["region"] == "cn")["reserved"]
+            assert request("/api/v1/regions")[0] == 401
+            assert request("/api/v1/players/by-profile-id/1", env["SIRIUS_API_TOKEN"])[0] == 501
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        global_config["region"] = "cn"
+        (root / "sirius-api-config.yaml").write_text(json.dumps(global_config))
+        result = subprocess.run([str(exe)], cwd=root, env=env, capture_output=True, timeout=15)
+        assert result.returncode != 0 and b"cn is reserved" in result.stderr
     print(f"Archive hashes, runtime files and offline startup passed: {m['name']} {m['version']} ({m['target']})")

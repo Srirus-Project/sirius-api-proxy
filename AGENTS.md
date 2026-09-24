@@ -14,7 +14,7 @@ Keep Haruki MIT attribution and Sirius attribution in LICENSE; sources are in do
 - Commit subjects use `[Feat]`, `[Fix]`, `[Chore]` or `[Docs]` and an imperative description.
 - Include `Co-authored-by: Codex <noreply@openai.com>` in Codex commit bodies.
 
-Build generates native prost/pbjson codecs from `protocol/sirius/1.0.3`. Runtime loads the configured
+Build generates native prost/pbjson codecs separately for JP and Global protocol families. Runtime loads the configured
 `.proto` bundle and prefers native only on exact fingerprint match; otherwise use dynamic hot reload.
 Keep build/runtime compilation and fingerprinting shared in src/proto_source.rs.
 Keep only the RPCs in src/routes.rs and their transitive message/enum dependencies.
@@ -30,3 +30,7 @@ Use Sirius names and SIRIUS_* environment variables. The game is BanG Dream! Our
 Keep explicit derived-from links to the appropriate Haruki repository in README.md.
 Release archives must include runtime files, example configuration, documentation and licenses.
 Keep repository visibility, release publication and workflow activation explicit operations.
+
+Region is independent of environment. Preserve legacy JP defaults, explicit region identity in new snapshots,
+region-scoped caches and the reserved (non-operational) CN boundary. Never silently use JP schemas or
+credentials for Global. Keep the capability matrix in docs/REGIONS.md accurate.

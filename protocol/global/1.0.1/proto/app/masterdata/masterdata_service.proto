@@ -1,0 +1,15 @@
+syntax = "proto3";
+package app.masterdata;
+import "entity/method_options/method_options.proto";
+
+message VersionRequest {
+}
+message VersionResponse {
+  string version = 1;
+  string resource_version = 2;
+}
+service MasterdataService {
+  rpc Version (.app.masterdata.VersionRequest) returns (.app.masterdata.VersionResponse) {
+    option (entity.method_options.skip_authentication) = true;
+  }
+}

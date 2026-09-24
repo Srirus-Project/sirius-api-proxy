@@ -29,6 +29,8 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        region: crate::region::Region::Jp,
+        platform: None,
         protocol_directory: crate::config::default_protocol_directory(),
         listen: "127.0.0.1:0".parse().unwrap(),
         environment: "release".into(),
@@ -1514,7 +1516,9 @@ fn native_codecs_match_independent_wire_and_dynamic_json_for_all_exposed_routes(
                 let expected = DynamicMessage::deserialize(method.input(), input.clone()).unwrap();
                 if !unknown {
                     assert!(
-                        crate::native::encode(route, &input).unwrap().is_some(),
+                        crate::native::encode("jp", route, &input)
+                            .unwrap()
+                            .is_some(),
                         "native encode {route}"
                     );
                 }
@@ -1530,7 +1534,7 @@ fn native_codecs_match_independent_wire_and_dynamic_json_for_all_exposed_routes(
                 let expected = serde_json::to_value(&message).unwrap();
                 if !unknown {
                     assert!(
-                        crate::native::decode(route, &message.encode_to_vec())
+                        crate::native::decode("jp", route, &message.encode_to_vec())
                             .unwrap()
                             .is_some(),
                         "native decode {route}"
@@ -1781,4 +1785,207 @@ async fn unlocked_authenticated_bootstrap_is_single_flight() {
     let received = f.received.lock().unwrap();
     assert_eq!(received.len(), 3);
     assert_eq!(received.iter().filter(|r| r.0 == VERSION).count(), 1);
+}
+
+#[test]
+fn region_config_defaults_and_reserved_cn_fail_closed() {
+    use crate::region::{Platform, Region};
+    let mut cfg = config();
+    assert_eq!(cfg.region, Region::Jp);
+    assert_eq!(cfg.platform(), Platform::Ios);
+    cfg.region = Region::En;
+    cfg.endpoint = "https://l14-prod-va-all-gs-sirius.bilibiligame.net".into();
+    cfg.default_cdn_root = "https://cdn.example/prod/en_fixture".into();
+    cfg.cdn_credential_env =
+        BTreeMap::from([(cfg.default_cdn_root.clone(), "UNSET_EN_CDN".into())]);
+    assert_eq!(cfg.platform(), Platform::Android);
+    assert!(cfg.validate().is_ok());
+    assert_eq!(
+        cfg.protocol_path(),
+        std::path::PathBuf::from("protocol/global/1.0.1")
+    );
+    cfg.region = Region::Cn;
+    assert!(matches!(cfg.validate(), Err(AppError::Config(_))));
+    assert!(yaml_serde::from_str::<crate::region::Region>("global").is_err());
+    for bad in [
+        "https://cdn.example/prod/../en",
+        "https://cdn.example/prod/%2e%2e/en",
+        "https://cdn.example/prod/en?token=x",
+        "https://cdn.example/prod/en/",
+        "https://cdn.example/a\\b",
+    ] {
+        assert!(!crate::config::cdn_root(bad), "{bad}");
+    }
+}
+#[test]
+fn global_native_codec_and_protocol_family_are_independent() {
+    let bundle =
+        crate::protocol::ProtocolBundle::load(std::path::Path::new("protocol/global/1.0.1"))
+            .unwrap();
+    assert_eq!(bundle.status.codec, "native");
+    assert_eq!(bundle.status.family, "global");
+    assert_ne!(bundle.status.sha256, crate::native::SHA256);
+    let wire = vec![0x0a, 1, b'm', 0x12, 1, b'r'];
+    assert_eq!(
+        bundle.decode(VERSION, &wire).unwrap(),
+        json!({"version":"m","resourceVersion":"r"})
+    );
+    let servers = json!({"servers":[{"name":"EN Region","areaId":"3","cdnRoot":"https://cdn.example/prod/en_fixture","apiServerRoot":"https://api.example"}]});
+    let method = crate::protocol::method(&bundle.pool, crate::routes::SERVER_LIST).unwrap();
+    let bytes = DynamicMessage::deserialize(method.output(), servers.clone())
+        .unwrap()
+        .encode_to_vec();
+    assert_eq!(
+        bundle.decode(crate::routes::SERVER_LIST, &bytes).unwrap(),
+        servers
+    );
+    assert!(bundle
+        .encode(crate::routes::SERVER_LIST, json!({}))
+        .unwrap()
+        .is_empty());
+    let mut cfg = config();
+    cfg.region = crate::region::Region::En;
+    cfg.endpoint = "https://api.example".into();
+    cfg.default_cdn_root = "https://cdn.example".into();
+    cfg.cdn_credential_env =
+        BTreeMap::from([(cfg.default_cdn_root.clone(), "UNSET_GLOBAL_CDN".into())]);
+    cfg.protocol_directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("protocol/sirius/1.0.3");
+    assert!(matches!(
+        GameClient::new(cfg),
+        Err(AppError::ProtocolDefinition)
+    ));
+}
+#[tokio::test]
+async fn global_sends_android_headers_and_refuses_unverified_player_routes() {
+    let mut reply = Reply::version();
+    reply.bytes = framed(vec![0x0a, 1, b'm', 0x12, 1, b'r']);
+    let f = fixture(vec![reply]).await;
+    let mut cfg = config();
+    cfg.region = crate::region::Region::En;
+    cfg.client_version = "1.0.1".into();
+    cfg.endpoint = f.url.clone();
+    let c = GameClient::for_test(cfg);
+    assert!(matches!(
+        c.call(crate::routes::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::UnsupportedRegionOperation)
+    ));
+    assert!(f.received.lock().unwrap().is_empty());
+    assert_eq!(
+        c.call(VERSION, json!({})).await.unwrap()["resourceVersion"],
+        "r"
+    );
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen[0].1["x-platform"], "android");
+    assert_eq!(seen[0].1["x-client-version"], "1.0.1");
+    assert!(!seen[0].1.contains_key("x-player-credential"));
+}
+#[test]
+fn resource_selector_uses_requested_platform_and_never_substitutes_ios() {
+    use crate::region::Platform;
+    let raw = r#"{"version":"r1","iOS":"ios-hash","Android":"android-hash"}"#;
+    assert_eq!(
+        resources::select_platform(raw, "1.0.1", Platform::Android).unwrap(),
+        ("r1".into(), "android-hash".into())
+    );
+    assert!(resources::select_platform(
+        r#"{"version":"r1","iOS":"ios-hash"}"#,
+        "1.0.1",
+        Platform::Android
+    )
+    .is_err());
+    assert!(resources::select_platform("unknown", "1.0.1", Platform::Android).is_err());
+}
+
+#[test]
+fn known_region_endpoints_cannot_be_relabelled() {
+    use crate::region::Region;
+    for (host, path, region) in [
+        ("api.bang-dream-on.jp", "/", Region::Jp),
+        (
+            "l14-prod-hk-all-gs-sirius.gamerfusiontech.com",
+            "/",
+            Region::Tw,
+        ),
+        (
+            "l14-prod-va-all-gs-sirius.bilibiligame.net",
+            "/",
+            Region::En,
+        ),
+        (
+            "l14-prod-kr-all-gs-sirius.bilibiligame.net",
+            "/",
+            Region::Kr,
+        ),
+        (
+            "l14-prod-sg-patch-sirius.bilibiligame.net",
+            "/prod/en_fixture",
+            Region::En,
+        ),
+        (
+            "l14-prod-sg-patch-sirius.bilibiligame.net",
+            "/prod/kr_fixture",
+            Region::Kr,
+        ),
+    ] {
+        for candidate in [Region::Jp, Region::Tw, Region::En, Region::Kr, Region::Cn] {
+            assert_eq!(
+                candidate.matches_known_service(host, path),
+                candidate == region
+            );
+        }
+    }
+    let mut cfg = config();
+    cfg.region = Region::Tw;
+    assert!(matches!(cfg.validate(), Err(AppError::Config(_))));
+}
+#[tokio::test]
+async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = std::path::Path::new("protocol/global/1.0.1");
+    for path in [
+        "bundle.json",
+        "proto/app/masterdata/masterdata_service.proto",
+        "proto/app/playerlogin/playerlogin_service.proto",
+        "proto/entity/method_options/method_options.proto",
+        "proto/google/protobuf/descriptor.proto",
+    ] {
+        let target = temp.path().join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(source.join(path), target).unwrap();
+    }
+    let mut cfg = config();
+    cfg.region = crate::region::Region::En;
+    cfg.protocol_directory = temp.path().into();
+    let c = GameClient::for_test(cfg);
+    let original = c.protocol_status().unwrap();
+    assert_eq!(original.codec, "native");
+    edit_version_proto(
+        temp.path(),
+        "string resource_version = 2;",
+        "string resource_version = 2; string fixture_field = 99;",
+    );
+    let changed = c.reload_protocol().await.unwrap();
+    assert_eq!(changed.codec, "dynamic");
+    assert_eq!(changed.family, "global");
+    std::fs::write(
+        temp.path().join("bundle.json"),
+        r#"{"version":"1.0.1","family":"jp"}"#,
+    )
+    .unwrap();
+    assert!(c.reload_protocol().await.is_err());
+    assert_eq!(c.protocol_status().unwrap().sha256, changed.sha256);
+    std::fs::copy(source.join("bundle.json"), temp.path().join("bundle.json")).unwrap();
+    std::fs::copy(
+        source.join("proto/app/masterdata/masterdata_service.proto"),
+        temp.path()
+            .join("proto/app/masterdata/masterdata_service.proto"),
+    )
+    .unwrap();
+    // Removing a field after activation is intentionally incompatible: restart restores native.
+    assert!(c.reload_protocol().await.is_err());
+    let restored = crate::protocol::ProtocolBundle::load(temp.path()).unwrap();
+    assert_eq!(restored.status.codec, "native");
+    assert_eq!(restored.status.sha256, original.sha256);
 }

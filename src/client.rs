@@ -46,6 +46,7 @@ pub struct Observation {
     pub server_time: Option<String>,
     pub maintenance: bool,
     pub master_version: Option<String>,
+    pub resource_version: Option<String>,
 }
 struct State {
     master_update: Value,
@@ -80,7 +81,10 @@ impl GameClient {
         Self::build(config, false)
     }
     fn build(config: Config, test_http: bool) -> Result<Arc<Self>, AppError> {
-        let protocol = ProtocolBundle::load(&config.protocol_directory)?;
+        let protocol = ProtocolBundle::load(&config.protocol_path())?;
+        if protocol.status.family != config.region.family() {
+            return Err(AppError::ProtocolDefinition);
+        }
         let builder = HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
             .map_err(|_| AppError::Config("TLS provider initialization failed"))?;
@@ -142,7 +146,7 @@ impl GameClient {
     }
     pub async fn reload_protocol(&self) -> Result<ProtocolStatus, AppError> {
         let _reload = self.reload_lock.lock().await;
-        let directory = self.config.protocol_directory.clone();
+        let directory = self.config.protocol_path();
         let mut candidate = tokio::task::spawn_blocking(move || ProtocolBundle::load(&directory))
             .await
             .map_err(|_| AppError::ProtocolDefinition)??;
@@ -154,6 +158,9 @@ impl GameClient {
             .read()
             .map_err(|_| AppError::ProtocolDefinition)?
             .clone();
+        if candidate.status.family != self.config.region.family() {
+            return Err(AppError::ProtocolDefinition);
+        }
         if current.status.sha256 == candidate.status.sha256 {
             return Ok(current.status.clone());
         }
@@ -173,6 +180,15 @@ impl GameClient {
         state.observation = Observation::default();
         state.snapshot_stale = true;
         Ok(status)
+    }
+    pub fn region(&self) -> crate::region::Region {
+        self.config.region
+    }
+    pub fn platform(&self) -> crate::region::Platform {
+        self.config.platform()
+    }
+    pub fn supported_routes(&self) -> &'static [&'static str] {
+        crate::routes::for_family(self.config.region.family())
     }
     pub fn environment(&self) -> &str {
         &self.config.environment
@@ -224,8 +240,11 @@ impl GameClient {
     }
     pub async fn call(&self, route: &str, input: Value) -> Result<Value, AppError> {
         // No generic passthrough: only these read operations are supported.
-        if !protocol::ROUTES.contains(&route) {
+        if !crate::routes::ROUTES.contains(&route) && route != crate::routes::SERVER_LIST {
             return Err(AppError::InvalidRequest);
+        }
+        if !self.supported_routes().contains(&route) {
+            return Err(AppError::UnsupportedRegionOperation);
         }
         if authenticated(route) && self.account.is_none() {
             return Err(AppError::AccountUnavailable);
@@ -289,7 +308,8 @@ impl GameClient {
             .header("te", "trailers")
             .header("grpc-accept-encoding", "identity")
             .header("grpc-timeout", "20S")
-            .header("x-platform", "ios")
+            .header("x-platform", self.config.platform().header())
+            .header("x-client-version", &self.config.client_version)
             .header("x-request-id", uuid::Uuid::new_v4().to_string());
         if let Some(version) = &self.state.lock().await.observation.master_version {
             request = request.header("x-master-version", version);
@@ -367,7 +387,13 @@ impl GameClient {
                         && s.parse::<hyper::header::HeaderValue>().is_ok()
                 })
                 .ok_or(AppError::Protocol)?;
-            self.state.lock().await.observation.master_version = Some(version.to_string());
+            let mut state = self.state.lock().await;
+            state.observation.master_version = Some(version.to_string());
+            state.observation.resource_version = value
+                .get("resourceVersion")
+                .and_then(Value::as_str)
+                .filter(|v| crate::master::safe_version(v))
+                .map(str::to_owned);
         }
         self.promote_snapshot(&metadata, &protocol.status.version)
             .await;
@@ -415,7 +441,9 @@ impl GameClient {
         };
         let mut s = self.state.lock().await;
         s.snapshot_stale = true;
-        let Ok((version, hash)) = resources::select(raw, &self.config.client_version) else {
+        let Ok((version, hash)) =
+            resources::select_platform(raw, &self.config.client_version, self.config.platform())
+        else {
             return;
         };
         let Some(reference) = self.config.cdn_credential_env.get(&s.cdn_root) else {
@@ -425,9 +453,10 @@ impl GameClient {
             return;
         }
         s.snapshot = Some(ResourceSnapshot {
-            schema_version: 1,
+            schema_version: 2,
+            region: self.config.region,
             environment: self.config.environment.clone(),
-            platform: "iOS",
+            platform: self.config.platform().name(),
             client_version: self.config.client_version.clone(),
             protocol_version: protocol_version.into(),
             master_version: s.observation.master_version.clone(),

@@ -5,6 +5,10 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub region: crate::region::Region,
+    #[serde(default)]
+    pub platform: Option<crate::region::Platform>,
     #[serde(default = "default_protocol_directory")]
     pub protocol_directory: std::path::PathBuf,
     pub listen: SocketAddr,
@@ -67,8 +71,51 @@ pub(crate) fn https_root(value: &str) -> bool {
     })
 }
 
+pub(crate) fn cdn_root(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some()
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && !value.ends_with('/')
+            && !value.contains('%')
+            && !value.contains('\\')
+            && !value.split('/').any(|s| matches!(s, "." | ".."))
+            && u.path().split('/').all(|s| {
+                s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_ .".contains(&b))
+                    && !s.contains(' ')
+            })
+    })
+}
 impl Config {
+    pub fn platform(&self) -> crate::region::Platform {
+        self.platform.unwrap_or(self.region.default_platform())
+    }
+    pub fn protocol_path(&self) -> std::path::PathBuf {
+        if self.region.family() == "global"
+            && self.protocol_directory == default_protocol_directory()
+        {
+            "protocol/global/1.0.1".into()
+        } else {
+            self.protocol_directory.clone()
+        }
+    }
     pub fn validate(&self) -> Result<(), AppError> {
+        if self.region == crate::region::Region::Cn {
+            return Err(AppError::Config(
+                "cn is reserved; no verified endpoint or protocol is available",
+            ));
+        }
+        if self.region != crate::region::Region::Jp
+            && (self.master_update.is_some() || self.master_directory.is_some())
+        {
+            return Err(AppError::Config(
+                "automatic Master storage is currently verified only for jp",
+            ));
+        }
         if let Some(update) = &self.master_update {
             if self
                 .master_directory
@@ -86,12 +133,27 @@ impl Config {
                 return Err(AppError::Config("Master updater requires a directory, secret references and a 60..86400 second interval"));
             }
         }
+        for value in std::iter::once(&self.endpoint)
+            .chain(std::iter::once(&self.default_cdn_root))
+            .chain(self.cdn_credential_env.keys())
+        {
+            if let Ok(url) = url::Url::parse(value) {
+                if !self
+                    .region
+                    .matches_known_service(url.host_str().unwrap_or(""), url.path())
+                {
+                    return Err(AppError::Config(
+                        "known service URL does not belong to configured region",
+                    ));
+                }
+            }
+        }
         if !https_root(&self.endpoint)
-            || !https_root(&self.default_cdn_root)
-            || self.cdn_credential_env.keys().any(|k| !https_root(k))
+            || !cdn_root(&self.default_cdn_root)
+            || self.cdn_credential_env.keys().any(|k| !cdn_root(k))
         {
             return Err(AppError::Config(
-                "endpoints must be HTTPS origins without a trailing slash",
+                "API endpoint must be an HTTPS origin and CDN roots must be safe HTTPS base URLs without a trailing slash",
             ));
         }
         if self.environment.is_empty()

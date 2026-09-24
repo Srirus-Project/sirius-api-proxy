@@ -1,3 +1,6 @@
+# Region and deployment environment are independent. See docs/REGIONS.md.
+region: jp
+platform: iOS
 listen: 127.0.0.1:9999
 environment: release
 endpoint: https://api.bang-dream-on.jp
