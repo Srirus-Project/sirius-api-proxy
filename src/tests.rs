@@ -32,7 +32,7 @@ fn config() -> Config {
         region: crate::region::Region::Jp,
         platform: None,
         protocol_directory: crate::config::default_protocol_directory(),
-        listen: "127.0.0.1:0".parse().unwrap(),
+        listen: Some("127.0.0.1:0".parse().unwrap()),
         environment: "release".into(),
         endpoint: "https://api.bang-dream-on.jp".into(),
         client_version: "1.0.3".into(),
@@ -1988,4 +1988,198 @@ async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     let restored = crate::protocol::ProtocolBundle::load(temp.path()).unwrap();
     assert_eq!(restored.status.codec, "native");
     assert_eq!(restored.status.sha256, original.sha256);
+}
+
+fn regional_config(region: crate::region::Region) -> Config {
+    let mut c = config();
+    c.listen = None;
+    c.region = region;
+    if region != crate::region::Region::Jp {
+        c.endpoint = "https://api.example".into();
+        c.default_cdn_root = "https://cdn.example".into();
+        c.cdn_credential_env =
+            BTreeMap::from([("https://cdn.example".into(), "UNSET_FIXTURE_CDN".into())]);
+        c.client_version = "1.0.1".into();
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    c.api_token_env = format!("SIRIUS_TEST_API_{id}");
+    c.internal_token_env = format!("SIRIUS_TEST_INTERNAL_{id}");
+    std::env::set_var(&c.api_token_env, format!("public-{}", region.name()));
+    std::env::set_var(&c.internal_token_env, format!("internal-{}", region.name()));
+    c
+}
+
+#[test]
+fn deployment_rejects_ambiguous_region_and_token_scope() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        region::Region,
+    };
+    let mut m = MultiConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::new(),
+    };
+    assert!(DeploymentConfig::Multi(m.clone()).validate().is_err());
+    m.regions.insert("en".into(), regional_config(Region::Jp));
+    assert!(DeploymentConfig::Multi(m.clone()).validate().is_err());
+    m.regions.clear();
+    m.regions.insert("cn".into(), regional_config(Region::Cn));
+    assert!(DeploymentConfig::Multi(m.clone()).validate().is_err());
+    m.regions.clear();
+    let jp = regional_config(Region::Jp);
+    let en = regional_config(Region::En);
+    // Even across regions, an external bearer cannot gain internal privileges.
+    std::env::set_var(&en.internal_token_env, "public-jp");
+    m.regions.insert("jp".into(), jp);
+    m.regions.insert("en".into(), en);
+    assert!(DeploymentConfig::Multi(m.clone()).prepare().is_err());
+    m.regions.get_mut("jp").unwrap().listen = Some(m.listen);
+    assert!(DeploymentConfig::Multi(m).validate().is_err());
+    assert!(DeploymentConfig::parse(
+        "listen: 127.0.0.1:9999\nregions: {}\nendpoint: https://example.com"
+    )
+    .is_err());
+    let single =
+        DeploymentConfig::parse(include_str!("../sirius-api-config.example.yaml")).unwrap();
+    assert_eq!(single.single().unwrap().region, Region::Jp);
+}
+
+#[tokio::test]
+async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        region::Region,
+    };
+    let bundle = copy_protocol_bundle();
+    let mut configs = BTreeMap::new();
+    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+        let mut c = regional_config(region);
+        if region == Region::Jp {
+            c.protocol_directory = bundle.path().into();
+        }
+        configs.insert(region.name().into(), c);
+    }
+    let deployment = DeploymentConfig::Multi(MultiConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: configs,
+    });
+    assert!(deployment.single().is_err());
+    let app = deployment.prepare().unwrap().router;
+    async fn request(app: &axum::Router, path: &str, token: &str, method: &str) -> (u16, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+    assert_eq!(request(&app, "/health", "", "GET").await.0, 200);
+    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+        let n = region.name();
+        let (status, body) = request(
+            &app,
+            &format!("/api/v1/{n}/regions"),
+            &format!("public-{n}"),
+            "GET",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["selected"], n);
+        let (status, body) = request(
+            &app,
+            &format!("/internal/v1/{n}/protocol"),
+            &format!("internal-{n}"),
+            "GET",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["family"], region.family());
+        assert_eq!(body["generation"], 1);
+        assert_eq!(
+            request(
+                &app,
+                &format!("/internal/v1/{n}/protocol"),
+                &format!("public-{n}"),
+                "GET"
+            )
+            .await
+            .0,
+            401
+        );
+        if region != Region::Jp {
+            assert_eq!(
+                request(&app, &format!("/api/v1/{n}/regions"), "public-jp", "GET")
+                    .await
+                    .0,
+                401
+            );
+            assert_eq!(
+                request(
+                    &app,
+                    &format!("/internal/v1/{n}/protocol"),
+                    "internal-jp",
+                    "GET"
+                )
+                .await
+                .0,
+                401
+            );
+            assert_eq!(
+                request(
+                    &app,
+                    &format!("/api/v1/{n}/players/by-profile-id/123"),
+                    &format!("public-{n}"),
+                    "GET"
+                )
+                .await
+                .0,
+                501
+            );
+        }
+    }
+    for path in [
+        "/api/v1/regions",
+        "/api/v1/cn/regions",
+        "/api/v1/global/regions",
+    ] {
+        assert_eq!(request(&app, path, "public-jp", "GET").await.0, 404);
+    }
+    edit_version_proto(
+        bundle.path(),
+        "string version = 1;",
+        "string version = 1;\n string extra = 2;",
+    );
+    let (status, body) = request(
+        &app,
+        "/internal/v1/jp/protocol/reload",
+        "internal-jp",
+        "POST",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["generation"], 2);
+    assert_eq!(body["codec"], "dynamic");
+    for region in ["tw", "en", "kr"] {
+        let (_, body) = request(
+            &app,
+            &format!("/internal/v1/{region}/protocol"),
+            &format!("internal-{region}"),
+            "GET",
+        )
+        .await;
+        assert_eq!(body["generation"], 1);
+        assert_eq!(body["codec"], "native");
+    }
 }

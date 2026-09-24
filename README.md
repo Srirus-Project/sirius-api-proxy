@@ -41,6 +41,8 @@ export SIRIUS_INTERNAL_TOKEN='replace-with-a-different-long-random-token'
 # Release archive: ./sirius-api-proxy (sirius-api-proxy.exe on Windows)
 ```
 
+For one process serving multiple regions, see [multi-region configuration](docs/MULTI_REGION.md).
+
 `SIRIUS_CONFIG_PATH` overrides the configuration path. Default listen address: `127.0.0.1:9999`.
 Keep the bundled `protocol/` directory beside the executable and run from that directory,
 or configure an absolute `protocol_directory`. No external protoc, Redis or database is needed.

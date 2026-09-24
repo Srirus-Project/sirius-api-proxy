@@ -32,24 +32,43 @@ async fn authorize(
     Ok(next.run(request).await)
 }
 pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String) -> Router {
-    let public=Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-api-proxy","version":env!("CARGO_PKG_VERSION")}))}));
+    health_router().merge(router_at(
+        client,
+        api_token,
+        internal_token,
+        "/api/v1",
+        "/internal/v1",
+    ))
+}
+
+pub fn health_router() -> Router {
+    Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-api-proxy","version":env!("CARGO_PKG_VERSION")}))}))
+}
+
+pub fn router_at(
+    client: Arc<GameClient>,
+    api_token: String,
+    internal_token: String,
+    api_prefix: &str,
+    internal_prefix: &str,
+) -> Router {
     let api = Router::new()
-        .route("/api/v1/system", get(system))
-        .route("/api/v1/servers", get(servers))
-        .route("/api/v1/regions", get(regions))
-        .route("/api/v1/master-data", get(master_status))
-        .route("/api/v1/master-data/tables/{table}", get(master_table))
-        .route("/api/v1/announcements", get(announcements))
-        .route("/api/v1/announcements/{id}", get(announcement))
-        .route("/api/v1/players/by-profile-id/{profile_id}", get(profile))
-        .route("/api/v1/events/{event_id}/rankings", get(event_ranking))
+        .route("/system", get(system))
+        .route("/servers", get(servers))
+        .route("/regions", get(regions))
+        .route("/master-data", get(master_status))
+        .route("/master-data/tables/{table}", get(master_table))
+        .route("/announcements", get(announcements))
+        .route("/announcements/{id}", get(announcement))
+        .route("/players/by-profile-id/{profile_id}", get(profile))
+        .route("/events/{event_id}/rankings", get(event_ranking))
         .route(
-            "/api/v1/events/{event_id}/players/{player_id}/deck",
+            "/events/{event_id}/players/{player_id}/deck",
             get(event_deck),
         )
-        .route("/api/v1/songs/{song_id}/rankings", get(music_ranking))
+        .route("/songs/{song_id}/rankings", get(music_ranking))
         .route(
-            "/api/v1/challenge-songs/{challenge_song_id}/rankings",
+            "/challenge-songs/{challenge_song_id}/rankings",
             get(challenge_ranking),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -57,20 +76,20 @@ pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String
             authorize,
         ));
     let internal = Router::new()
-        .route("/internal/v1/protocol", get(protocol_status))
-        .route("/internal/v1/protocol/reload", post(protocol_reload))
-        .route("/internal/v1/resources/snapshot", get(snapshot))
-        .route("/internal/v1/account", get(account))
-        .route(
-            "/internal/v1/master-data/updater",
-            get(master_update_status),
-        )
-        .route("/internal/v1/account/player-data", get(player_data))
+        .route("/protocol", get(protocol_status))
+        .route("/protocol/reload", post(protocol_reload))
+        .route("/resources/snapshot", get(snapshot))
+        .route("/account", get(account))
+        .route("/master-data/updater", get(master_update_status))
+        .route("/account/player-data", get(player_data))
         .route_layer(middleware::from_fn_with_state(
             Arc::<str>::from(internal_token),
             authorize,
         ));
-    public.merge(api).merge(internal).with_state(client)
+    Router::new()
+        .nest(api_prefix, api)
+        .nest(internal_prefix, internal)
+        .with_state(client)
 }
 
 async fn protocol_status(

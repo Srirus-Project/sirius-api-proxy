@@ -1,7 +1,7 @@
-# Region support in v1.1.0
+# Region support
 
-Region is distinct from deployment environment and UI language. Run one proxy instance per
-region, with separate configuration, tokens, game credentials, session locks and storage.
+Region is distinct from deployment environment and UI language. Deploy separate instances or
+use the [multi-region service](MULTI_REGION.md), with isolated client state and regional routes.
 Changing region requires a restart; hot reload changes compatible protobuf definitions within
 one protocol family and cannot switch regions or account identity.
 

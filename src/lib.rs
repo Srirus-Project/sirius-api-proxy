@@ -16,3 +16,5 @@ mod proto_source;
 mod routes;
 
 pub mod region;
+
+pub mod deployment;

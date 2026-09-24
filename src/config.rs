@@ -11,7 +11,7 @@ pub struct Config {
     pub platform: Option<crate::region::Platform>,
     #[serde(default = "default_protocol_directory")]
     pub protocol_directory: std::path::PathBuf,
-    pub listen: SocketAddr,
+    pub listen: Option<SocketAddr>,
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,

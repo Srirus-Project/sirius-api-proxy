@@ -35,6 +35,7 @@ with tempfile.TemporaryDirectory() as tmp:
     shutil.copytree(root / "docs", stage / "docs")
     if name == "sirius-api-proxy":
         shutil.copytree(root / "protocol", stage / "protocol")
+        shutil.copy2(root / "sirius-multi-region-config.example.yaml", stage / "sirius-multi-region-config.example.yaml")
     else:
         shutil.copy2(root / "export-config.example.yaml", stage / "export-config.example.yaml")
     manifest = {"name": name, "version": version, "target": a.target, "files": {}}

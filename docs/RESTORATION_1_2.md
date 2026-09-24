@@ -4,7 +4,7 @@ Objective: retain Haruki's reusable service/platform capabilities, replace all S
 
 Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e131 and Haruki-Sekai-Asset-Updater 3d33ed037f0ef5009e361e0535b3b19f8c239947. Preserve MIT attribution. Existing Sirius release baselines: API 5ab1e390ca514e550cb609ae4d299b19c105b79e, updater e7ffb7b905958de88aa8d5a06327dafcc8acd8ce.
 
-## API requirements (all pending)
+## API requirements (pending unless evidenced in the work log)
 
 - Multi-region service configuration/routing with per-region protocol family, credentials and isolated state; retain v1.1 single-region config compatibility and reserved CN.
 - Account pool, per-account locking, selection, health/cooldown and credential reload. No speculative retries of account mutations; no fabricated Global login.
@@ -43,3 +43,5 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Updater durable job ledger implemented and five lifecycle tests passed: restart interruption, exclusive state ownership, queue/retention bounds, per-region scheduling, cancellation acknowledgement, storage failure atomicity and reserved-region rejection. HTTP and pipeline integration remain pending; this does not satisfy the service gate yet.
 
 - User requires category investigation before adapting filters. Verified Sirius catalog labels: InitialDownload, Everything, MV; use native key/dependency membership, not Sekai start_app/on_demand. Everything is a subset of full catalog (JP baseline: 13,364 versus 13,367 remote files). Exact tutorial/runtime required-address composition remains unverified; no invented preset.
+
+- Multi-region service assembly implemented with one listener, independent regional clients/protocols/observations/locks, legacy single-region routes and per-region bearer scopes. Local four-region tests verify wrong-scope rejection, Global 501, CN/unknown route rejection and JP-only protocol reload. Updater opt-in regional routes cover version refresh and snapshot transport. Account pools, cache and the remaining API requirements are still pending.
