@@ -170,6 +170,21 @@ fn verified_snapshot(source: &Path, scope: Scope, id: Option<&str>) -> Result<Sn
         tables,
     })
 }
+/// Verify local CURRENT without loading database credentials or establishing a connection.
+pub async fn verify_current(source: &Path, scope: Scope) -> Result<Receipt, Error> {
+    let source = source.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = verified(&source, scope)?;
+        Ok(Receipt {
+            content_sha256: snapshot.manifest.content_sha256,
+            tables: snapshot.tables.len(),
+            bytes: snapshot.tables.iter().map(|(f, _, _)| f.size).sum(),
+            changed: false,
+        })
+    })
+    .await
+    .map_err(|_| Error::Snapshot)?
+}
 /// Verify the entire pinned local snapshot before any database connection or mutation.
 /// Cancellation rolls back the transaction; an uncertain commit is reconciled by content identity.
 pub async fn publish(config: &Config, source: &Path, scope: Scope) -> Result<Receipt, Error> {

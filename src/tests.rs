@@ -10685,7 +10685,8 @@ fn registry_owner_config(
     let internal = format!("SIRIUS_REGISTRY_ADMIN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&internal, "registry-admin");
     cfg.owner = Some(crate::registry_owner::Config {
-        source: master_sync_config(origin, directory).master_sync.unwrap(),
+        source: master_sync_config(origin, directory).master_sync,
+        local_interval_seconds: None,
         internal_token_env: internal,
         staging_directory: None,
     });
@@ -10737,8 +10738,20 @@ async fn standalone_registry_owner_start_hint_recovery_auth_and_shutdown() {
     let local = tempfile::tempdir().unwrap();
     let output = local.path().join("master");
     let mut cfg = registry_owner_config(origin, output.clone());
-    cfg.owner.as_mut().unwrap().source.request_timeout_ms = 60_000;
-    cfg.owner.as_mut().unwrap().source.timeout_seconds = 60;
+    cfg.owner
+        .as_mut()
+        .unwrap()
+        .source
+        .as_mut()
+        .unwrap()
+        .request_timeout_ms = 60_000;
+    cfg.owner
+        .as_mut()
+        .unwrap()
+        .source
+        .as_mut()
+        .unwrap()
+        .timeout_seconds = 60;
     let prepared = cfg.prepare().unwrap();
     let app = prepared.router;
     let worker = prepared.owner.unwrap();
@@ -11012,4 +11025,200 @@ async fn standalone_registry_owner_periodic_retry_without_hint() {
     shutdown.send(true).unwrap();
     task.await.unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn registry_local_publication_requires_admin_and_verifies_without_installing() {
+    use axum::body::Body;
+    let (_root, input, source, _) = registry_fixture();
+    let mut cfg = registry_owner_config("http://127.0.0.1:1".into(), source.clone());
+    cfg.owner.as_mut().unwrap().source = None;
+    let prepared = cfg.prepare().unwrap();
+    let worker = prepared.owner.unwrap();
+    let app = prepared.router;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    let initial = registry_owner_wait(&worker, "ready").await;
+    let old_hash = initial["last_success"]["receipt"]["local"]["content_sha256"].clone();
+    let path = "/internal/v1/master-data/publish";
+    let request = |path: &str, token: &str| {
+        Request::post(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(request(path, "registry-read"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "/internal/v1/master-data/refresh",
+                "registry-admin"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let (mut next, decoder, _) = master_fixture();
+    next.version = "local-publication".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(request(path, "registry-admin"))
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    let good = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let value = worker.status().await;
+            if value["status"] == "ready"
+                && value["last_success"]["receipt"]["local"]["content_sha256"] != old_hash
+            {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    let table = source
+        .join(String::from_utf8(before.clone()).unwrap())
+        .join("MasterFixture.json");
+    let bytes = std::fs::read(&table).unwrap();
+    std::fs::write(&table, b"{}").unwrap();
+    worker.publish_local();
+    let failed = registry_owner_wait(&worker, "failed").await;
+    assert_eq!(failed["error_code"], "local_verification_failed");
+    assert_eq!(failed["last_success"], good["last_success"]);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    std::fs::write(table, bytes).unwrap();
+    worker.publish_local();
+    registry_owner_wait(&worker, "ready").await;
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    let mut bad = cfg.clone();
+    bad.owner.as_mut().unwrap().local_interval_seconds = Some(0);
+    assert!(bad.prepare().is_err());
+}
+
+#[tokio::test]
+async fn registry_local_publication_does_not_contact_a_failing_source() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let app = axum::Router::new().fallback(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        async { axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response() }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let (_root, _input, source, _) = registry_fixture();
+    let cfg = registry_owner_config(origin, source.clone());
+    let worker = cfg.prepare().unwrap().owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    registry_owner_wait(&worker, "failed").await;
+    let contacted = calls.load(Ordering::SeqCst);
+    assert_eq!(contacted, 1);
+    worker.publish_local();
+    let ready = registry_owner_wait(&worker, "ready").await;
+    assert!(ready["last_success"]["receipt"]["sync"].is_null());
+    assert_eq!(ready["last_success"]["receipt"]["local"]["tables"], 1);
+    assert_eq!(calls.load(Ordering::SeqCst), contacted);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn registry_local_publication_database_without_source_deduplicates() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master_database as db, registry_service as service};
+    let (_root, input, source, _) = registry_fixture();
+    let mut cfg = registry_owner_config("http://127.0.0.1:1".into(), source.clone());
+    cfg.scope.environment = format!("local-publisher-{}", uuid::Uuid::new_v4().simple());
+    let mut database = master_database_config();
+    database.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.backend = service::Backend::Postgres {
+        connection: database.clone(),
+    };
+    cfg.owner.as_mut().unwrap().source = None;
+    cfg.owner.as_mut().unwrap().staging_directory = Some(source.clone());
+    let worker = cfg.prepare().unwrap().owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    let first = registry_owner_wait(&worker, "ready").await;
+    assert_eq!(
+        first["last_success"]["receipt"]["database"]["changed"],
+        true
+    );
+    let (mut next, decoder, _) = master_fixture();
+    next.version = "local-db-next".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    worker.publish_local();
+    let ready = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = worker.status().await;
+            if status["status"] == "ready" && status["last_success"] != first["last_success"] {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ready["last_success"]["receipt"]["database"]["changed"],
+        true
+    );
+    worker.publish_local();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if worker.status().await["last_success"]["receipt"]["database"]["changed"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    let reader = db::Reader::new(&database).unwrap();
+    assert_eq!(
+        reader
+            .history(&cfg.scope, 20, None)
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
 }

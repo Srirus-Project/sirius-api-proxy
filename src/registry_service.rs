@@ -100,7 +100,9 @@ impl Config {
         };
         let mut internal_token = None;
         let owner = if let Some(owner) = &self.owner {
-            owner.source.validate()?;
+            if let Some(source) = &owner.source {
+                source.validate()?;
+            }
             if owner.internal_token_env.is_empty()
                 || owner.internal_token_env.len() > 128
                 || !owner
@@ -111,13 +113,18 @@ impl Config {
                 return Err(invalid());
             }
             let internal = crate::config::secret(&owner.internal_token_env)?;
-            let upstream = crate::config::secret(&owner.source.token_env)?;
+            let upstream = owner
+                .source
+                .as_ref()
+                .map(|source| crate::config::secret(&source.token_env))
+                .transpose()?;
             if internal.is_empty()
                 || internal.len() > 4096
                 || !internal.bytes().all(|b| (33..=126).contains(&b))
                 || internal == token
-                || upstream == token
-                || upstream == internal
+                || upstream
+                    .as_ref()
+                    .is_some_and(|upstream| upstream == &token || upstream == &internal)
             {
                 return Err(invalid());
             }
@@ -130,7 +137,7 @@ impl Config {
                 }
                 Backend::Postgres { connection } => {
                     let password = crate::config::secret(&connection.password_env)?;
-                    if password == internal || password == upstream {
+                    if password == internal || upstream.as_ref() == Some(&password) {
                         return Err(invalid());
                     }
                     (
@@ -177,6 +184,7 @@ impl Config {
             let internal = Router::new()
                 .route("/master-data/updater", get(owner_status))
                 .route("/master-data/refresh", post(owner_refresh))
+                .route("/master-data/publish", post(owner_publish))
                 .route(
                     "/master-data/sync",
                     post(owner_hint).layer(axum::extract::DefaultBodyLimit::max(4096)),
@@ -467,7 +475,11 @@ async fn owner_status(State(s): State<Arc<Service>>) -> Result<Json<Value>, AppE
 async fn owner_refresh(
     State(s): State<Arc<Service>>,
 ) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
-    s.owner.as_ref().ok_or(AppError::NotFound)?.refresh();
+    let owner = s.owner.as_ref().ok_or(AppError::NotFound)?;
+    if !owner.has_source() {
+        return Err(AppError::NotFound);
+    }
+    owner.refresh();
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(json!({"status":"accepted"})),
@@ -478,6 +490,16 @@ async fn owner_hint(
     Json(hint): Json<crate::master_sync::UpdateHint>,
 ) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
     s.owner.as_ref().ok_or(AppError::NotFound)?.hint(&hint)?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({"status":"accepted"})),
+    ))
+}
+
+async fn owner_publish(
+    State(s): State<Arc<Service>>,
+) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
+    s.owner.as_ref().ok_or(AppError::NotFound)?.publish_local();
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(json!({"status":"accepted"})),

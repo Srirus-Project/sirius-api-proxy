@@ -158,3 +158,12 @@ optional startup/poll/hint-driven registry owner synchronization. File backends 
 PostgreSQL backends publish verified local snapshots transactionally with retry after database failures.
 Scoped internal status/refresh/update-hint routes use distinct credentials and retain last success.
 Local-only rescan/publication triggers and final platform/production/release gates remain open.
+
+
+### Source-independent local publication
+
+Added authenticated queued local verification/publication and source-free publisher configuration.
+File CURRENT is already authoritative, so local validation does not fabricate an installation event;
+PostgreSQL publication uses existing transactional content identity. Local work can proceed during a
+source outage and is serialized with source refresh. Original registry source audit also confirms
+outbound subscriber fan-out; standalone notification integration remains an explicit outstanding item.

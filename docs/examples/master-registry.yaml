@@ -38,3 +38,9 @@ backend:
 #     timeout_seconds: 600
 #     request_timeout_ms: 60000
 #   staging_directory: ./registry-master # PostgreSQL only; omit for files
+
+# For local-only publication, omit owner.source and set:
+# owner:
+#   internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+#   local_interval_seconds: 300
+#   staging_directory: ./registry-master # PostgreSQL only

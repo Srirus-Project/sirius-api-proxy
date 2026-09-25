@@ -56,8 +56,10 @@ not pretend that file installation chronology and database publication chronolog
 
 ## Remaining registry work
 
-The service can serve files or database state written externally or by the optional owner worker
-below. An explicit local-only rescan/publication trigger remains separate restoration work. No Sekai-specific music metadata or app-identity overrides are
+The service can serve files or database state written externally or by the optional publication worker
+below. Standalone outbound subscriber notifications remain separate restoration work; the original
+registry notifies subscribers after publication, while the existing proxy notification worker is still
+coupled to its game-service assembly. No Sekai-specific music metadata or app-identity overrides are
 introduced. Final candidate and packaged cross-platform acceptance are still required for 1.2.0.
 
 
@@ -121,6 +123,7 @@ account, game server access or runtime proto bundle is needed. Restart to rotate
 | --- | --- |
 | `GET /master-data/updater` | Pending/running/ready/failed/stopped and process-local last success |
 | `POST /master-data/refresh` | Queue a coalesced source reconciliation; return 202 |
+| `POST /master-data/publish` | Queue local verification/database publication without contacting the source; return 202 |
 | `POST /master-data/sync` | Validate a bounded scoped `{scope, content_sha256}` hint, queue reconciliation; return 202 |
 
 These routes exist only with an owner configured and require its internal token. The update hint
@@ -140,3 +143,31 @@ requests/database work; the normal snapshot and transaction cancellation protect
 Tests exercise a real HTTP owner, startup, authorization, scoped hints, source failure/recovery,
 stalled-request shutdown, actual PostgreSQL insertion failure/retry, observed advisory-lock blocking
 at shutdown, restart deduplication, and a separately executed real 60-second periodic retry without hints.
+
+
+### Local publication without a source
+
+Omit `owner.source` to run a local publication worker instead of a puller:
+
+```yaml
+owner:
+  internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+  local_interval_seconds: 300 # optional; 60–86400, default 300
+  # staging_directory: ./registry-master # required for PostgreSQL, omitted for files
+```
+
+Startup and periodic reconciliation fully verify a pinned local CURRENT. File backends already
+serve installed snapshots directly, so verification does not create a new snapshot or history entry;
+the local verification receipt's `changed` field is always false. PostgreSQL backends transactionally
+publish local CURRENT with the existing content deduplication and retention rules. Database failures
+leave published state unchanged. No game account, upstream bearer or owner URL is needed in this mode.
+The refresh and source-hint endpoints return 404 without a source. Status and local publish remain
+protected by the configured internal token. `local_interval_seconds` is rejected when a source is
+configured; source mode uses `source.interval_seconds` without silently ignoring either setting.
+
+`POST /master-data/publish` also works with a source configured, even when that source is unavailable.
+It queues local work on the same serial worker; it does not pull, alter local CURRENT or accept files
+from the caller. A 202 acknowledges process-local queued work; inspect status for completion. Concurrent
+local-publish and source-refresh requests are coalesced separately: local publication runs first, followed
+by the requested source reconciliation. Periodic source reconciliation may subsequently install newer
+source content. Failed local verification retains last success and never publishes corrupted tables.
