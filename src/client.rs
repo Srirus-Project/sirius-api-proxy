@@ -54,6 +54,7 @@ struct State {
 }
 
 pub struct GameClient {
+    master_sync_wake: tokio::sync::Notify,
     node_routing: Option<crate::node_routing::Router>,
     config: Config,
     http: Client<crate::transport::TlsConnector, Full<Bytes>>,
@@ -127,6 +128,7 @@ impl GameClient {
             .map(|routing| crate::node_routing::Router::new(routing, config.region))
             .transpose()?;
         Ok(Arc::new(Self {
+            master_sync_wake: tokio::sync::Notify::new(),
             node_routing,
             config,
             http,
@@ -207,6 +209,28 @@ impl GameClient {
     }
     pub fn environment(&self) -> &str {
         &self.config.environment
+    }
+    pub(crate) fn request_master_sync(
+        &self,
+        hint: &crate::master_sync::UpdateHint,
+    ) -> Result<(), AppError> {
+        if self.config.master_sync.is_none() {
+            return Err(AppError::MasterUnavailable);
+        }
+        if hint.scope.region != self.config.region
+            || hint.scope.environment != self.config.environment
+            || hint.scope.platform != self.config.platform()
+            || hint.content_sha256.len() != 64
+            || !hint.content_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(AppError::InvalidRequest);
+        }
+        // Notify retains at most one pending permit: bursts cannot create unbounded jobs.
+        self.master_sync_wake.notify_one();
+        Ok(())
+    }
+    pub(crate) async fn master_sync_notified(&self) {
+        self.master_sync_wake.notified().await;
     }
     pub fn master_directory(&self) -> Option<&std::path::Path> {
         self.config.master_directory.as_deref()

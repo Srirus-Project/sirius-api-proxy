@@ -79,6 +79,13 @@ impl From<MasterError> for Error {
         Self::Storage
     }
 }
+/// A wakeup hint only; the configured owner manifest remains authoritative.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateHint {
+    pub scope: Scope,
+    pub content_sha256: String,
+}
 pub struct Syncer {
     config: Config,
     http: reqwest::Client,
@@ -308,7 +315,11 @@ impl Syncer {
             tokio::select! {biased; _=shutdown.changed()=>break,result=self.update_once()=>{
                 if result.is_err(){tracing::warn!(error_code="master_sync_failed","Master sync failed; installed snapshot retained");}
             }}
-            tokio::select! {_=shutdown.changed()=>break,_=tokio::time::sleep(Duration::from_secs(self.config.interval_seconds))=>{}}
+            tokio::select! {biased;
+                _=shutdown.changed()=>break,
+                _=self.game.master_sync_notified()=>{},
+                _=tokio::time::sleep(Duration::from_secs(self.config.interval_seconds))=>{}
+            }
         }
     }
 }

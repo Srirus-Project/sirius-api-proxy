@@ -6788,3 +6788,161 @@ fn master_history_pagination_reads_more_than_one_hundred_installations_without_g
     assert!(before.is_none());
     assert_eq!(actual, expected);
 }
+
+#[tokio::test]
+async fn master_sync_notifications_are_scoped_coalesced_and_fetch_verified_owner_state() {
+    let (_owner_root, input, output, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut owner_config = config();
+    owner_config.master_directory = Some(output.clone());
+    let (origin, server) = peer_http_server(api::router(
+        client(&game, owner_config),
+        "owner-read".into(),
+        "owner-admin".into(),
+    ))
+    .await;
+    let consumer = tempfile::tempdir().unwrap();
+    let mut cfg = master_sync_config(origin, consumer.path().join("master"));
+    cfg.master_sync.as_mut().unwrap().interval_seconds = 86400;
+    let front = GameClient::new(cfg.clone()).unwrap();
+    let app = api::router(front.clone(), "api".into(), "internal".into());
+    let hint = json!({"scope":registry_scope(),"content_sha256":"0".repeat(64)});
+    let request = |token: &str, value: &Value| {
+        Request::post("/internal/v1/master-data/sync")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(value).unwrap()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(request("api", &hint))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for field in ["region", "environment", "platform"] {
+        let mut wrong = hint.clone();
+        wrong["scope"][field] = json!(match field {
+            "region" => "tw",
+            "environment" => "review",
+            _ => "Android",
+        });
+        assert_eq!(
+            app.clone()
+                .oneshot(request("internal", &wrong))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    let mut wrong = hint.clone();
+    wrong["content_sha256"] = json!("bad");
+    assert_eq!(
+        app.clone()
+            .oneshot(request("internal", &wrong))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let mut wrong = hint.clone();
+    wrong["origin"] = json!("https://untrusted.invalid");
+    assert_eq!(
+        app.clone()
+            .oneshot(request("internal", &wrong))
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+    let mut huge = hint.clone();
+    huge["content_sha256"] = json!("a".repeat(5000));
+    assert_eq!(
+        app.clone()
+            .oneshot(request("internal", &huge))
+            .await
+            .unwrap()
+            .status(),
+        413
+    );
+    let disabled = api::router(
+        GameClient::new(config()).unwrap(),
+        "api".into(),
+        "internal".into(),
+    );
+    assert_eq!(
+        disabled
+            .oneshot(request("internal", &hint))
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    for _ in 0..32 {
+        assert_eq!(
+            app.clone()
+                .oneshot(request("internal", &hint))
+                .await
+                .unwrap()
+                .status(),
+            202
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(1), front.master_sync_notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), front.master_sync_notified())
+            .await
+            .is_err()
+    );
+    let sync = crate::master_sync::Syncer::new(&cfg, front.clone()).unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(sync.run(receiver));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while front.master_update_status().await["status"] != "ready" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "notified-version".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &output, &decoder).unwrap();
+    // The intentionally stale digest is only a hint, never an instruction to install content.
+    assert_eq!(
+        app.oneshot(request("internal", &hint))
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    let local = cfg.master_directory.as_ref().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = crate::master_registry::manifest(local, None, registry_scope()).unwrap();
+            let value: Value = serde_json::from_slice(&current.bytes).unwrap();
+            if value["version"] == "notified-version" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(game.received.lock().unwrap().is_empty());
+    server.abort();
+}

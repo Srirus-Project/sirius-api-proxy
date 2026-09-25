@@ -94,6 +94,10 @@ pub fn router_at(
         .route("/accounts/{name}/identity", get(named_account))
         .route("/accounts/{name}/player-data", get(named_player_data))
         .route("/master-data/updater", get(master_update_status))
+        .route(
+            "/master-data/sync",
+            post(master_sync_hint).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/account/player-data", get(player_data))
         .route_layer(middleware::from_fn_with_state(
             Arc::<str>::from(internal_token),
@@ -103,6 +107,17 @@ pub fn router_at(
         .nest(api_prefix, api)
         .nest(internal_prefix, internal)
         .with_state(client)
+}
+
+async fn master_sync_hint(
+    State(c): State<Arc<GameClient>>,
+    Json(hint): Json<crate::master_sync::UpdateHint>,
+) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
+    c.request_master_sync(&hint)?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({"status":"accepted"})),
+    ))
 }
 
 async fn nodes(State(c): State<Arc<GameClient>>) -> Json<Value> {

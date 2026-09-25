@@ -158,3 +158,25 @@ Producer reads and consumer synchronization operate over atomic local snapshots.
 Central registry persistence, completion notifications and optional Git
 publication remain separate restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.
+
+## Consumer update notifications
+
+An internal caller may `POST /internal/v1/master-data/sync` (or the configured regional
+internal prefix) with the internal bearer and a JSON hint:
+
+```json
+{"scope":{"region":"jp","environment":"release","platform":"iOS"},"content_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+```
+
+The body is limited to 4 KiB, unknown fields are rejected, and scope must exactly match
+the receiving profile. A consumer without `master_sync` returns 503; invalid scope/hash
+returns 400. Public read credentials cannot trigger synchronization. HTTP 202 acknowledges
+an in-memory wakeup, not completed synchronization or verification of the supplied digest.
+
+Bursts coalesce to at most one pending wakeup, including notifications during an active
+update. The existing single sync worker always fetches the configured owner's current
+manifest, validates scope/content/files, and atomically publishes; no origin/path or file
+content is accepted from the hint. A stale digest therefore cannot roll back a consumer.
+Periodic polling remains the fallback, and service restart performs an immediate poll,
+so notification loss does not disable eventual synchronization. This receiver does not yet
+provide owner-side delivery, retries or publication notifications to unrelated services.
