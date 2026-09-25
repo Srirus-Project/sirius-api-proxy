@@ -88,7 +88,7 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         let source = receipt
             .get("source")
             .and_then(serde_json::Value::as_str)
-            .filter(|source| matches!(*source, "local-import" | "remote"))
+            .filter(|source| matches!(*source, "local-import" | "remote" | "registry"))
             .ok_or(MasterError::Format)?;
         if receipt["version"] != manifest.version || receipt["snapshot"] != snapshot {
             return Err(MasterError::Format);
@@ -345,4 +345,54 @@ impl PreparedImport {
         sync_directory(output)?;
         Ok(self.receipt)
     }
+}
+
+/// Validate staged plaintext from a pinned owner; never publish from the blocking worker.
+pub(crate) fn prepare_registry(
+    staging: tempfile::TempDir,
+    manifest: &crate::master_registry::PublishedManifest,
+) -> Result<PreparedImport, MasterError> {
+    manifest.validate(&manifest.scope)?;
+    let mut total = 0;
+    for entry in &manifest.files {
+        let path = staging.path().join(&entry.name);
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(MasterError::Format);
+        }
+        let bytes = read_bounded(&path, entry.size)?;
+        if bytes.len() as u64 != entry.size
+            || crate::master_registry::digest(&bytes) != entry.sha256
+        {
+            return Err(MasterError::Integrity);
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
+        fs::File::open(path)?.sync_all()?;
+        total += entry.size;
+    }
+    let index = crate::master_registry::Inventory {
+        schema_version: 1,
+        version: manifest.version.clone(),
+        files: manifest.files.clone(),
+    };
+    write_synced(
+        &staging.path().join("tables.json"),
+        &serde_json::to_vec(&index).map_err(|_| MasterError::Format)?,
+    )?;
+    write_synced(
+        &staging.path().join("MasterManifest.json"),
+        &serde_json::to_vec(&manifest.source_manifest).map_err(|_| MasterError::Format)?,
+    )?;
+    let receipt = ImportReceipt {
+        version: manifest.version.clone(),
+        snapshot: format!("master-{}", uuid::Uuid::new_v4().simple()),
+        tables: manifest.files.len(),
+        json_bytes: total,
+        source: "registry",
+    };
+    write_synced(
+        &staging.path().join("receipt.json"),
+        &serde_json::to_vec(&receipt).map_err(|_| MasterError::Format)?,
+    )?;
+    sync_directory(staging.path())?;
+    Ok(PreparedImport { staging, receipt })
 }

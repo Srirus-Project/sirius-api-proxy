@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        master_sync: None,
         node_routing: None,
         peer_token_env: None,
         asset_dispatch: None,
@@ -6203,4 +6204,311 @@ async fn master_registry_http_auth_conditional_reads_and_pinned_bytes_work_witho
         503
     );
     assert!(f.received.lock().unwrap().is_empty());
+}
+
+fn master_sync_config(origin: String, output: std::path::PathBuf) -> Config {
+    let mut cfg = config();
+    cfg.master_directory = Some(output);
+    let token_env = format!("SIRIUS_MASTER_SYNC_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, "owner-read");
+    cfg.master_sync = Some(crate::master_sync::Config {
+        origin,
+        token_env,
+        regional_paths: false,
+        allow_http: true,
+        interval_seconds: 60,
+        timeout_seconds: 5,
+        request_timeout_ms: 2000,
+    });
+    cfg
+}
+#[tokio::test]
+async fn master_sync_installs_reuses_verifies_and_repairs_without_game_credentials() {
+    let (_owner_root, input, output, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = calls.clone();
+    let app = api::router(
+        client(&game, cfg),
+        "owner-read".into(),
+        "owner-admin".into(),
+    )
+    .layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let seen = seen.clone();
+            async move {
+                assert_eq!(request.headers()["authorization"], "Bearer owner-read");
+                seen.lock().unwrap().push(request.uri().path().to_owned());
+                next.run(request).await
+            }
+        },
+    ));
+    let (origin, server) = peer_http_server(app).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let cfg = master_sync_config(origin, consumer.path().join("master"));
+    let front = GameClient::new(cfg.clone()).unwrap();
+    let sync = crate::master_sync::Syncer::new(&cfg, front.clone()).unwrap();
+    let first = sync.update_once().await.unwrap();
+    assert_eq!(first["action"], "updated");
+    assert_eq!(first["downloaded_files"], 1);
+    let installed = crate::master::read_current(
+        cfg.master_directory.as_ref().unwrap(),
+        Some("MasterFixture"),
+    )
+    .unwrap();
+    assert_eq!(
+        installed.bytes,
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    calls.lock().unwrap().clear();
+    assert_eq!(sync.update_once().await.unwrap()["action"], "unchanged");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let root = cfg.master_directory.as_ref().unwrap();
+    let current = crate::master_registry::current_snapshot(root).unwrap();
+    std::fs::write(root.join(&current).join("MasterFixture.json"), b"[]").unwrap();
+    let repair = sync.update_once().await.unwrap();
+    assert_eq!(repair["downloaded_files"], 1);
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "fixture-v2".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &output, &decoder).unwrap();
+    calls.lock().unwrap().clear();
+    let update = sync.update_once().await.unwrap();
+    assert_eq!(update["receipt"]["version"], "fixture-v2");
+    assert_eq!(update["downloaded_files"], 0);
+    assert_eq!(update["reused_files"], 1);
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(root.join(current).exists());
+    assert_eq!(front.master_update_status().await["mode"], "sync");
+    assert!(game.received.lock().unwrap().is_empty());
+    // A consumer can itself publish the same canonical content under its own snapshot UUID.
+    let local: crate::master_registry::PublishedManifest = serde_json::from_slice(
+        &crate::master_registry::manifest(root, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(local.content_sha256, update["content_sha256"]);
+    server.abort();
+}
+#[tokio::test]
+async fn master_sync_rejects_wrong_scope_and_late_owner_change_preserving_installed_snapshot() {
+    for wrong_scope in [true, false] {
+        let (_owner_root, input, output, _) = registry_fixture();
+        let (_consumer_root, _consumer_input, consumer, _) = registry_fixture();
+        let pointer = std::fs::read(consumer.join("CURRENT")).unwrap();
+        let (mut initial, decoder, _) = master_fixture();
+        initial.version = "fixture-owner-v2".into();
+        std::fs::write(
+            input.join("MasterManifest.json"),
+            serde_json::to_vec(&initial).unwrap(),
+        )
+        .unwrap();
+        crate::master::import_directory(&input, &output, &decoder).unwrap();
+        let game = fixture(vec![]).await;
+        let mut owner = config();
+        owner.master_directory = Some(output.clone());
+        if wrong_scope {
+            owner.environment = "review".into();
+        }
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        let app = api::router(client(&game, owner), "owner-read".into(), "admin".into()).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let count = count.clone();
+                    let input = input.clone();
+                    let output = output.clone();
+                    async move {
+                        if request.uri().path().ends_with("/manifest")
+                            && count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1
+                            && !wrong_scope
+                        {
+                            let (mut manifest, decoder, _) = master_fixture();
+                            manifest.version = "fixture-owner-v3".into();
+                            std::fs::write(
+                                input.join("MasterManifest.json"),
+                                serde_json::to_vec(&manifest).unwrap(),
+                            )
+                            .unwrap();
+                            crate::master::import_directory(&input, &output, &decoder).unwrap();
+                        }
+                        next.run(request).await
+                    }
+                },
+            ),
+        );
+        let (origin, server) = peer_http_server(app).await;
+        let cfg = master_sync_config(origin, consumer.clone());
+        let sync =
+            crate::master_sync::Syncer::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+        let error = sync.update_once().await.unwrap_err();
+        if wrong_scope {
+            assert!(matches!(error, crate::master_sync::Error::Integrity));
+            assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        } else {
+            assert!(matches!(error, crate::master_sync::Error::Changed));
+        }
+        assert_eq!(std::fs::read(consumer.join("CURRENT")).unwrap(), pointer);
+        assert!(!std::fs::read_dir(&consumer).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".master-sync-")));
+        server.abort();
+    }
+}
+#[tokio::test]
+async fn master_sync_shutdown_and_corrupted_download_never_publish_and_writer_recovers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_owner_root, _input, output, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut owner = config();
+    owner.master_directory = Some(output);
+    let mode = Arc::new(AtomicUsize::new(1));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (flag, count, blocked) = (mode.clone(), seen.clone(), gate.clone());
+    let app = api::router(client(&game, owner), "owner-read".into(), "admin".into()).layer(
+        axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let flag = flag.clone();
+                let count = count.clone();
+                let blocked = blocked.clone();
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    if flag.load(Ordering::Relaxed) == 1 {
+                        let _permit = blocked.acquire().await.unwrap();
+                    }
+                    if flag.load(Ordering::Relaxed) == 2
+                        && request.uri().path().contains("/tables/")
+                    {
+                        return axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from("[]"))
+                            .unwrap();
+                    }
+                    next.run(request).await
+                }
+            },
+        ),
+    );
+    let (origin, server) = peer_http_server(app).await;
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("consumer");
+    let cfg = master_sync_config(origin, output.clone());
+    let sync =
+        crate::master_sync::Syncer::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(sync.clone().run(receiver));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while seen.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!output.join("CURRENT").exists());
+    mode.store(2, Ordering::Relaxed);
+    gate.add_permits(1);
+    assert!(matches!(
+        sync.update_once().await,
+        Err(crate::master_sync::Error::Integrity)
+    ));
+    assert!(!output.join("CURRENT").exists());
+    mode.store(0, Ordering::Relaxed);
+    assert_eq!(sync.update_once().await.unwrap()["action"], "updated");
+    server.abort();
+}
+
+#[tokio::test]
+async fn master_sync_configuration_enforces_scope_policy_and_worker_assembly() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = regional_config(Region::Jp);
+    cfg.master_directory = Some(dir.path().join("consumer"));
+    cfg.master_sync =
+        master_sync_config("https://owner.example.invalid".into(), dir.path().into()).master_sync;
+    let base = cfg.master_sync.clone().unwrap();
+    for origin in [
+        "http://owner.example.invalid",
+        "https://user:pass@owner.example.invalid",
+        "https://owner.example.invalid/path",
+        "https://owner.example.invalid/?secret=1",
+        "https://owner.example.invalid/#fragment",
+    ] {
+        let mut policy = base.clone();
+        policy.allow_http = false;
+        policy.origin = origin.into();
+        assert!(policy.validate().is_err());
+    }
+    for (interval, total, request) in [
+        (59, 600, 60000),
+        (86401, 600, 60000),
+        (60, 0, 60000),
+        (60, 3601, 60000),
+        (60, 600, 99),
+        (60, 600, 300001),
+    ] {
+        let mut policy = base.clone();
+        policy.interval_seconds = interval;
+        policy.timeout_seconds = total;
+        policy.request_timeout_ms = request;
+        assert!(policy.validate().is_err());
+    }
+    let mut missing = cfg.clone();
+    missing.master_directory = None;
+    assert!(missing.validate().is_err());
+    for region in [Region::Tw, Region::En, Region::Kr, Region::Cn] {
+        let mut wrong = cfg.clone();
+        wrong.region = region;
+        assert!(wrong.validate().is_err());
+    }
+    for token in ["internal-jp", "fixture-cdn-secret"] {
+        std::env::set_var(&base.token_env, token);
+        assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
+            .prepare()
+            .is_err());
+    }
+    std::env::set_var(&base.token_env, "public-jp");
+    let prepared = DeploymentConfig::Single(Box::new(cfg)).prepare().unwrap();
+    assert_eq!(prepared.syncers.len(), 1);
+    assert!(prepared.updaters.is_empty());
+    assert!(!dir.path().join("consumer/CURRENT").exists());
+}
+
+#[tokio::test]
+async fn master_sync_whole_deadline_bounds_stalled_owner_and_preserves_current() {
+    let (_root, _input, output, _) = registry_fixture();
+    let before = std::fs::read(output.join("CURRENT")).unwrap();
+    let (origin, server) = peer_http_server(axum::Router::new().fallback(|| async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        axum::Json(serde_json::json!({}))
+    }))
+    .await;
+    let mut cfg = master_sync_config(origin, output.clone());
+    cfg.master_sync.as_mut().unwrap().timeout_seconds = 1;
+    cfg.master_sync.as_mut().unwrap().request_timeout_ms = 5000;
+    let syncer =
+        crate::master_sync::Syncer::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        syncer.update_once().await,
+        Err(crate::master_sync::Error::Timeout)
+    ));
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), before);
+    assert!(crate::master::WriterLock::acquire(&output).is_ok());
+    server.abort();
 }

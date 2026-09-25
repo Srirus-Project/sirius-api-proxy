@@ -35,6 +35,17 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 #     max_retry_delay_ms: 5000
 #     # proxy_url_env: SIRIUS_MASTER_PROXY_URL
 #     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION
+# Alternatively, synchronize verified plaintext snapshots from another Sirius API.
+# Requires master_directory; cannot be combined with master_update.
+# See docs/MASTER_REGISTRY.md. The token is the owner's public read bearer.
+# master_sync:
+#   origin: https://master-owner.example.invalid
+#   token_env: SIRIUS_MASTER_OWNER_TOKEN
+#   regional_paths: false
+#   allow_http: false
+#   interval_seconds: 300
+#   timeout_seconds: 600
+#   request_timeout_ms: 60000
 default_cdn_root: https://static.bang-dream-on.jp
 cdn_credential_env:
   https://static.bang-dream-on.jp: SIRIUS_CDN_CREDENTIAL

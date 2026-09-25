@@ -111,7 +111,7 @@ impl GameClient {
             .filter_map(|(root, name)| secret(name).ok().map(|s| (root.clone(), s)))
             .collect::<BTreeMap<_, _>>();
         let state = State {
-            master_update: json!({"status": if config.master_update.is_some() {"pending"} else {"disabled"}}),
+            master_update: json!({"status": if config.master_update.is_some() || config.master_sync.is_some() {"pending"} else {"disabled"}}),
             observation: Observation::default(),
             snapshot: None,
             snapshot_stale: true,

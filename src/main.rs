@@ -2,7 +2,7 @@ use sirius_api_proxy::{client::GameClient, deployment::DeploymentConfig};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let path = if args.is_empty() || args == ["master-update"] {
+    let path = if args.is_empty() || (args == ["master-update"] || args == ["master-sync"]) {
         Some(std::path::PathBuf::from(
             std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into()),
         ))
@@ -50,10 +50,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if !args.is_empty() && args != ["master-update"] {
+    if !args.is_empty() && args != ["master-update"] && args != ["master-sync"] {
         if args.len() != 3 || args[0] != "master-import" {
             return Err(
-                "usage: sirius-api-proxy [master-update | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
+                "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
             );
         }
         use sirius_api_proxy::master::{import_directory, key_from_hex, MasterDecoder};
@@ -77,9 +77,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path =
         std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
     let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
-    if args == ["master-update"] {
+    if args == ["master-update"] || args == ["master-sync"] {
         let config = deployment.single()?;
         let client = GameClient::new(config.clone())?;
+        if args == ["master-sync"] {
+            let syncer = sirius_api_proxy::master_sync::Syncer::new(config, client)?;
+            println!("{}", syncer.update_once().await?);
+            return Ok(());
+        }
         if config.master_update.is_none() {
             return Err("master_update configuration is required".into());
         }
@@ -98,6 +103,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|u| tokio::spawn(u.run(receiver.clone())))
         .collect();
+    workers.extend(
+        prepared
+            .syncers
+            .into_iter()
+            .map(|syncer| tokio::spawn(syncer.run(receiver.clone()))),
+    );
     workers.extend(
         prepared
             .asset_dispatchers

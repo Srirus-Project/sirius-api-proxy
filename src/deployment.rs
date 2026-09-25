@@ -33,6 +33,7 @@ pub struct Prepared {
     pub listen: SocketAddr,
     pub router: Router,
     pub updaters: Vec<Arc<MasterUpdater>>,
+    pub syncers: Vec<Arc<crate::master_sync::Syncer>>,
     pub asset_dispatchers: Vec<crate::asset_dispatch::Worker>,
 }
 
@@ -53,7 +54,7 @@ impl DeploymentConfig {
         match self {
             Self::Single(c) => Ok(c),
             Self::Multi(_) => Err(AppError::Config(
-                "master-update requires a single-region configuration",
+                "Master commands require a single-region configuration",
             )),
         }
     }
@@ -231,8 +232,39 @@ impl DeploymentConfig {
                 }
             }
         }
+        for c in &configs {
+            if let Some(sync) = &c.master_sync {
+                let token = secret(&sync.token_env)?;
+                if tokens.iter().any(|(_, internal)| token == *internal)
+                    || peer_tokens.iter().flatten().any(|peer| peer == &token)
+                    || outgoing.iter().any(|(_, peer)| peer == &token)
+                    || configs.iter().any(|other| {
+                        other
+                            .cdn_credential_env
+                            .values()
+                            .chain(other.player_credential_env.iter())
+                            .chain(
+                                other
+                                    .accounts
+                                    .iter()
+                                    .filter_map(|a| a.credential_env.as_ref()),
+                            )
+                            .chain(
+                                other
+                                    .asset_dispatch
+                                    .iter()
+                                    .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
+                            )
+                            .any(|name| std::env::var(name).is_ok_and(|value| value == token))
+                    })
+                {
+                    return Err(AppError::Config("Master owner read token must be distinct from administrative/peer/game/CDN/updater credentials").into());
+                }
+            }
+        }
         let mut router = api::health_router();
         let mut updaters = Vec::new();
+        let mut syncers = Vec::new();
         let mut asset_dispatchers = Vec::new();
         for ((c, (public, internal)), peer_token) in
             configs.into_iter().zip(tokens).zip(peer_tokens)
@@ -240,6 +272,9 @@ impl DeploymentConfig {
             let client = GameClient::new(c.clone())?;
             if c.asset_dispatch.is_some() {
                 asset_dispatchers.push(crate::asset_dispatch::Worker::new(c, client.clone())?);
+            }
+            if c.master_sync.is_some() {
+                syncers.push(crate::master_sync::Syncer::new(c, client.clone())?);
             }
             if c.master_update.is_some() {
                 updaters.push(MasterUpdater::new(c, client.clone())?);
@@ -279,6 +314,7 @@ impl DeploymentConfig {
             listen,
             router,
             updaters,
+            syncers,
             asset_dispatchers,
         })
     }

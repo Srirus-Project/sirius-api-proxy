@@ -58,9 +58,64 @@ all tables. This establishes a baseline from the trusted local legacy files, not
 of their original encrypted CDN payload. Reimporting or updating with the current producer
 creates the durable index. Normal existing API paths remain compatible.
 
+## Consumer synchronization
+
+A JP consumer may configure `master_directory` and `master_sync` instead of `master_update`:
+
+```yaml
+master_directory: ./master-data
+master_sync:
+  origin: https://master-owner.example.invalid
+  token_env: SIRIUS_MASTER_OWNER_TOKEN
+  regional_paths: false
+  allow_http: false
+  interval_seconds: 300
+  timeout_seconds: 600
+  request_timeout_ms: 60000
+```
+
+The origin must contain only scheme and authority. The bearer is the owner's public API read
+credential; it must not reuse administrative, peer, game, CDN or updater credentials in a
+service deployment. `regional_paths: true` selects the owner's multi-region URL layout.
+HTTPS verifies certificates normally. Plain HTTP requires explicit opt-in. Redirects, ambient
+proxies and automatic HTTP retries are disabled. Neither game login nor CDN decryption keys
+are needed by the synchronization operation.
+
+The service synchronizes immediately after startup and waits `interval_seconds` after each
+attempt (60..86400). Failed attempts retain the installed snapshot and retry at the next poll.
+`timeout_seconds` (default 600, 1..3600) covers lock admission, manifest/file acquisition and
+preparation; `request_timeout_ms` (default 60000, 100..300000) bounds each HTTP request. Connection
+establishment uses the smaller of that request limit and 10 seconds. Manifests are bounded to
+4 MiB; declared tables retain the producer's file/count/aggregate bounds. The final synchronous
+filesystem publication is not preemptible; filesystem stalls may exceed the network deadline.
+
+The consumer pins the owner's scoped manifest, validates its content identity, verifies cached
+local tables before reuse, and downloads missing or corrupt files through pinned digest URLs.
+All files must match their declared byte length and SHA-256 and parse as JSON before publication.
+A second manifest check rejects owner content changes during the transfer. New owner snapshot
+UUIDs with identical content are accepted. The consumer creates its own local snapshot UUID and
+receipt (`source: registry`), retaining the same content identity. It can serve the same read
+protocol to downstream consumers. Unchanged polls still verify every installed table, allowing
+local corruption to be detected and repaired. Previous snapshots are retained.
+
+The existing filesystem writer lock excludes imports/CDN updates/other consumers. Shutdown
+cancels outstanding synchronization; a blocking preparation may finish, but cannot publish
+CURRENT independently after cancellation. Partial staging is temporary. No completion record
+is claimed until atomic publication succeeds. The existing Master update status reports
+`mode: sync`, running/ready/failed and a sanitized result.
+
+For a one-shot run, use a single-region config:
+
+```sh
+SIRIUS_CONFIG_PATH=consumer.yaml sirius-api-proxy master-sync
+```
+
+This prints the result as JSON, exits nonzero on failure and does not start an HTTP listener.
+As with other Master commands, stop a service owning the same snapshot directory first.
+
 ## Remaining restoration
 
-This is the producer/read protocol over atomic local snapshots. Owner-to-consumer synchronization,
-central publication history/registry persistence, completion notifications and optional Git
+Producer reads and consumer synchronization operate over atomic local snapshots.
+Central publication history/registry persistence, completion notifications and optional Git
 publication remain separate restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.

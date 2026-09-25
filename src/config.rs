@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub master_sync: Option<crate::master_sync::Config>,
+    #[serde(default)]
     pub node_routing: Option<crate::node_routing::Config>,
     /// Independent read-only node credential; absent disables peer HTTP routes.
     #[serde(default)]
@@ -201,6 +203,17 @@ impl Config {
         if let Some(log) = &self.access_log {
             log.validate()
                 .map_err(|_| AppError::Config("invalid access log configuration"))?;
+        }
+        if let Some(sync) = &self.master_sync {
+            sync.validate()?;
+            if self.master_update.is_some()
+                || self
+                    .master_directory
+                    .as_ref()
+                    .is_none_or(|p| p.as_os_str().is_empty())
+            {
+                return Err(AppError::Config("Master owner synchronization requires an output directory and excludes CDN updating"));
+            }
         }
         crate::accounts::validate(self)?;
         self.upstream.validate()?;

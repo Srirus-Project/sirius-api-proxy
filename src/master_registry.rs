@@ -26,14 +26,14 @@ pub struct Inventory {
     pub version: String,
     pub files: Vec<File>,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
     pub region: Region,
     pub environment: String,
     pub platform: Platform,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishedManifest {
     pub schema_version: u32,
@@ -44,6 +44,47 @@ pub struct PublishedManifest {
     pub files: Vec<File>,
     /// Original encrypted-file metadata, without any CDN credentials or keys.
     pub source_manifest: Manifest,
+}
+impl PublishedManifest {
+    pub fn validate(&self, scope: &Scope) -> Result<(), MasterError> {
+        if self.schema_version != 1
+            || &self.scope != scope
+            || scope.region != Region::Jp
+            || !self.snapshot.starts_with("master-")
+            || !master::safe_component(&self.snapshot)
+            || self.version != self.source_manifest.version
+        {
+            return Err(MasterError::Format);
+        }
+        let source = Manifest::parse(
+            &serde_json::to_vec(&self.source_manifest).map_err(|_| MasterError::Format)?,
+        )?;
+        if source
+            .files
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err(MasterError::Format);
+        }
+        let inventory = Inventory {
+            schema_version: 1,
+            version: self.version.clone(),
+            files: self.files.clone(),
+        };
+        inventory.validate(&source)?;
+        if content_hash(scope, &source, &inventory)? != self.content_sha256 {
+            return Err(MasterError::Integrity);
+        }
+        Ok(())
+    }
+}
+pub fn content_hash(
+    scope: &Scope,
+    source: &Manifest,
+    inventory: &Inventory,
+) -> Result<String, MasterError> {
+    let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"scope":scope,"source_manifest":source,"files":inventory.files})).map_err(|_|MasterError::Format)?;
+    Ok(digest(&bytes))
 }
 pub struct Document {
     pub bytes: Vec<u8>,
@@ -132,7 +173,10 @@ fn source(directory: &Path) -> Result<Manifest, MasterError> {
     if receipt["version"] != source.version
         || receipt["snapshot"].as_str() != directory.file_name().and_then(|name| name.to_str())
         || receipt["tables"].as_u64() != Some(source.files.len() as u64)
-        || !matches!(receipt["source"].as_str(), Some("local-import" | "remote"))
+        || !matches!(
+            receipt["source"].as_str(),
+            Some("local-import" | "remote" | "registry")
+        )
     {
         return Err(MasterError::Format);
     }
@@ -200,14 +244,13 @@ pub fn manifest(
     let mut source = source(&directory)?;
     source.files.sort_by(|a, b| a.name.cmp(&b.name));
     let inventory = inventory(&directory, &source)?;
-    let content =
-        serde_json::to_vec(&serde_json::json!({"schema_version":1,"scope":scope,"source_manifest":source,"files":inventory.files})).map_err(|_| MasterError::Format)?;
+    let content = content_hash(&scope, &source, &inventory)?;
     let manifest = PublishedManifest {
         schema_version: 1,
         scope,
         snapshot,
         version: source.version.clone(),
-        content_sha256: digest(&content),
+        content_sha256: content,
         files: inventory.files,
         source_manifest: source,
     };
