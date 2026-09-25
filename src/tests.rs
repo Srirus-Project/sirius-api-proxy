@@ -6512,3 +6512,157 @@ async fn master_sync_whole_deadline_bounds_stalled_owner_and_preserves_current()
     assert!(crate::master::WriterLock::acquire(&output).is_ok());
     server.abort();
 }
+
+#[test]
+fn master_publication_history_follows_committed_chain_and_retains_reimports() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let second = master::import_directory(&input, &output, &decoder).unwrap();
+    let orphan = master::import_directory(&input, &output, &decoder).unwrap();
+    // Model a directory retained after a failed CURRENT switch: existence alone
+    // must not turn it into a committed history entry.
+    std::fs::write(output.join("CURRENT"), &second.snapshot).unwrap();
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history.head, second.snapshot);
+    assert_eq!(history.entries.len(), 2);
+    assert_eq!(history.entries[0].snapshot, second.snapshot);
+    assert_eq!(history.entries[1].snapshot, first.snapshot);
+    assert!(history
+        .entries
+        .iter()
+        .all(|entry| entry.snapshot != orphan.snapshot));
+    assert_eq!(
+        history.entries[0].content_sha256,
+        history.entries[1].content_sha256
+    );
+    assert!(history
+        .entries
+        .iter()
+        .all(|entry| entry.published_at.is_some() && entry.file_count == 1));
+    assert!(!history.has_more);
+    assert!(!history.legacy_boundary);
+    let bounded = registry::history(&output, registry_scope(), 1).unwrap();
+    assert_eq!(bounded.entries.len(), 1);
+    assert!(bounded.has_more);
+    assert!(registry::history(&output, registry_scope(), 0).is_err());
+    assert!(registry::history(&output, registry_scope(), 101).is_err());
+    let mut source: Value =
+        serde_json::from_slice(&std::fs::read(input.join("MasterManifest.json")).unwrap()).unwrap();
+    source["version"] = json!("history-v2");
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&source).unwrap(),
+    )
+    .unwrap();
+    let third = master::import_directory(&input, &output, &decoder).unwrap();
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_ne!(
+        history.entries[0].content_sha256,
+        history.entries[1].content_sha256
+    );
+    assert_ne!(
+        history.entries[0].content_sha256,
+        history.entries[1].content_sha256
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .map(|entry| entry.snapshot.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            third.snapshot.as_str(),
+            second.snapshot.as_str(),
+            first.snapshot.as_str()
+        ]
+    );
+    // Historical time is unknown for legacy snapshots; do not infer it from mtimes.
+    std::fs::remove_file(output.join(&second.snapshot).join("publication.json")).unwrap();
+    let legacy = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(legacy.entries.len(), 2);
+    assert!(legacy.legacy_boundary);
+    assert!(!legacy.has_more);
+    assert!(legacy.entries[1].published_at.is_none());
+}
+
+#[test]
+fn master_publication_history_rejects_corruption_cycles_and_unsafe_predecessors() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let publication_path = output.join(&first.snapshot).join("publication.json");
+    let original = std::fs::read(&publication_path).unwrap();
+    for previous in [first.snapshot.as_str(), "../escape", "master-missing"] {
+        let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        record["previous_snapshot"] = json!(previous);
+        std::fs::write(&publication_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(registry::history(&output, registry_scope(), 100).is_err());
+    }
+    std::fs::write(&publication_path, b"{}").unwrap();
+    assert!(registry::history(&output, registry_scope(), 100).is_err());
+    std::fs::write(&publication_path, &original).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&publication_path).unwrap();
+        std::os::unix::fs::symlink(
+            output.join(&first.snapshot).join("receipt.json"),
+            &publication_path,
+        )
+        .unwrap();
+        assert!(registry::history(&output, registry_scope(), 100).is_err());
+        std::fs::remove_file(&publication_path).unwrap();
+        std::fs::write(&publication_path, &original).unwrap();
+    }
+    // Invalid existing CURRENT cannot silently create a new history root.
+    std::fs::write(output.join("CURRENT"), b"../escape").unwrap();
+    assert!(master::import_directory(&input, &output, &decoder).is_err());
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), b"../escape");
+    assert_eq!(
+        std::fs::read_dir(&output)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("master-"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn master_publication_history_http_is_authorized_bounded_and_local() {
+    let (_root, _input, output, first) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output);
+    let app = api::router(client(&game, cfg), "api".into(), "internal".into());
+    for (query, token, expected) in [
+        ("", "wrong", 401),
+        ("?limit=0", "api", 400),
+        ("?limit=101", "api", 400),
+        ("?unknown=1", "api", 400),
+        ("?limit=1", "api", 200),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/master-data/history{query}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+        if expected == 200 {
+            assert_eq!(response.headers()["cache-control"], "private, no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["head"], first.snapshot);
+            assert_eq!(value["entries"][0]["snapshot"], first.snapshot);
+            assert_eq!(value["scope"]["region"], "jp");
+        }
+    }
+    assert!(game.received.lock().unwrap().is_empty());
+}

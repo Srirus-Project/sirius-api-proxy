@@ -56,6 +56,7 @@ pub fn router_at(
         .route("/regions", get(regions))
         .route("/master-data", get(master_status))
         .route("/master-data/manifest", get(registry_current))
+        .route("/master-data/history", get(registry_history))
         .route(
             "/master-data/snapshots/{snapshot}/manifest",
             get(registry_manifest),
@@ -423,4 +424,47 @@ async fn registry_table(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
     registry_response(c, Some(snapshot), Some((table, hash)), headers).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    #[serde(default = "history_limit")]
+    limit: usize,
+}
+fn history_limit() -> usize {
+    20
+}
+async fn registry_history(
+    State(c): State<Arc<GameClient>>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Response, AppError> {
+    if !(1..=100).contains(&query.limit) {
+        return Err(AppError::InvalidRequest);
+    }
+    let root = c
+        .master_directory()
+        .ok_or(AppError::MasterUnavailable)?
+        .to_owned();
+    let scope = crate::master_registry::Scope {
+        region: c.region(),
+        environment: c.environment().into(),
+        platform: c.platform(),
+    };
+    let value = tokio::task::spawn_blocking(move || {
+        crate::master_registry::history(&root, scope, query.limit)
+    })
+    .await
+    .map_err(|_| AppError::MasterUnavailable)?
+    .map_err(|e| match e {
+        crate::master::MasterError::NotFound => AppError::NotFound,
+        _ => AppError::MasterUnavailable,
+    })?;
+    Response::builder()
+        .header("content-type", "application/json")
+        .header("cache-control", "private, no-store")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&value).map_err(|_| AppError::MasterUnavailable)?,
+        ))
+        .map_err(|_| AppError::MasterUnavailable)
 }

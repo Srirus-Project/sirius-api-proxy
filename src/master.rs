@@ -334,6 +334,17 @@ pub(crate) fn prepare_directory(
 impl PreparedImport {
     pub(crate) fn publish(self, output: &Path) -> Result<ImportReceipt, MasterError> {
         let snapshot = &self.receipt.snapshot;
+        let publication = crate::master_registry::Publication {
+            schema_version: 1,
+            snapshot: snapshot.clone(),
+            previous_snapshot: crate::master_registry::predecessor(output)?,
+            published_at: chrono::Utc::now(),
+        };
+        write_synced(
+            &self.staging.path().join("publication.json"),
+            &serde_json::to_vec(&publication).map_err(|_| MasterError::Format)?,
+        )?;
+        sync_directory(self.staging.path())?;
         fs::rename(self.staging.path(), output.join(snapshot))?;
         sync_directory(output)?;
         let mut pointer = tempfile::NamedTempFile::new_in(output)?;

@@ -10,6 +10,7 @@ For a single-region deployment:
 | GET path under `/api/v1/master-data` | Result |
 | --- | --- |
 | `/manifest` | Current snapshot's scoped plaintext manifest |
+| `/history?limit=20` | Recent installations in committed predecessor order |
 | `/snapshots/{snapshot}/manifest` | The named snapshot's manifest, independent of CURRENT |
 | `/snapshots/{snapshot}/tables/{table}/{sha256}` | Exact JSON bytes matching the pinned SHA-256 |
 
@@ -113,9 +114,38 @@ SIRIUS_CONFIG_PATH=consumer.yaml sirius-api-proxy master-sync
 This prints the result as JSON, exits nonzero on failure and does not start an HTTP listener.
 As with other Master commands, stop a service owning the same snapshot directory first.
 
+## Committed publication history
+
+Every new import, CDN update or consumer installation writes `publication.json` inside its staged
+snapshot, with its UUID, UTC publication-attempt time and the previous committed snapshot UUID.
+That record is synced before the snapshot directory is renamed and CURRENT changes. The current
+pointer therefore commits the new history link together with the new tables. Directories left
+behind before a failed pointer switch never become history merely because they exist on disk.
+Readers pin CURRENT once and walk the immutable predecessor chain, newest first; clock changes
+do not reorder it. All writers continue to require the existing exclusive directory lock.
+An invalid existing pointer/predecessor fails publication rather than silently starting a new chain.
+
+`GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
+(and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
+query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
+`has_more`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
+SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
+history: explicit reimports of identical content remain visible with equal content hashes;
+ordinary unchanged CDN/sync polls do not install and thus add no record. Read paths never call
+the game. Listed manifests/indexes and history links are validated; corrupt records, cycles,
+linked files and unsafe paths fail explicitly. History reports manifest identities rather than
+performing a full rehash of every indexed table payload.
+
+Legacy snapshots have no publication record. They are included with `published_at: null`, and
+traversal stops with `legacy_boundary: true`; older ordering is unknown. No directory scan,
+mtime inference or automatic legacy rewrite fabricates missing history. `has_more` denotes a
+known predecessor beyond the requested limit, not an inferred legacy predecessor. This endpoint
+returns at most 100 recent installations; full-history pagination, external database persistence
+and retention/compaction are separate work. Existing snapshot directories are not pruned.
+
 ## Remaining restoration
 
 Producer reads and consumer synchronization operate over atomic local snapshots.
-Central publication history/registry persistence, completion notifications and optional Git
+Central registry persistence, completion notifications and optional Git
 publication remain separate restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.

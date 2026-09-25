@@ -318,3 +318,109 @@ pub(crate) fn verify_indexed(
     }
     Ok(())
 }
+
+/// Installed with the snapshot before CURRENT changes. The predecessor is the last
+/// committed snapshot, never a directory discovered by scanning staging/orphans.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Publication {
+    pub schema_version: u32,
+    pub snapshot: String,
+    pub previous_snapshot: Option<String>,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub(crate) fn predecessor(root: &Path) -> Result<Option<String>, MasterError> {
+    let pointer = match regular(&root.join("CURRENT"), 128) {
+        Ok(bytes) => bytes,
+        Err(MasterError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let snapshot = String::from_utf8(pointer).map_err(|_| MasterError::Format)?;
+    let directory = snapshot_directory(root, &snapshot)?;
+    source(&directory)?;
+    Ok(Some(snapshot))
+}
+
+#[derive(Serialize)]
+pub struct HistoryEntry {
+    pub snapshot: String,
+    pub version: String,
+    pub content_sha256: String,
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub file_count: usize,
+    pub total_size: u64,
+}
+#[derive(Serialize)]
+pub struct History {
+    pub schema_version: u32,
+    pub scope: Scope,
+    pub head: String,
+    pub entries: Vec<HistoryEntry>,
+    pub has_more: bool,
+    /// Older snapshots have no predecessor record; their chronology is unknown.
+    pub legacy_boundary: bool,
+}
+
+pub fn history(root: &Path, scope: Scope, limit: usize) -> Result<History, MasterError> {
+    if !(1..=100).contains(&limit) {
+        return Err(MasterError::Limit);
+    }
+    let head = predecessor(root)?.ok_or(MasterError::NotFound)?;
+    let mut next = Some(head.clone());
+    let mut visited = std::collections::BTreeSet::new();
+    let mut entries = Vec::new();
+    let mut legacy_boundary = false;
+    while let Some(snapshot) = next.take() {
+        if !visited.insert(snapshot.clone()) {
+            return Err(MasterError::Format);
+        }
+        let directory = snapshot_directory(root, &snapshot)?;
+        let doc = manifest(root, Some(&snapshot), scope.clone())?;
+        let value: PublishedManifest =
+            serde_json::from_slice(&doc.bytes).map_err(|_| MasterError::Format)?;
+        let publication = match regular(&directory.join("publication.json"), 4096) {
+            Ok(bytes) => {
+                let record: Publication =
+                    serde_json::from_slice(&bytes).map_err(|_| MasterError::Format)?;
+                if record.schema_version != 1
+                    || record.snapshot != snapshot
+                    || record.previous_snapshot.as_ref().is_some_and(|previous| {
+                        !previous.starts_with("master-")
+                            || !master::safe_component(previous)
+                            || visited.contains(previous)
+                    })
+                {
+                    return Err(MasterError::Format);
+                }
+                Some(record)
+            }
+            Err(MasterError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                legacy_boundary = true;
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let published_at = publication.as_ref().map(|p| p.published_at);
+        next = publication.and_then(|p| p.previous_snapshot);
+        entries.push(HistoryEntry {
+            snapshot,
+            version: value.version,
+            content_sha256: value.content_sha256,
+            published_at,
+            file_count: value.files.len(),
+            total_size: value.files.iter().map(|f| f.size).sum(),
+        });
+        if entries.len() == limit {
+            break;
+        }
+    }
+    Ok(History {
+        schema_version: 1,
+        scope,
+        head,
+        entries,
+        has_more: next.is_some(),
+        legacy_boundary,
+    })
+}
