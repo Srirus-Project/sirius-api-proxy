@@ -52,3 +52,5 @@ pub mod master_notify;
 pub mod asset_dispatch_admin;
 
 pub mod git_process;
+
+pub mod master_git;

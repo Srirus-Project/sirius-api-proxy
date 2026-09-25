@@ -50,6 +50,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "master-git-commit") {
+        if args.len() != 2 {
+            return Err("usage: sirius-api-proxy master-git-commit GIT_STATE_DIRECTORY".into());
+        }
+        let path =
+            std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
+        let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
+        let config = deployment.single()?;
+        let source = config
+            .master_directory
+            .as_deref()
+            .ok_or("master_directory is required")?;
+        let scope = sirius_api_proxy::master_registry::Scope {
+            region: config.region,
+            environment: config.environment.clone(),
+            platform: config.platform(),
+        };
+        let receipt =
+            sirius_api_proxy::master_git::commit(source, std::path::Path::new(&args[1]), scope)
+                .await?;
+        println!("{}", serde_json::to_string(&receipt)?);
+        return Ok(());
+    }
     if !args.is_empty() && args != ["master-update"] && args != ["master-sync"] {
         if args.len() != 3 || args[0] != "master-import" {
             return Err(

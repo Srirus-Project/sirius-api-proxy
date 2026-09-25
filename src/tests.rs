@@ -7922,3 +7922,137 @@ async fn git_execution_timeout_and_future_cancellation_kill_helpers() {
         b"survived"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_commits_verified_content_reuses_identical_imports_and_preserves_history() {
+    use crate::{master, master_git, master_registry as registry};
+    let (_root, input, source, _) = registry_fixture();
+    let destination = tempfile::tempdir().unwrap();
+    let state = destination.path().join("git-state");
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let first = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(first.changed);
+    let repository = state.join("repository.git");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    };
+    let document = registry::manifest(&source, None, registry_scope()).unwrap();
+    let manifest: registry::PublishedManifest = serde_json::from_slice(&document.bytes).unwrap();
+    assert_eq!(first.content_sha256, manifest.content_sha256);
+    for file in &manifest.files {
+        let bytes = git(&["show", &format!("{}:{}", first.commit, file.name)]);
+        assert_eq!(registry::digest(&bytes), file.sha256);
+    }
+    let names = String::from_utf8(git(&["ls-tree", "--name-only", "HEAD"])).unwrap();
+    assert_eq!(names.lines().count(), manifest.files.len() + 1);
+    let metadata: Value =
+        serde_json::from_slice(&git(&["show", "HEAD:sirius-publication.json"])).unwrap();
+    assert!(metadata.get("snapshot").is_none());
+    assert_eq!(metadata["content_sha256"], first.content_sha256);
+    let (mut manifest, decoder, _) = master_fixture();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let repeated = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(!repeated.changed);
+    assert_eq!(repeated.commit, first.commit);
+    manifest.version = "git-next".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let next = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(next.changed);
+    assert_ne!(next.content_sha256, first.content_sha256);
+    assert_eq!(
+        String::from_utf8(git(&["rev-parse", "HEAD^"]))
+            .unwrap()
+            .trim(),
+        first.commit
+    );
+    let current = std::fs::read(source.join("CURRENT")).unwrap();
+    assert_ne!(current, before);
+    let snapshot = String::from_utf8(current.clone()).unwrap();
+    std::fs::write(source.join(snapshot).join("MasterFixture.json"), b"{}").unwrap();
+    assert!(master_git::commit(&source, &state, registry_scope())
+        .await
+        .is_err());
+    assert_eq!(
+        String::from_utf8(git(&["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim(),
+        next.commit
+    );
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), current);
+    let mut wrong_scope = registry_scope();
+    wrong_scope.environment = "review".into();
+    assert!(matches!(
+        master_git::commit(&source, &state, wrong_scope).await,
+        Err(master_git::Error::Ownership)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_refuses_unowned_locked_and_linked_destinations() {
+    use crate::master_git;
+    let (_root, _, source, _) = registry_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let occupied = root.path().join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), b"user-data").unwrap();
+    assert!(matches!(
+        master_git::commit(&source, &occupied, registry_scope()).await,
+        Err(master_git::Error::Ownership)
+    ));
+    assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"user-data");
+    let state = root.path().join("owned");
+    master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("owner.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    assert!(matches!(
+        master_git::commit(&source, &state, registry_scope()).await,
+        Err(master_git::Error::Locked)
+    ));
+    drop(owner);
+    let linked = root.path().join("linked");
+    std::os::unix::fs::symlink(&state, &linked).unwrap();
+    assert!(matches!(
+        master_git::commit(&source, &linked, registry_scope()).await,
+        Err(master_git::Error::Ownership)
+    ));
+    std::fs::rename(
+        state.join("repository.git"),
+        root.path().join("outside.git"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        root.path().join("outside.git"),
+        state.join("repository.git"),
+    )
+    .unwrap();
+    assert!(matches!(
+        master_git::commit(&source, &state, registry_scope()).await,
+        Err(master_git::Error::Ownership)
+    ));
+}

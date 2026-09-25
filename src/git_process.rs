@@ -47,7 +47,19 @@ pub async fn run(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<Vec<u8>, Error> {
-    if timeout.is_zero()
+    run_with_input(executable, directory, args, timeout, output_limit, &[]).await
+}
+
+pub async fn run_with_input(
+    executable: &Path,
+    directory: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    output_limit: usize,
+    input: &[u8],
+) -> Result<Vec<u8>, Error> {
+    if input.len() > 4 * 1024 * 1024
+        || timeout.is_zero()
         || timeout > Duration::from_secs(600)
         || !(1024..=16 * 1024 * 1024).contains(&output_limit)
     {
@@ -55,19 +67,25 @@ pub async fn run(
     }
     #[cfg(not(unix))]
     {
-        let _ = (executable, directory, args);
+        let _ = (executable, directory, args, input);
         Err(Error::Unsupported)
     }
     #[cfg(unix)]
     {
         use std::process::Stdio;
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut command = tokio::process::Command::new(executable);
+        // Do not inherit repository redirects, injected Git config or trace destinations.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
         command
             .current_dir(directory)
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -77,6 +95,7 @@ pub async fn run(
             id: child.id().ok_or(Error::Spawn)?,
             armed: true,
         };
+        let mut stdin = child.stdin.take().ok_or(Error::Io)?;
         let stdout = child.stdout.take().ok_or(Error::Io)?;
         let stderr = child.stderr.take().ok_or(Error::Io)?;
         async fn read(
@@ -96,10 +115,15 @@ pub async fn run(
             }
         }
         let operation = async {
-            let (stdout, _, status) = tokio::try_join!(
+            let (stdout, _, status, _) = tokio::try_join!(
                 read(stdout, output_limit),
                 read(stderr, output_limit),
                 async { child.wait().await.map_err(|_| Error::Io) },
+                async {
+                    stdin.write_all(input).await.map_err(|_| Error::Io)?;
+                    drop(stdin);
+                    Ok(())
+                },
             )?;
             if !status.success() {
                 return Err(Error::Failed);

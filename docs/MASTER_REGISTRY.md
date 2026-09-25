@@ -267,7 +267,48 @@ child; cancellation uses Tokio's kill-on-drop/reaping behavior. Process-group co
 not a sandbox against a helper deliberately escaping its group. Non-Unix execution currently
 returns an explicit unsupported error until platform-specific process-tree cleanup is added.
 
-This is execution groundwork, not an enabled Git publisher: snapshot staging/commit ownership,
-remote-ahead detection, signing/proxy/credential configuration, push acknowledgement/recovery,
-background integration and Windows process-tree handling remain pending. No new publication
-configuration is accepted and no Git network commands run automatically.
+Local snapshot commits are available through the command below. Remote-ahead detection,
+signing/proxy/credential configuration, push acknowledgement/recovery, background integration
+and Windows process-tree handling remain pending. No Git network commands run automatically.
+
+### Local Master Git commits
+
+On Unix, with Git available on PATH, a single-region configuration can commit its installed
+Master snapshot into a dedicated managed bare repository:
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-commit ./master-git-state
+```
+
+`master_directory` selects the source and the profile supplies region/environment/platform.
+The command does not create a game client, resolve game/CDN credentials, contact the game,
+start the HTTP service or push to a remote. It prints `commit`, `content_sha256` and `changed`.
+This receipt acknowledges only a local Git reference update.
+
+The destination must be a new/empty directory or an existing matching Sirius Git state
+directory. It contains an exclusive owner lock, a scoped ownership marker and `repository.git`.
+Do not point it at a source checkout or another application's repository. A different scope,
+symlinked destination/repository, unowned nonempty directory or locked owner fails explicitly.
+This is a single-writer managed store, not a shared worktree for manual edits.
+
+The command pins CURRENT, validates the manifest and every table's hash, size and JSON, and
+stages exact plaintext bytes in temporary storage. It creates Git blobs with filters disabled
+and constructs a fresh tree, so removed tables leave the new tree without altering old commits.
+`sirius-publication.json` records the scoped source manifest and content identity without the
+node-local snapshot UUID. Identical content therefore reuses the existing commit after a
+reimport, rather than creating timestamp-only commits. No receipt, keys or CDN credentials
+are included. The reserved publication filename cannot also be a table.
+
+The branch is `master-data`, with new commits parented to the previous commit. A compare-and-swap
+reference update commits the new tree; failed validation leaves the prior reference unchanged.
+A cancelled/failed command may leave unreachable Git objects, and loss of the response at the
+reference update is ambiguous: rerun the identical operation to inspect/reuse the committed tree.
+The source CURRENT pointer is never changed by Git publication. Git commands share a 120-second
+budget after local preparation; synchronous local reads can exceed that preparation time.
+
+Commits currently use the fixed local identity `Sirius Master Publisher <sirius-master@localhost>`
+and are unsigned. Ambient `GIT_*` variables are removed before process execution to prevent
+repository redirects, injected config and trace destinations; terminal prompting is disabled.
+Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Remote
+push, configured identities/signing, credentials/proxies, background scheduling and Windows
+support are still required before the full optional Git publication feature is complete.
