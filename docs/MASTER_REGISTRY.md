@@ -128,7 +128,7 @@ An invalid existing pointer/predecessor fails publication rather than silently s
 `GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
 (and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
 query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
-`has_more`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
+`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
 SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
 history: explicit reimports of identical content remain visible with equal content hashes;
 ordinary unchanged CDN/sync polls do not install and thus add no record. Read paths never call
@@ -139,9 +139,18 @@ performing a full rehash of every indexed table payload.
 Legacy snapshots have no publication record. They are included with `published_at: null`, and
 traversal stops with `legacy_boundary: true`; older ordering is unknown. No directory scan,
 mtime inference or automatic legacy rewrite fabricates missing history. `has_more` denotes a
-known predecessor beyond the requested limit, not an inferred legacy predecessor. This endpoint
-returns at most 100 recent installations; full-history pagination, external database persistence
-and retention/compaction are separate work. Existing snapshot directories are not pruned.
+known predecessor beyond the requested limit, not an inferred legacy predecessor. Each page
+returns at most 100 installations. Pass the returned `next_before` as the `before` query
+parameter to retrieve strictly older entries, for example `/history?limit=20&before=master-UUID`.
+`next_before` is null at the end; repeating a cursor is safe. A new CURRENT between page requests
+does not duplicate or skip the older entries, since each page finds the cursor in the committed
+predecessor chain. `head` is pinned independently for each request and may therefore change.
+A syntactically invalid cursor returns 400; a missing or orphan snapshot, or a cursor beyond a
+legacy boundary, returns 404. A cursor at the oldest entry returns an empty final page. Cursors
+are bounded to 128 characters; each request traverses at most 10,000 links, including the skipped
+prefix. Hitting that safety bound fails explicitly with 503, not a truncated success. Deep
+history indexing, external database persistence and retention/compaction remain separate work.
+Existing snapshot directories are not pruned.
 
 ## Remaining restoration
 

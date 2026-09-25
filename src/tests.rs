@@ -6666,3 +6666,125 @@ async fn master_publication_history_http_is_authorized_bounded_and_local() {
     }
     assert!(game.received.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn master_history_pages_follow_commits_across_new_publications_and_reject_orphans() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let second = master::import_directory(&input, &output, &decoder).unwrap();
+    let orphan = master::import_directory(&input, &output, &decoder).unwrap();
+    std::fs::write(output.join("CURRENT"), &second.snapshot).unwrap();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let get = |query: &str, token: &str| {
+        Request::get(format!("/api/v1/master-data/history?{query}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(get("limit=1", "internal"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let response = app.clone().oneshot(get("limit=1", "api")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["cache-control"]
+        .to_str()
+        .unwrap()
+        .contains("no-store"));
+    let page = body(response).await;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(page["entries"][0]["snapshot"], second.snapshot);
+    assert_eq!(page["next_before"], second.snapshot);
+    assert_eq!(page["has_more"], true);
+    let third = master::import_directory(&input, &output, &decoder).unwrap();
+    let query = format!("limit=1&before={}", second.snapshot);
+    for _ in 0..2 {
+        let response = app.clone().oneshot(get(&query, "api")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let page = body(response).await;
+        assert_eq!(page["head"], third.snapshot);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["snapshot"], first.snapshot);
+        assert_eq!(page["has_more"], false);
+        assert!(page["next_before"].is_null());
+    }
+    let page = registry::history_page(&output, registry_scope(), 1, Some(&first.snapshot)).unwrap();
+    assert!(page.entries.is_empty() && !page.has_more && page.next_before.is_none());
+    for cursor in [&orphan.snapshot, "master-missing"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&format!("before={cursor}"), "api"))
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+    for query in [
+        "before=",
+        "before=..%2Fmaster-x",
+        "limit=0",
+        "limit=101",
+        "unknown=1",
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(get(query, "api"))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    assert!(!registry::valid_history_cursor(&format!(
+        "master-{}",
+        "a".repeat(129)
+    )));
+    // Legacy boundaries cannot be crossed by a cursor naming an existing directory.
+    std::fs::remove_file(output.join(&second.snapshot).join("publication.json")).unwrap();
+    let page =
+        registry::history_page(&output, registry_scope(), 1, Some(&second.snapshot)).unwrap();
+    assert!(page.entries.is_empty() && page.legacy_boundary && !page.has_more);
+    assert!(matches!(
+        registry::history_page(&output, registry_scope(), 1, Some(&first.snapshot)),
+        Err(master::MasterError::NotFound)
+    ));
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn master_history_pagination_reads_more_than_one_hundred_installations_without_gaps() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let mut expected = vec![first.snapshot];
+    for _ in 0..104 {
+        expected.push(
+            master::import_directory(&input, &output, &decoder)
+                .unwrap()
+                .snapshot,
+        );
+    }
+    expected.reverse();
+    let mut before = None;
+    let mut actual = Vec::new();
+    for page_index in 0..3 {
+        let page =
+            registry::history_page(&output, registry_scope(), 37, before.as_deref()).unwrap();
+        assert_eq!(page.head, expected[0]);
+        assert_eq!(page.has_more, page_index < 2);
+        assert!(!page.legacy_boundary);
+        before = page.next_before;
+        actual.extend(page.entries.into_iter().map(|entry| entry.snapshot));
+    }
+    assert!(before.is_none());
+    assert_eq!(actual, expected);
+}

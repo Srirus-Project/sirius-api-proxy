@@ -358,20 +358,42 @@ pub struct History {
     pub head: String,
     pub entries: Vec<HistoryEntry>,
     pub has_more: bool,
+    /// Pass this snapshot as `before` to continue with older committed entries.
+    pub next_before: Option<String>,
     /// Older snapshots have no predecessor record; their chronology is unknown.
     pub legacy_boundary: bool,
 }
 
 pub fn history(root: &Path, scope: Scope, limit: usize) -> Result<History, MasterError> {
+    history_page(root, scope, limit, None)
+}
+
+pub fn valid_history_cursor(value: &str) -> bool {
+    value.len() <= 128 && value.starts_with("master-") && master::safe_component(value)
+}
+
+pub fn history_page(
+    root: &Path,
+    scope: Scope,
+    limit: usize,
+    before: Option<&str>,
+) -> Result<History, MasterError> {
     if !(1..=100).contains(&limit) {
         return Err(MasterError::Limit);
     }
+    if before.is_some_and(|v| !valid_history_cursor(v)) {
+        return Err(MasterError::Format);
+    }
     let head = predecessor(root)?.ok_or(MasterError::NotFound)?;
+    let mut cursor_found = before.is_none();
     let mut next = Some(head.clone());
     let mut visited = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
     let mut legacy_boundary = false;
     while let Some(snapshot) = next.take() {
+        if visited.len() == 10_000 {
+            return Err(MasterError::Limit);
+        }
         if !visited.insert(snapshot.clone()) {
             return Err(MasterError::Format);
         }
@@ -403,6 +425,10 @@ pub fn history(root: &Path, scope: Scope, limit: usize) -> Result<History, Maste
         };
         let published_at = publication.as_ref().map(|p| p.published_at);
         next = publication.and_then(|p| p.previous_snapshot);
+        if !cursor_found {
+            cursor_found = before == Some(snapshot.as_str());
+            continue;
+        }
         entries.push(HistoryEntry {
             snapshot,
             version: value.version,
@@ -415,12 +441,21 @@ pub fn history(root: &Path, scope: Scope, limit: usize) -> Result<History, Maste
             break;
         }
     }
+    if !cursor_found {
+        return Err(MasterError::NotFound);
+    }
+    let next_before = if next.is_some() {
+        entries.last().map(|entry| entry.snapshot.clone())
+    } else {
+        None
+    };
     Ok(History {
         schema_version: 1,
         scope,
         head,
         entries,
         has_more: next.is_some(),
+        next_before,
         legacy_boundary,
     })
 }

@@ -429,6 +429,7 @@ async fn registry_table(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryQuery {
+    before: Option<String>,
     #[serde(default = "history_limit")]
     limit: usize,
 }
@@ -439,7 +440,12 @@ async fn registry_history(
     State(c): State<Arc<GameClient>>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Response, AppError> {
-    if !(1..=100).contains(&query.limit) {
+    if !(1..=100).contains(&query.limit)
+        || query
+            .before
+            .as_deref()
+            .is_some_and(|v| !crate::master_registry::valid_history_cursor(v))
+    {
         return Err(AppError::InvalidRequest);
     }
     let root = c
@@ -452,7 +458,7 @@ async fn registry_history(
         platform: c.platform(),
     };
     let value = tokio::task::spawn_blocking(move || {
-        crate::master_registry::history(&root, scope, query.limit)
+        crate::master_registry::history_page(&root, scope, query.limit, query.before.as_deref())
     })
     .await
     .map_err(|_| AppError::MasterUnavailable)?
