@@ -252,3 +252,22 @@ response ETag while preserving `content_sha256`; responses therefore use private
 and support If-None-Match, rather than promising immutable response bytes for the hash URL.
 Pin the returned snapshot and table hashes when fetching files. As with other manifest
 reads, indexed metadata is validated here; exact table payloads are verified when read.
+
+## Git publication restoration status
+
+The bounded Git execution primitive is implemented and locally tested on Unix. It invokes
+commands directly, disables terminal prompting, drains stdout/stderr concurrently, limits
+each stream to a caller-selected 1 KiB–16 MiB, and applies a command timeout up to 600 seconds.
+Failures return static error categories without raw argv, stderr or stdout. Successful callers
+receive bounded stdout only and must avoid exposing any credential-bearing command results.
+
+Cancellation or failure kills the owned Git process group, including ordinary Git transport
+helpers. Timeout/error cleanup explicitly waits up to two additional seconds for the direct
+child; cancellation uses Tokio's kill-on-drop/reaping behavior. Process-group containment is
+not a sandbox against a helper deliberately escaping its group. Non-Unix execution currently
+returns an explicit unsupported error until platform-specific process-tree cleanup is added.
+
+This is execution groundwork, not an enabled Git publisher: snapshot staging/commit ownership,
+remote-ahead detection, signing/proxy/credential configuration, push acknowledgement/recovery,
+background integration and Windows process-tree handling remain pending. No new publication
+configuration is accepted and no Git network commands run automatically.

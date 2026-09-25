@@ -7781,3 +7781,144 @@ async fn master_content_hash_lookup_is_committed_scoped_and_conditionally_cached
         503
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_execution_runs_real_git_and_bounds_output_without_error_leaks() {
+    use crate::git_process::{run, Error};
+    use std::{ffi::OsString, path::Path};
+    let directory = tempfile::tempdir().unwrap();
+    let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+    run(
+        Path::new("git"),
+        directory.path(),
+        &args(&["init", "--quiet"]),
+        Duration::from_secs(5),
+        4096,
+    )
+    .await
+    .unwrap();
+    let head = run(
+        Path::new("git"),
+        directory.path(),
+        &args(&["symbolic-ref", "HEAD"]),
+        Duration::from_secs(5),
+        4096,
+    )
+    .await
+    .unwrap();
+    assert!(head.starts_with(b"refs/heads/"));
+    let error = run(
+        Path::new("/bin/sh"),
+        directory.path(),
+        &args(&["-c", "printf fixture-private-value >&2; exit 1"]),
+        Duration::from_secs(2),
+        1024,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Failed));
+    assert!(!format!("{error:?} {error}").contains("fixture-private-value"));
+    // Drain stdout and stderr concurrently; neither pipe may deadlock before the limit.
+    for script in [
+        "while :; do printf 'abcdefghijklmnopqrstuvwxyz'; done",
+        "while :; do printf 'abcdefghijklmnopqrstuvwxyz' >&2; done",
+    ] {
+        assert!(matches!(
+            run(
+                Path::new("/bin/sh"),
+                directory.path(),
+                &args(&["-c", script]),
+                Duration::from_secs(2),
+                1024
+            )
+            .await,
+            Err(Error::OutputLimit)
+        ));
+    }
+    assert!(matches!(
+        run(
+            Path::new("git"),
+            directory.path(),
+            &[],
+            Duration::ZERO,
+            1024
+        )
+        .await,
+        Err(Error::Config)
+    ));
+    assert!(matches!(
+        run(
+            Path::new("missing-git-fixture"),
+            directory.path(),
+            &[],
+            Duration::from_secs(2),
+            1024
+        )
+        .await,
+        Err(Error::Spawn)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_execution_timeout_and_future_cancellation_kill_helpers() {
+    use crate::git_process::{run, Error};
+    use std::{ffi::OsString, path::Path};
+    let root = tempfile::tempdir().unwrap();
+    let script = "(sleep 1; printf survived > finished) & printf ready > ready; wait";
+    let args: Vec<OsString> = ["-c", script].into_iter().map(OsString::from).collect();
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        run(
+            Path::new("/bin/sh"),
+            root.path(),
+            &args,
+            Duration::from_millis(100),
+            1024
+        )
+        .await,
+        Err(Error::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(3));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!root.path().join("finished").exists());
+    std::fs::remove_file(root.path().join("ready")).unwrap();
+    let path = root.path().to_owned();
+    let owned_args = args.clone();
+    let task = tokio::spawn(async move {
+        run(
+            Path::new("/bin/sh"),
+            &path,
+            &owned_args,
+            Duration::from_secs(10),
+            1024,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !root.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!root.path().join("finished").exists());
+    // Positive control proves the child would otherwise perform the delayed write.
+    run(
+        Path::new("/bin/sh"),
+        root.path(),
+        &args,
+        Duration::from_secs(5),
+        1024,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("finished")).unwrap(),
+        b"survived"
+    );
+}
