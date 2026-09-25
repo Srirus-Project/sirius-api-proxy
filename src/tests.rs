@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        master_notify: None,
         master_sync: None,
         node_routing: None,
         peer_token_env: None,
@@ -7119,5 +7120,278 @@ async fn master_notification_rejects_redirects_unbounded_and_stalled_replies() {
     }
     mode.store(4, Ordering::SeqCst);
     assert!(target.deliver(&hash).await.unwrap());
+    server.abort();
+}
+
+fn notification_policy(origin: String) -> crate::master_notify::Config {
+    let token_env = format!("SIRIUS_NOTIFY_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, "consumer-admin");
+    crate::master_notify::Config {
+        targets: vec![crate::master_notify::TargetConfig {
+            name: "consumer".into(),
+            origin,
+            token_env,
+            regional_paths: false,
+            allow_http: true,
+        }],
+        interval_seconds: 3600,
+        request_timeout_ms: 1000,
+    }
+}
+
+#[tokio::test]
+async fn master_notification_worker_wakes_verified_consumer_after_publication() {
+    let (_root, input, output, _) = registry_fixture();
+    let mut owner_cfg = config();
+    owner_cfg.master_directory = Some(output.clone());
+    let owner = GameClient::new(owner_cfg.clone()).unwrap();
+    let (origin, owner_server) = peer_http_server(api::router(
+        owner.clone(),
+        "owner-read".into(),
+        "owner-admin".into(),
+    ))
+    .await;
+    let consumer_root = tempfile::tempdir().unwrap();
+    let mut cfg = master_sync_config(origin, consumer_root.path().join("master"));
+    cfg.master_sync.as_mut().unwrap().interval_seconds = 86400;
+    let consumer = GameClient::new(cfg.clone()).unwrap();
+    let (origin, consumer_server) = peer_http_server(api::router(
+        consumer.clone(),
+        "consumer-read".into(),
+        "consumer-admin".into(),
+    ))
+    .await;
+    owner_cfg.master_notify = Some(notification_policy(origin));
+    let syncer = crate::master_sync::Syncer::new(&cfg, consumer.clone()).unwrap();
+    let mut notifier = crate::master_notify::Worker::new(&owner_cfg, owner.clone()).unwrap();
+    // Exercise actual receiver acceptance and sender deduplication before worker start.
+    assert_eq!(notifier.reconcile().await.unwrap(), 1);
+    assert_eq!(notifier.reconcile().await.unwrap(), 0);
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let sync_task = tokio::spawn(syncer.run(receiver.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while consumer.master_update_status().await["status"] != "ready" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let notify_task = tokio::spawn(notifier.run(receiver));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "automatic-notification".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &output, &decoder).unwrap();
+    owner
+        .record_master_update(json!({"status":"ready","result":{"action":"updated"}}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = crate::master_registry::manifest(
+                cfg.master_directory.as_ref().unwrap(),
+                None,
+                registry_scope(),
+            )
+            .unwrap();
+            let value: Value = serde_json::from_slice(&current.bytes).unwrap();
+            if value["version"] == "automatic-notification" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    for task in [notify_task, sync_task] {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    owner_server.abort();
+    consumer_server.abort();
+}
+
+#[tokio::test]
+async fn master_notification_worker_retries_failed_targets_without_rolling_back_or_resending_success(
+) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (_root, _, output, _) = registry_fixture();
+    let before = std::fs::read(output.join("CURRENT")).unwrap();
+    let failures = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let failures = failures.clone();
+        let calls = calls.clone();
+        move || {
+            let failures = failures.clone();
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if failures.load(Ordering::SeqCst) {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down")
+                } else {
+                    (
+                        axum::http::StatusCode::ACCEPTED,
+                        "{\"status\":\"accepted\"}",
+                    )
+                }
+            }
+        }
+    });
+    let (origin, bad_server) = peer_http_server(app).await;
+    let good_calls = Arc::new(AtomicUsize::new(0));
+    let (good_origin, good_server) = peer_http_server(axum::Router::new().fallback({
+        let count = good_calls.clone();
+        move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::ACCEPTED,
+                    "{\"status\":\"accepted\"}",
+                )
+            }
+        }
+    }))
+    .await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let mut policy = notification_policy(origin);
+    let mut good = policy.targets[0].clone();
+    good.name = "healthy".into();
+    good.origin = good_origin;
+    policy.targets.push(good);
+    cfg.master_notify = Some(policy);
+    let mut worker =
+        crate::master_notify::Worker::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    assert!(worker.reconcile().await.is_err());
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+    failures.store(false, Ordering::SeqCst);
+    assert_eq!(worker.reconcile().await.unwrap(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(worker.reconcile().await.unwrap(), 0);
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), before);
+    // Startup reconciliation and timed retry work without an in-memory signal.
+    failures.store(true, Ordering::SeqCst);
+    cfg.master_notify.as_mut().unwrap().interval_seconds = 10;
+    let fresh =
+        crate::master_notify::Worker::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(fresh.run(rx));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while good_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    failures.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while calls.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(good_calls.load(Ordering::SeqCst), 2);
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    bad_server.abort();
+    good_server.abort();
+}
+
+#[test]
+fn master_notification_configuration_and_deployment_separate_credentials() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = regional_config(Region::Jp);
+    cfg.master_directory = Some(root.path().join("master"));
+    cfg.master_notify = Some(notification_policy("http://127.0.0.1:1".into()));
+    let base = cfg.master_notify.clone().unwrap();
+    for interval in [0, 9, 3601] {
+        let mut bad = cfg.clone();
+        bad.master_notify.as_mut().unwrap().interval_seconds = interval;
+        assert!(bad.validate().is_err());
+    }
+    for count in [0, 17] {
+        let mut bad = cfg.clone();
+        bad.master_notify.as_mut().unwrap().targets = vec![base.targets[0].clone(); count];
+        assert!(bad.validate().is_err());
+    }
+    let mut bad = cfg.clone();
+    bad.master_directory = None;
+    assert!(bad.validate().is_err());
+    let mut bad = cfg.clone();
+    bad.master_notify
+        .as_mut()
+        .unwrap()
+        .targets
+        .push(base.targets[0].clone());
+    assert!(bad.validate().is_err());
+    for region in [Region::Tw, Region::En, Region::Kr, Region::Cn] {
+        let mut bad = cfg.clone();
+        bad.region = region;
+        assert!(bad.validate().is_err());
+    }
+    for value in ["public-jp", "internal-jp", "fixture-cdn-secret"] {
+        std::env::set_var(&base.targets[0].token_env, value);
+        assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
+            .prepare()
+            .is_err());
+    }
+    // Another profile's credentials are protected, even if unrelated to JP Master.
+    let other = regional_config(Region::Tw);
+    std::env::set_var(&base.targets[0].token_env, "internal-tw");
+    assert!(crate::master_notify::validate_tokens(&[&cfg, &other]).is_err());
+    std::env::set_var(&base.targets[0].token_env, "consumer-admin");
+    let prepared = DeploymentConfig::Single(Box::new(cfg)).prepare().unwrap();
+    assert_eq!(prepared.notifiers.len(), 1);
+    assert!(!root.path().join("master/CURRENT").exists());
+}
+
+#[tokio::test]
+async fn master_notification_shutdown_cancels_active_delivery_without_publication_changes() {
+    let (_root, _, output, _) = registry_fixture();
+    let before = std::fs::read(output.join("CURRENT")).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().fallback({
+        let entered = entered.clone();
+        move || {
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                std::future::pending::<axum::http::StatusCode>().await
+            }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let mut policy = notification_policy(origin);
+    policy.request_timeout_ms = 30_000;
+    cfg.master_notify = Some(policy);
+    let worker =
+        crate::master_notify::Worker::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), before);
     server.abort();
 }

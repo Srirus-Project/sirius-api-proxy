@@ -155,7 +155,7 @@ Existing snapshot directories are not pruned.
 ## Remaining restoration
 
 Producer reads and consumer synchronization operate over atomic local snapshots.
-Central registry persistence, completion notifications and optional Git
+Central registry persistence, general completion notifications and optional Git
 publication remain separate restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.
 
@@ -178,10 +178,9 @@ update. The existing single sync worker always fetches the configured owner's cu
 manifest, validates scope/content/files, and atomically publishes; no origin/path or file
 content is accepted from the hint. A stale digest therefore cannot roll back a consumer.
 Periodic polling remains the fallback, and service restart performs an immediate poll,
-so notification loss does not disable eventual synchronization. This receiver does not yet
-provide owner-side delivery, retries or publication notifications to unrelated services.
+so notification loss does not disable eventual synchronization.
 
-### Owner transport restoration status
+### Configured owner notifications
 
 The owner transport now has a bounded one-attempt sender with per-target in-memory
 acknowledgements. Only HTTP 202 with the strict JSON status `accepted` advances that
@@ -191,6 +190,42 @@ Requests use explicit origins, normal TLS verification, no ambient proxies, no r
 and no implicit retries. Response bodies are bounded to 1 KiB and the request deadline
 covers body consumption. Acceptance does not prove consumer synchronization.
 
-This transport is not yet wired into deployment configuration or background workers.
-Publication-driven reconciliation, scheduling and outgoing credential-scope checks remain
-pending; no automatic owner notifications are enabled by this change.
+Configure `master_notify` on a JP profile with `master_directory`:
+
+```yaml
+master_notify:
+  interval_seconds: 30
+  request_timeout_ms: 5000
+  targets:
+    - name: replica
+      origin: https://replica.example
+      token_env: SIRIUS_MASTER_REPLICA_NOTIFY_TOKEN
+      regional_paths: true
+      allow_http: false
+```
+
+The token must authorize the consumer's internal endpoint. It must differ from every
+local profile's API/internal/peer/game/CDN/owner-read/updater/outgoing-node and proxy
+credentials; only environment variable references belong in configuration. Target names
+are unique, 1–64 ASCII letters/digits/underscores/hyphens. Configure 1–16 targets, a
+10–3600 second reconciliation interval (default 30) and a 100–30000 millisecond per-target
+request timeout (default 5000). HTTP requires explicit opt-in; origins cannot include
+paths, URL credentials, queries or fragments. Notifications are disabled when omitted.
+
+The worker reconciles committed CURRENT immediately at startup, after successful in-process
+CDN/consumer publication and periodically. Polling also discovers independent CLI imports.
+Targets are visited sequentially; the interval starts after the pass finishes, so a full
+pass can take up to the target count times the request timeout plus local manifest reads.
+Each failed target retries on a later pass, while accepted targets skip unchanged content.
+One failed target does not prevent later targets from being tried. Local manifest failure
+sends no hint; delivery failures never change CURRENT or roll back a publication.
+Shutdown cancels active network work. Manifest reads run off the async executor and may
+finish after cancellation, but perform no writes or notification transmission themselves.
+
+Acknowledgements are transient. The durable source is CURRENT: restart resends its current
+content, and intermediate versions can coalesce to the newest committed state. There is
+no promise to deliver every installation event, or to deliver exactly once. A notification
+only wakes the consumer; its configured owner and full verification determine installed
+data. Periodic consumer polling remains necessary even after an accepted notification.
+General publication webhooks, central registry persistence and Git publication remain
+separate restoration work.

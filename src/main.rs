@@ -115,6 +115,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .map(|worker| tokio::spawn(worker.run(receiver.clone()))),
     );
+    workers.extend(
+        prepared
+            .notifiers
+            .into_iter()
+            .map(|worker| tokio::spawn(worker.run(receiver.clone()))),
+    );
     let signal_shutdown = shutdown.clone();
     tracing::info!(%listen,"Sirius API Proxy listening");
     let result = sirius_api_proxy::server::serve(listener, router, tls, async move {

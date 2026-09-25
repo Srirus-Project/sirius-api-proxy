@@ -123,3 +123,16 @@ response_cache:
 #       token_env: SIRIUS_JP_SECONDARY_PEER_TOKEN
 #       priority: 10
 #       regional_paths: true
+
+# Optional Master owner notifications. Requires master_directory; JP only.
+# Each token authorizes the remote consumer's internal endpoint and must be distinct
+# from this deployment's local credentials. See docs/MASTER_REGISTRY.md.
+# master_notify:
+#   interval_seconds: 30
+#   request_timeout_ms: 5000
+#   targets:
+#     - name: replica
+#       origin: https://replica.example
+#       token_env: SIRIUS_MASTER_REPLICA_NOTIFY_TOKEN
+#       regional_paths: true
+#       allow_http: false

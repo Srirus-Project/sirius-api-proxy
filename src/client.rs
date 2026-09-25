@@ -55,6 +55,7 @@ struct State {
 
 pub struct GameClient {
     master_sync_wake: tokio::sync::Notify,
+    master_publication_wake: tokio::sync::Notify,
     node_routing: Option<crate::node_routing::Router>,
     config: Config,
     http: Client<crate::transport::TlsConnector, Full<Bytes>>,
@@ -129,6 +130,7 @@ impl GameClient {
             .transpose()?;
         Ok(Arc::new(Self {
             master_sync_wake: tokio::sync::Notify::new(),
+            master_publication_wake: tokio::sync::Notify::new(),
             node_routing,
             config,
             http,
@@ -241,8 +243,15 @@ impl GameClient {
     pub async fn master_update_status(&self) -> Value {
         self.state.lock().await.master_update.clone()
     }
+    pub(crate) async fn master_publication_notified(&self) {
+        self.master_publication_wake.notified().await;
+    }
     pub(crate) async fn record_master_update(&self, value: Value) {
+        let published = value["status"] == "ready" && value["result"]["action"] == "updated";
         self.state.lock().await.master_update = value;
+        if published {
+            self.master_publication_wake.notify_one();
+        }
     }
     pub(crate) async fn refresh_master_target(
         self: &Arc<Self>,

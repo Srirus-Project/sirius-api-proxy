@@ -33,6 +33,7 @@ pub struct Prepared {
     pub listen: SocketAddr,
     pub router: Router,
     pub updaters: Vec<Arc<MasterUpdater>>,
+    pub notifiers: Vec<crate::master_notify::Worker>,
     pub syncers: Vec<Arc<crate::master_sync::Syncer>>,
     pub asset_dispatchers: Vec<crate::asset_dispatch::Worker>,
 }
@@ -262,6 +263,8 @@ impl DeploymentConfig {
                 }
             }
         }
+        crate::master_notify::validate_tokens(&configs)?;
+        let mut notifiers = Vec::new();
         let mut router = api::health_router();
         let mut updaters = Vec::new();
         let mut syncers = Vec::new();
@@ -272,6 +275,9 @@ impl DeploymentConfig {
             let client = GameClient::new(c.clone())?;
             if c.asset_dispatch.is_some() {
                 asset_dispatchers.push(crate::asset_dispatch::Worker::new(c, client.clone())?);
+            }
+            if c.master_notify.is_some() {
+                notifiers.push(crate::master_notify::Worker::new(c, client.clone())?);
             }
             if c.master_sync.is_some() {
                 syncers.push(crate::master_sync::Syncer::new(c, client.clone())?);
@@ -315,6 +321,7 @@ impl DeploymentConfig {
             router,
             updaters,
             syncers,
+            notifiers,
             asset_dispatchers,
         })
     }
