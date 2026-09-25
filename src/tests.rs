@@ -9152,3 +9152,222 @@ async fn dispatch_archive_admin_requires_auth_completion_and_survives_owner_rest
     assert_eq!(store.observe(identity).unwrap(), key);
     assert_eq!(store.entries().len(), 1);
 }
+
+fn master_database_config() -> crate::master_database::Config {
+    crate::master_database::Config {
+        host: "127.0.0.1".into(),
+        port: 5432,
+        database: "sirius_test".into(),
+        username: "postgres".into(),
+        password_env: "SIRIUS_TEST_POSTGRES_PASSWORD".into(),
+        root_certificate: None,
+        plaintext_loopback: true,
+        timeout_seconds: 10,
+        keep_snapshots: 2,
+    }
+}
+#[tokio::test]
+async fn master_database_policy_rejects_unsafe_transport_and_source_before_connecting() {
+    use crate::master_database::{self as db, Error};
+    let good = master_database_config();
+    good.validate().unwrap();
+    for host in [
+        "localhost",
+        "db.example",
+        "127.0.0.1/other",
+        "user@127.0.0.1",
+        "",
+    ] {
+        let mut c = good.clone();
+        c.host = host.into();
+        assert!(c.validate().is_err());
+    }
+    for n in [0, 10001] {
+        let mut c = good.clone();
+        c.keep_snapshots = n;
+        assert!(c.validate().is_err());
+    }
+    let mut secure = good.clone();
+    secure.host = "db.example".into();
+    secure.plaintext_loopback = false;
+    secure.validate().unwrap();
+    let (_root, _input, source, _) = registry_fixture();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let current = String::from_utf8(before.clone()).unwrap();
+    let document = crate::master_registry::manifest(&source, None, registry_scope()).unwrap();
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&document.bytes).unwrap();
+    std::fs::write(
+        source.join(current.trim()).join(&manifest.files[0].name),
+        b"{}",
+    )
+    .unwrap();
+    // No database or password is needed to prove corrupt source never reaches a connection.
+    assert!(matches!(
+        db::publish(&good, &source, registry_scope()).await,
+        Err(Error::Snapshot)
+    ));
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_postgres_atomic_history_retention_integrity_and_retry() {
+    use crate::{master, master_database as db, master_registry as registry};
+    use sqlx::{Connection, Row};
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut scope = registry_scope();
+    scope.environment = format!("fixture-{}", uuid::Uuid::new_v4().simple());
+    let scope_key = serde_json::to_string(&scope).unwrap();
+    let (_root, input, source, _) = registry_fixture();
+    let local_before = std::fs::read(source.join("CURRENT")).unwrap();
+    let first = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    assert!(first.changed);
+    let repeated = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    assert!(!repeated.changed);
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    let rows = sqlx::query("SELECT name,bytes,document FROM public.sirius_master_documents WHERE scope=$1 ORDER BY name")
+        .bind(&scope_key).fetch_all(&mut conn).await.unwrap();
+    assert_eq!(rows.len(), first.tables);
+    for row in rows {
+        let name: String = row.get("name");
+        let bytes: Vec<u8> = row.get("bytes");
+        let value: Value = row.get("document");
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), value);
+        assert_eq!(
+            std::fs::read(
+                source
+                    .join(String::from_utf8(local_before.clone()).unwrap().trim())
+                    .join(name)
+            )
+            .unwrap(),
+            bytes
+        );
+    }
+    // Unrelated scope is independently published and never pruned by this scope.
+    let mut other = scope.clone();
+    other.environment.push_str("-other");
+    let other_key = serde_json::to_string(&other).unwrap();
+    db::publish(&cfg, &source, other).await.unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "db-second".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    // Fail after snapshot insertion, during document insertion: neither new snapshot nor
+    // history/current may become visible after rollback.
+    sqlx::query("ALTER TABLE public.sirius_master_documents ADD CONSTRAINT sirius_fixture_reject CHECK (name <> 'MasterFixture.json') NOT VALID")
+        .execute(&mut conn).await.unwrap();
+    assert!(matches!(
+        db::publish(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Database)
+    ));
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
+            .bind(&scope_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(retained, 1);
+    sqlx::query("ALTER TABLE public.sirius_master_documents DROP CONSTRAINT sirius_fixture_reject")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A blocked writer times out/cancels, preserving both the published database and local CURRENT.
+    let mut lock = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7369726975731200)")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let mut short = cfg.clone();
+    short.timeout_seconds = 1;
+    assert!(db::publish(&short, &source, scope.clone()).await.is_err());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        db::publish(&cfg, &source, scope.clone())
+    )
+    .await
+    .is_err());
+    lock.rollback().await.unwrap();
+    let current: String =
+        sqlx::query_scalar("SELECT content_hash FROM public.sirius_master_current WHERE scope=$1")
+            .bind(&scope_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(current, first.content_sha256);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    let (a, b) = tokio::join!(
+        db::publish(&cfg, &source, scope.clone()),
+        db::publish(&cfg, &source, scope.clone())
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.changed, b.changed);
+    assert_eq!(a.content_sha256, b.content_sha256);
+    manifest.version = "db-third".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let third = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
+            .bind(&scope_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
+    let history: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_history WHERE scope=$1")
+            .bind(&scope_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(history, 3);
+    let other_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
+            .bind(other_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(other_count, 1);
+    let old_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM public.sirius_master_documents WHERE scope=$1 AND content_hash=$2",
+    )
+    .bind(&scope_key)
+    .bind(&first.content_sha256)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(old_count, 0);
+    sqlx::query(
+        "UPDATE public.sirius_master_documents SET bytes=$3 WHERE scope=$1 AND content_hash=$2",
+    )
+    .bind(&scope_key)
+    .bind(&third.content_sha256)
+    .bind(b"corrupt".as_slice())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert!(matches!(
+        db::publish(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Integrity)
+    ));
+    // Verified TLS is the default; this plaintext-only test server must be refused.
+    let mut tls = cfg.clone();
+    tls.plaintext_loopback = false;
+    assert!(db::publish(&tls, &source, scope).await.is_err());
+    assert!(registry::hash_valid(&third.content_sha256));
+}

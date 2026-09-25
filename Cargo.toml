@@ -10,6 +10,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json"] }
 base64 = "0.22"
 tracing-appender = "0.2"
 ipnet = "2"

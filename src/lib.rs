@@ -56,3 +56,5 @@ pub mod git_process;
 pub mod master_git;
 
 pub mod master_git_worker;
+
+pub mod master_database;

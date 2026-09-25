@@ -25,6 +25,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("sirius-api-proxy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.first().is_some_and(|a| a == "master-db-import") {
+        if args.len() != 2 {
+            return Err("usage: sirius-api-proxy master-db-import DATABASE_CONFIG".into());
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&args[1])
+            .map_err(|_| "database configuration unavailable")?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "database configuration unavailable")?;
+        if bytes.len() > 65536 {
+            return Err("database configuration too large".into());
+        }
+        let import: sirius_api_proxy::master_database::Import =
+            yaml_serde::from_slice(&bytes).map_err(|_| "invalid database configuration")?;
+        let receipt = sirius_api_proxy::master_database::publish(
+            &import.database,
+            &import.source,
+            import.scope,
+        )
+        .await?;
+        println!("{}", serde_json::to_string(&receipt)?);
+        return Ok(());
+    }
     if matches!(
         args.first().map(String::as_str),
         Some(

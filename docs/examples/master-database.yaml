@@ -1,0 +1,15 @@
+source: ./master
+scope:
+  region: jp
+  environment: release
+  platform: iOS
+database:
+  host: database.example.invalid
+  port: 5432
+  database: sirius_master
+  username: sirius_master
+  password_env: SIRIUS_MASTER_DATABASE_PASSWORD
+  # root_certificate: /absolute/path/to/database-ca.pem
+  plaintext_loopback: false
+  timeout_seconds: 120
+  keep_snapshots: 20

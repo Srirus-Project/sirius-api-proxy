@@ -15,6 +15,8 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   dynamic codecs without restarting. Rebuilding restores the native path for the new definitions.
 - Master manifest verification, Rijndael-256 decryption, gzip/JSON validation, atomic snapshots,
   local table queries and optional periodic updates. No database is required.
+- Optional [transactional PostgreSQL Master mirror](docs/MASTER_DATABASE.md) with exact JSON bytes,
+  searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
 The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has a separate discovery/version bundle. The application release version **1.1.0** is
