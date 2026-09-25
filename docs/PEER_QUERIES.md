@@ -62,8 +62,8 @@ The schema hash is rechecked after acquiring admission and the protocol read bar
 a reload from changing a queued request's contract before execution.
 
 HTTP 200 contains the request identity/id and a typed outcome: `status: success` with `data`,
-or `status: failure` with `kind`. Failure types are `identity_mismatch`, `unsupported_operation`,
-`account_unavailable`, `timeout`, `transport`, `protocol`, or `game` with `grpc_status`.
+or `status: failure` with `kind`. The reply also carries the executor's sanitized `observation`. Failure types are `identity_mismatch`, `unsupported_operation`,
+`account_unavailable`, `unavailable_before_dispatch`, `timeout`, `transport`, `protocol`, or `game` with `grpc_status`.
 The echoed identity binds the response to the request; an identity failure does not claim
 that identity was accepted. Malformed input and failed authorization use HTTP errors.
 Raw upstream diagnostics and credentials are never serialized. Account-relative `myRank` and
@@ -74,11 +74,10 @@ alone does not authorize an automatic replay of authenticated queries.
 
 ## Restoration status
 
-This is the executing node interface, not completed multi-node routing. Outbound node selection,
-priorities, total-deadline failover, passive health, remote-only deployment and public-route
-integration remain required restoration work. The full yhm01 acceptance and 1.2.0 release gates
-remain pending. Local tests exercise real gRPC execution, errors without diagnostic leakage,
-credential separation, request limits, Global identity/capability boundaries and protocol reload.
+Public query routing now uses this contract; see [NODE_ROUTING.md](NODE_ROUTING.md) for
+priorities, bounded failover and health. `unavailable_before_dispatch` is emitted only when
+account selection fails before a game request; later account errors remain ambiguous. Full
+yhm01 acceptance and release gates remain pending.
 
 ## Outbound transport foundation
 
@@ -106,5 +105,4 @@ No replay or fallback occurs in the transport itself. Node routing will own that
 Tests cover a real HTTP peer executing local gRPC, single/multi-region path selection, token
 scope, exact response identity, unknown fields, int64 strings, fixed/chunked oversized bodies,
 redirect refusal, untrusted TLS, header/body stalls under both timeout budgets and connection
-versus mid-body failures. This module is wired into the library; outbound service configuration
-and public-route node selection remain pending. No unused YAML routing knobs are advertised.
+versus mid-body failures. The service node router uses this transport with explicit outbound configuration.

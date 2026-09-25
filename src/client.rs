@@ -33,7 +33,8 @@ pub(crate) fn authenticated(route: &str) -> bool {
     )
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observation {
     pub observed_at: Option<DateTime<Utc>>,
     pub grpc_status: Option<u16>,
@@ -53,6 +54,7 @@ struct State {
 }
 
 pub struct GameClient {
+    node_routing: Option<crate::node_routing::Router>,
     config: Config,
     http: Client<crate::transport::TlsConnector, Full<Bytes>>,
     protocol: RwLock<Arc<ProtocolBundle>>,
@@ -119,7 +121,13 @@ impl GameClient {
         let timeout = Duration::from_millis(config.upstream.timeout_ms);
         let inflight = tokio::sync::Semaphore::new(config.upstream.max_inflight);
         let response_cache = crate::response_cache::Cache::new(config.response_cache.clone())?;
+        let node_routing = config
+            .node_routing
+            .clone()
+            .map(|routing| crate::node_routing::Router::new(routing, config.region))
+            .transpose()?;
         Ok(Arc::new(Self {
+            node_routing,
             config,
             http,
             accounts: std::sync::Mutex::new(accounts),
@@ -295,6 +303,33 @@ impl GameClient {
             .map_err(|_| AppError::AccountUnavailable)? = candidate;
         self.account_status()
     }
+    pub fn node_status(&self) -> Value {
+        self.node_routing
+            .as_ref()
+            .map_or_else(|| json!({"enabled":false}), |router| router.status())
+    }
+    pub async fn public_query(
+        self: &Arc<Self>,
+        operation: crate::peer::Operation,
+    ) -> crate::node_routing::Execution {
+        if let Some(router) = &self.node_routing {
+            return router.call(self, operation).await;
+        }
+        let result = match operation.rpc() {
+            Ok((route, input)) => self.call(route, input).await,
+            Err(e) => Err(e),
+        };
+        crate::node_routing::Execution {
+            result,
+            observation: self.observation().await,
+        }
+    }
+    pub async fn public_call(
+        self: &Arc<Self>,
+        operation: crate::peer::Operation,
+    ) -> Result<Value, AppError> {
+        self.public_query(operation).await.result
+    }
     pub fn peer_identity(&self) -> Result<crate::peer::Identity, AppError> {
         Ok(crate::peer::Identity {
             contract_version: 1,
@@ -364,7 +399,14 @@ impl GameClient {
                         self.accounts
                             .lock()
                             .map_err(|_| AppError::AccountUnavailable)?
-                            .select(name, matches!(route, WHOAMI | PLAYER_DATA))?,
+                            .select(name, matches!(route, WHOAMI | PLAYER_DATA))
+                            .map_err(|e| {
+                                if expected_protocol.is_some() {
+                                    AppError::PeerAccountUnavailable
+                                } else {
+                                    e
+                                }
+                            })?,
                     )
                 } else {
                     None

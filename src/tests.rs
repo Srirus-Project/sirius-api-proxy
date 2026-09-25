@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        node_routing: None,
         peer_token_env: None,
         asset_dispatch: None,
         logging: None,
@@ -5269,7 +5270,7 @@ async fn peer_transport_rejects_unbound_malformed_and_oversized_replies_without_
                 counter.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(headers["authorization"], "Bearer fixture-peer-only");
                 assert_eq!(headers["content-type"], "application/json");
-                let mut reply = json!({"request_id":request["request_id"],"identity":request["identity"],"outcome":{"status":"success","data":{"largeId":"9223372036854775807"}}});
+                let mut reply = json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":{"status":"success","data":{"largeId":"9223372036854775807"}}});
                 let mut mime = "application/json";
                 match case {
                     0 => {},
@@ -5561,4 +5562,418 @@ async fn peer_transport_tls_rejection_and_mid_body_disconnect_preserve_delivery_
     assert!(!error.definitely_not_sent());
     assert!(!error.to_string().contains("fixture-peer-only"));
     server.await.unwrap();
+}
+
+fn routing_target(name: &str, origin: String, priority: i32) -> crate::node_routing::TargetConfig {
+    let token_env = format!("SIRIUS_ROUTING_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, "node-secret");
+    crate::node_routing::TargetConfig {
+        name: name.into(),
+        origin,
+        priority,
+        token_env,
+        regional_paths: false,
+        allow_http: true,
+    }
+}
+#[tokio::test]
+async fn node_routing_public_system_uses_remote_observation_without_contaminating_local_state() {
+    let upstream = fixture(vec![Reply::version()]).await;
+    let remote = client(&upstream, config());
+    let (url, server) = peer_http_server(crate::peer::router(
+        remote,
+        "/internal/v1/peer",
+        "node-secret".into(),
+    ))
+    .await;
+    let local = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![routing_target("remote", url, 10)],
+        ..Default::default()
+    });
+    let front = client(&local, cfg);
+    let app = api::router(front.clone(), "api".into(), "internal".into());
+    let result = app
+        .oneshot(
+            Request::get("/api/v1/system")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    let value = body(result).await;
+    assert_eq!(value["status"], "available");
+    assert_eq!(value["observation"]["master_version"], "master-fixture");
+    assert!(front.observation().await.master_version.is_none());
+    assert!(front.snapshot().await.is_err());
+    assert!(local.received.lock().unwrap().is_empty());
+    assert_eq!(upstream.received.lock().unwrap().len(), 1);
+    server.abort();
+}
+#[tokio::test]
+async fn node_routing_local_account_rejection_fails_over_before_game_dispatch() {
+    let upstream = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+    let remote = client(&upstream, account_config());
+    let (url, server) = peer_http_server(crate::peer::router(
+        remote,
+        "/internal/v1/peer",
+        "node-secret".into(),
+    ))
+    .await;
+    let local = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        targets: vec![routing_target("remote", url, 10)],
+        ..Default::default()
+    });
+    let front = client(&local, cfg);
+    assert!(front
+        .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+        .await
+        .is_ok());
+    assert!(local.received.lock().unwrap().is_empty());
+    assert_eq!(upstream.received.lock().unwrap().len(), 2);
+    server.abort();
+}
+async fn routing_mock(
+    name: &'static str,
+    mode: Arc<std::sync::atomic::AtomicUsize>,
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use std::sync::atomic::Ordering;
+    peer_http_server(axum::Router::new().route("/internal/v1/peer/query",axum::routing::post(move |axum::Json(request):axum::Json<Value>| {
+        let mode=mode.clone();let seen=seen.clone();async move {
+            seen.fetch_add(1,Ordering::Relaxed);let mode=mode.load(Ordering::Relaxed);
+            if mode==4 {tokio::time::sleep(Duration::from_millis(150)).await;}
+            let outcome=match mode {
+                1=>json!({"status":"failure","kind":{"type":"transport"}}),
+                2=>json!({"status":"failure","kind":{"type":"game","grpc_status":14}}),
+                3=>json!({"status":"failure","kind":{"type":"identity_mismatch"}}),
+                _=>json!({"status":"success","data":{"node":name,"myRank":99,"myScore":88}}),
+            };
+            axum::Json(json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":outcome}))
+        }
+    }))).await
+}
+#[tokio::test]
+async fn node_routing_priorities_cooldown_single_probe_and_terminal_game_errors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(1));
+    let first_seen = Arc::new(AtomicUsize::new(0));
+    let second_seen = Arc::new(AtomicUsize::new(0));
+    let (first, a) = routing_mock("first", mode.clone(), first_seen.clone()).await;
+    let (second, b) =
+        routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![
+            routing_target("second", second, 20),
+            routing_target("first", first, 10),
+        ],
+        failure_threshold: 1,
+        cooldown_ms: 100,
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            front
+                .public_call(crate::peer::Operation::Version {})
+                .await
+                .unwrap()["node"],
+            "second"
+        );
+    }
+    assert_eq!(first_seen.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    mode.store(4, Ordering::Relaxed);
+    let copy = front.clone();
+    let probe = tokio::spawn(async move {
+        copy.public_call(crate::peer::Operation::Version {})
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while first_seen.load(Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        assert_eq!(
+            front
+                .public_call(crate::peer::Operation::Version {})
+                .await
+                .unwrap()["node"],
+            "second"
+        );
+    }
+    assert_eq!(first_seen.load(Ordering::Relaxed), 2);
+    assert_eq!(probe.await.unwrap()["node"], "first");
+    let previous = second_seen.load(Ordering::Relaxed);
+    mode.store(2, Ordering::Relaxed);
+    assert!(matches!(
+        front.public_call(crate::peer::Operation::Version {}).await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(second_seen.load(Ordering::Relaxed), previous);
+    assert_eq!(front.node_status()["targets"][0]["failures"], 0);
+    a.abort();
+    b.abort();
+}
+#[tokio::test]
+async fn node_routing_does_not_replay_ambiguous_authenticated_query_but_can_skip_incompatible_peer()
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(1));
+    let first_seen = Arc::new(AtomicUsize::new(0));
+    let second_seen = Arc::new(AtomicUsize::new(0));
+    let (first, a) = routing_mock("first", mode.clone(), first_seen).await;
+    let (second, b) =
+        routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![
+            routing_target("first", first, 0),
+            routing_target("second", second, 10),
+        ],
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    assert!(matches!(
+        front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await,
+        Err(AppError::Transport)
+    ));
+    assert_eq!(second_seen.load(Ordering::Relaxed), 0);
+    mode.store(3, Ordering::Relaxed);
+    assert_eq!(
+        front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await
+            .unwrap()["node"],
+        "second"
+    );
+    a.abort();
+    b.abort();
+}
+#[tokio::test]
+async fn node_routing_total_deadline_stops_before_next_target_and_recovers_admission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(4));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (first, a) = routing_mock("first", mode.clone(), Arc::new(AtomicUsize::new(0))).await;
+    let (second, b) = routing_mock("second", Arc::new(AtomicUsize::new(0)), seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![
+            routing_target("first", first, 0),
+            routing_target("second", second, 10),
+        ],
+        timeout_ms: 100,
+        max_inflight: 1,
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    assert!(matches!(
+        front.public_call(crate::peer::Operation::Version {}).await,
+        Err(AppError::Timeout)
+    ));
+    assert_eq!(seen.load(Ordering::Relaxed), 0);
+    mode.store(0, Ordering::Relaxed);
+    assert_eq!(
+        front
+            .public_call(crate::peer::Operation::Version {})
+            .await
+            .unwrap()["node"],
+        "first"
+    );
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
+async fn node_routing_configuration_and_admin_scope_are_enforced_at_deployment() {
+    use crate::{deployment::DeploymentConfig, node_routing, region::Region};
+    let mut cfg = regional_config(Region::Jp);
+    let target = routing_target("remote", "https://node.example.invalid".into(), 10);
+    let token_env = target.token_env.clone();
+    cfg.node_routing = Some(node_routing::Config {
+        targets: vec![target],
+        ..Default::default()
+    });
+    for bad in ["public-jp", "internal-jp", "fixture-cdn-secret"] {
+        std::env::set_var(&token_env, bad);
+        assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
+            .prepare()
+            .is_err());
+    }
+    std::env::set_var(&token_env, "node-secret");
+    let app = DeploymentConfig::Single(Box::new(cfg.clone()))
+        .prepare()
+        .unwrap()
+        .router;
+    for (token, status) in [("public-jp", 401), ("internal-jp", 200)] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/internal/v1/nodes")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        if status == 200 {
+            let value = body(response).await;
+            assert_eq!(value["targets"][0]["name"], "local");
+            assert!(!value.to_string().contains("node-secret"));
+            assert!(!value.to_string().contains("example.invalid"));
+        }
+    }
+    let mut tw = regional_config(Region::Tw);
+    tw.node_routing = cfg.node_routing.clone();
+    let deployment = crate::deployment::MultiConfig {
+        logging: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: None,
+        access_log: None,
+        regions: BTreeMap::from([("jp".into(), cfg.clone()), ("tw".into(), tw)]),
+    };
+    assert!(DeploymentConfig::Multi(Box::new(deployment))
+        .prepare()
+        .is_err());
+    let mut routing = cfg.node_routing.take().unwrap();
+    routing.targets.push(routing.targets[0].clone());
+    assert!(routing.validate(Region::Jp).is_err());
+    routing.targets.clear();
+    routing.local_priority = None;
+    assert!(routing.validate(Region::Jp).is_err());
+}
+
+#[tokio::test]
+async fn node_routing_local_priority_tie_and_incoming_peer_never_forward() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (url, server) = routing_mock("remote", Arc::new(AtomicUsize::new(0)), seen.clone()).await;
+    let local = fixture(vec![Reply::version(), Reply::version()]).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        targets: vec![routing_target("remote", url, 0)],
+        ..Default::default()
+    });
+    let front = client(&local, cfg.clone());
+    assert_eq!(
+        front
+            .public_call(crate::peer::Operation::Version {})
+            .await
+            .unwrap()["version"],
+        "master-fixture"
+    );
+    cfg.node_routing.as_mut().unwrap().targets[0].priority = -1;
+    let front = client(&local, cfg);
+    assert_eq!(
+        front
+            .public_call(crate::peer::Operation::Version {})
+            .await
+            .unwrap()["node"],
+        "remote"
+    );
+    let app = crate::peer::router(front.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(front.peer_identity().unwrap(), json!({"type":"version"}));
+    assert_eq!(peer_send(app, "peer", request).await.status(), 200);
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+    assert_eq!(local.received.lock().unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn node_routing_cancelled_request_releases_bounded_admission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(4));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (url, server) = routing_mock("remote", mode.clone(), seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        max_inflight: 1,
+        targets: vec![routing_target("remote", url, 0)],
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    let copy = front.clone();
+    let first =
+        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while seen.load(Ordering::Relaxed) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let copy = front.clone();
+    let second =
+        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+    mode.store(0, Ordering::Relaxed);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()["node"],
+        "remote"
+    );
+    assert_eq!(seen.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn node_routing_public_ranking_strips_remote_account_fields() {
+    use std::sync::atomic::AtomicUsize;
+    let (url, server) = routing_mock(
+        "remote",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![routing_target("remote", url, 0)],
+        ..Default::default()
+    });
+    let app = api::router(
+        GameClient::new(cfg).unwrap(),
+        "api".into(),
+        "internal".into(),
+    );
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/songs/1/rankings")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let data = body(response).await;
+    assert_eq!(data["node"], "remote");
+    assert!(data.get("myRank").is_none());
+    assert!(data.get("myScore").is_none());
+    server.abort();
 }

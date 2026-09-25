@@ -5,6 +5,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub node_routing: Option<crate::node_routing::Config>,
     /// Independent read-only node credential; absent disables peer HTTP routes.
     #[serde(default)]
     pub peer_token_env: Option<String>,
@@ -181,6 +183,9 @@ impl Config {
             return Err(AppError::Config(
                 "peer token must have an independent environment reference",
             ));
+        }
+        if let Some(routing) = &self.node_routing {
+            routing.validate(self.region)?;
         }
         if let Some(dispatch) = &self.asset_dispatch {
             dispatch.validate()?;

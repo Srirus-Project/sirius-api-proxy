@@ -113,6 +113,7 @@ pub struct Reply {
     pub request_id: String,
     pub identity: Identity,
     pub outcome: Outcome,
+    pub observation: crate::client::Observation,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -126,6 +127,7 @@ pub enum Failure {
     IdentityMismatch {},
     UnsupportedOperation {},
     AccountUnavailable {},
+    UnavailableBeforeDispatch {},
     Timeout {},
     Transport {},
     Protocol {},
@@ -135,6 +137,7 @@ impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
         match error {
             AppError::UnsupportedRegionOperation => Self::UnsupportedOperation {},
+            AppError::PeerAccountUnavailable => Self::UnavailableBeforeDispatch {},
             AppError::AccountUnavailable => Self::AccountUnavailable {},
             AppError::Timeout => Self::Timeout {},
             AppError::Transport | AppError::Proxy => Self::Transport {},
@@ -196,6 +199,7 @@ async fn query(
             request_id: request.request_id,
             identity: request.identity,
             outcome,
+            observation: client.observation().await,
         }),
     ))
 }

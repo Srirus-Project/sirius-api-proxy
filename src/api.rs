@@ -1,9 +1,7 @@
 use crate::{
-    client::{
-        GameClient, ANNOUNCEMENT, ANNOUNCEMENTS, CHALLENGE_RANKING, EVENT_DECK, EVENT_RANKING,
-        MUSIC_RANKING, PLAYER_DATA, PROFILE, VERSION, WHOAMI,
-    },
+    client::{GameClient, PLAYER_DATA, WHOAMI},
     error::AppError,
+    peer::Operation,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -76,6 +74,7 @@ pub fn router_at(
             authorize,
         ));
     let internal = Router::new()
+        .route("/nodes", get(nodes))
         .route("/protocol", get(protocol_status))
         .route("/protocol/reload", post(protocol_reload))
         .route("/resources/snapshot", get(snapshot))
@@ -96,6 +95,9 @@ pub fn router_at(
         .with_state(client)
 }
 
+async fn nodes(State(c): State<Arc<GameClient>>) -> Json<Value> {
+    Json(c.node_status())
+}
 async fn protocol_status(
     State(c): State<Arc<GameClient>>,
 ) -> Result<Json<crate::protocol::ProtocolStatus>, AppError> {
@@ -145,17 +147,16 @@ async fn regions(State(c): State<Arc<GameClient>>) -> Json<Value> {
     Json(json!({"selected":c.region(),"regions":regions}))
 }
 async fn servers(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
-    c.call(crate::routes::SERVER_LIST, json!({}))
-        .await
-        .map(Json)
+    c.public_call(Operation::Servers {}).await.map(Json)
 }
 async fn system(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppError> {
-    match c.call(VERSION, json!({})).await {
+    let execution = c.public_query(Operation::Version {}).await;
+    match execution.result {
         Ok(_) => Ok(Json(
-            json!({"status":"available","region":c.region(),"area_id":c.region().area_id(),"platform":c.platform(),"protocol_family":c.region().family(),"supported_rpcs":c.supported_routes(),"observation":c.observation().await}),
+            json!({"status":"available","region":c.region(),"area_id":c.region().area_id(),"platform":c.platform(),"protocol_family":c.region().family(),"supported_rpcs":c.supported_routes(),"observation":execution.observation}),
         )),
         Err(AppError::Grpc(_)) => Ok(Json(
-            json!({"status":"unavailable","region":c.region(),"platform":c.platform(),"observation":c.observation().await}),
+            json!({"status":"unavailable","region":c.region(),"platform":c.platform(),"observation":execution.observation}),
         )),
         Err(e) => Err(e),
     }
@@ -173,7 +174,7 @@ async fn announcements(
     if !(0..=2).contains(&q.tab) {
         return Err(AppError::InvalidRequest);
     }
-    c.call(ANNOUNCEMENTS, json!({"selectedTab":q.tab}))
+    c.public_call(Operation::Announcements { tab: q.tab })
         .await
         .map(Json)
 }
@@ -184,7 +185,7 @@ async fn announcement(
     if id <= 0 {
         return Err(AppError::InvalidRequest);
     }
-    c.call(ANNOUNCEMENT, json!({"id":id.to_string()}))
+    c.public_call(Operation::Announcement { id })
         .await
         .map(Json)
 }
@@ -195,7 +196,7 @@ async fn profile(
     if id <= 0 {
         return Err(AppError::InvalidRequest);
     }
-    c.call(PROFILE, json!({"playerProfileId":id.to_string()}))
+    c.public_call(Operation::Profile { profile_id: id })
         .await
         .map(Json)
 }
@@ -269,10 +270,10 @@ async fn event_ranking(
         return Err(AppError::InvalidRequest);
     }
     let ranks = parse_ranks(&q.ranks)?;
-    c.call(
-        EVENT_RANKING,
-        json!({"eventId":id.to_string(),"ranks":ranks}),
-    )
+    c.public_call(Operation::EventRanking {
+        event_id: id,
+        ranks,
+    })
     .await
     .map(Json)
 }
@@ -289,23 +290,22 @@ async fn event_deck(
     {
         return Err(AppError::InvalidRequest);
     }
-    c.call(
-        EVENT_DECK,
-        json!({"eventId":id.to_string(),"playerId":player}),
-    )
+    c.public_call(Operation::EventDeck {
+        event_id: id,
+        player_id: player,
+    })
     .await
     .map(Json)
 }
 async fn public_ranking(
     c: Arc<GameClient>,
     id: i64,
-    route: &str,
-    key: &str,
+    operation: Operation,
 ) -> Result<Json<Value>, AppError> {
     if id <= 0 {
         return Err(AppError::InvalidRequest);
     }
-    let mut response = c.call(route, json!({key:id.to_string()})).await?;
+    let mut response = c.public_call(operation).await?;
     // These fields describe the shared service account, not the queried player.
     if let Some(object) = response.as_object_mut() {
         object.remove("myRank");
@@ -317,11 +317,18 @@ async fn music_ranking(
     State(c): State<Arc<GameClient>>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    public_ranking(c, id, MUSIC_RANKING, "musicId").await
+    public_ranking(c, id, Operation::MusicRanking { music_id: id }).await
 }
 async fn challenge_ranking(
     State(c): State<Arc<GameClient>>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    public_ranking(c, id, CHALLENGE_RANKING, "challengeMusicId").await
+    public_ranking(
+        c,
+        id,
+        Operation::ChallengeRanking {
+            challenge_music_id: id,
+        },
+    )
+    .await
 }

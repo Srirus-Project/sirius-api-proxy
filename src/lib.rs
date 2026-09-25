@@ -40,3 +40,5 @@ pub mod asset_dispatch;
 pub mod peer;
 
 pub mod peer_transport;
+
+pub mod node_routing;

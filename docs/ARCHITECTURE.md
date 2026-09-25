@@ -7,6 +7,7 @@ Authenticated queries first establish the Master version; anonymous RPCs omit ac
 
 - `src/api.rs`: public queries and internal state/account routes.
 - `src/peer.rs`: separately authorized, local-only node query contract.
+- `src/node_routing.rs`, `src/peer_transport.rs`: public query priorities, passive health and bounded peer calls.
 - `src/deployment.rs`, `src/accounts.rs`: region assembly, account selection and credential reload.
 - `src/response_cache.rs`: bounded memory/Redis cache with opt-in stale refresh.
 - `src/asset_dispatch.rs`, `src/asset_outbox.rs`: durable updater dispatch and recovery.

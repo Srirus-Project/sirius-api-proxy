@@ -191,6 +191,46 @@ impl DeploymentConfig {
                 }
             }
         }
+        let mut outgoing = Vec::new();
+        for c in &configs {
+            if let Some(routing) = &c.node_routing {
+                for target in &routing.targets {
+                    let token = secret(&target.token_env)?;
+                    if tokens
+                        .iter()
+                        .any(|(public, internal)| token == *public || token == *internal)
+                        || configs.iter().zip(&peer_tokens).any(|(other, peer)| {
+                            other.region != c.region && peer.as_ref() == Some(&token)
+                        })
+                        || outgoing
+                            .iter()
+                            .any(|(region, value)| *region != c.region && value == &token)
+                        || configs.iter().any(|other| {
+                            other
+                                .cdn_credential_env
+                                .values()
+                                .chain(other.player_credential_env.iter())
+                                .chain(
+                                    other
+                                        .accounts
+                                        .iter()
+                                        .filter_map(|a| a.credential_env.as_ref()),
+                                )
+                                .chain(
+                                    other
+                                        .asset_dispatch
+                                        .iter()
+                                        .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
+                                )
+                                .any(|name| std::env::var(name).is_ok_and(|value| value == token))
+                        })
+                    {
+                        return Err(AppError::Config("outgoing peer tokens must be region scoped and distinct from administrative/game/CDN/updater credentials").into());
+                    }
+                    outgoing.push((c.region, token));
+                }
+            }
+        }
         let mut router = api::health_router();
         let mut updaters = Vec::new();
         let mut asset_dispatchers = Vec::new();

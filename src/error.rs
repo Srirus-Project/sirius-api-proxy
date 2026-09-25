@@ -7,6 +7,10 @@ use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("no node is currently available")]
+    NodeUnavailable,
+    #[error("local account unavailable before dispatch")]
+    PeerAccountUnavailable,
     #[error("peer protocol identity changed before dispatch")]
     PeerIdentityMismatch,
     #[error("operation is not supported by the verified protocol for this region")]
@@ -47,7 +51,9 @@ impl IntoResponse for AppError {
             Self::ProtocolDefinition => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::AccountUnavailable
+            Self::NodeUnavailable
+            | Self::PeerAccountUnavailable
+            | Self::AccountUnavailable
             | Self::SnapshotUnavailable
             | Self::MasterUnavailable
             | Self::Grpc(14) => StatusCode::SERVICE_UNAVAILABLE,

@@ -102,3 +102,13 @@ response_cache:
 #       require_full_catalog: true
 #       require_full_export: true
 #       require_publication: true
+
+# Optional local/remote public-query routing; see docs/NODE_ROUTING.md.
+# node_routing:
+#   local_priority: 0
+#   targets:
+#     - name: secondary
+#       origin: https://secondary.example.invalid
+#       token_env: SIRIUS_JP_SECONDARY_PEER_TOKEN
+#       priority: 10
+#       regional_paths: true
