@@ -4298,6 +4298,7 @@ async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
                  headers: HeaderMap,
                  body: axum::body::Bytes| async move {
                     assert_eq!(headers["authorization"], "Bearer fixture-updater-only");
+                    assert_eq!(headers["user-agent"], "SiriusClient/test");
                     assert!(!headers.contains_key("proxy-authorization"));
                     if method == axum::http::Method::POST {
                         assert_eq!(headers["idempotency-key"], "key-1");
@@ -4321,7 +4322,16 @@ async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let root = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = Client::new(&root, "fixture-updater-only", true, 200).unwrap();
+    for value in ["", "  ", "bad\r\nvalue", "客户", &"x".repeat(257)] {
+        assert!(Client::new(&root, "fixture-updater-only", true, 200)
+            .unwrap()
+            .with_user_agent(Some(value))
+            .is_err());
+    }
+    let client = Client::new(&root, "fixture-updater-only", true, 200)
+        .unwrap()
+        .with_user_agent(Some("SiriusClient/test"))
+        .unwrap();
     let job = client.submit(&request, "key-1").await.unwrap();
     assert_eq!(job.id, id);
     assert_eq!(job.status, Status::Queued);
@@ -4567,6 +4577,7 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     )));
     let app=Router::new().route("/{*path}",any(|State(state):State<RemoteState>,method:axum::http::Method,headers:HeaderMap,body:axum::body::Bytes|async move{
         assert_eq!(headers["authorization"],"Bearer dispatch-only-token");
+        assert_eq!(headers["user-agent"], "SiriusClient/dispatch");
         let mut state=state.lock().unwrap();
         if method==axum::http::Method::POST {
             state.1+=1;
@@ -4598,6 +4609,7 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
         request_timeout_ms: 1000,
         history_capacity: 100,
         targets: vec![Target {
+            user_agent: Some("SiriusClient/dispatch".into()),
             origin,
             token_env: token.clone(),
             allow_http: true,

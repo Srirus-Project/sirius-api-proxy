@@ -77,6 +77,7 @@ pub struct Client {
     http: reqwest::Client,
     root: Url,
     authorization: header::HeaderValue,
+    user_agent: Option<header::HeaderValue>,
 }
 impl Client {
     /// Credentials are scoped to this exact configured origin, with no redirects or ambient proxies.
@@ -111,7 +112,22 @@ impl Client {
             http,
             root,
             authorization,
+            user_agent: None,
         })
+    }
+    pub fn with_user_agent(mut self, value: Option<&str>) -> Result<Self, Error> {
+        self.user_agent = value
+            .map(|v| {
+                if v.trim().is_empty()
+                    || v.len() > 256
+                    || !v.bytes().all(|b| (32..=126).contains(&b))
+                {
+                    return Err(Error::Config);
+                }
+                header::HeaderValue::from_str(v).map_err(|_| Error::Config)
+            })
+            .transpose()?;
+        Ok(self)
     }
     pub async fn submit(&self, request: &Request, key: &str) -> Result<Job, Error> {
         validate_request(request)?;
@@ -162,6 +178,11 @@ impl Client {
         expected: StatusCode,
         request: &Request,
     ) -> Result<Job, Error> {
+        let builder = if let Some(agent) = &self.user_agent {
+            builder.header(header::USER_AGENT, agent.clone())
+        } else {
+            builder
+        };
         let mut response = builder
             .header(header::AUTHORIZATION, self.authorization.clone())
             .send()

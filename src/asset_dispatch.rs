@@ -26,6 +26,8 @@ pub struct Target {
     pub origin: String,
     pub token_env: String,
     #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
     pub allow_http: bool,
     pub profile: String,
     pub profile_revision: String,
@@ -63,6 +65,7 @@ impl Config {
                 target.allow_http,
                 self.request_timeout_ms,
             )
+            .and_then(|client| client.with_user_agent(target.user_agent.as_deref()))
             .map_err(|_| AppError::Config("invalid asset dispatch transport"))?;
             identity(
                 target,
@@ -148,7 +151,8 @@ impl Worker {
                     &token,
                     target.allow_http,
                     cfg.request_timeout_ms,
-                )?,
+                )?
+                .with_user_agent(target.user_agent.as_deref())?,
                 config: target.clone(),
             });
         }

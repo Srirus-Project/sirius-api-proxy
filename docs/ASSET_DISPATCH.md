@@ -42,6 +42,8 @@ asset_dispatch:
   targets:
     - origin: https://asset-updater.example.com
       token_env: SIRIUS_ASSET_UPDATER_TOKEN
+      # Optional when the updater requires a client User-Agent prefix.
+      user_agent: SiriusClient/api-proxy
       allow_http: false
       profile: jp-full
       profile_revision: "1"
@@ -141,3 +143,10 @@ state ledger. The online endpoint returns 503 once the worker has stopped; it do
 a worker or erase its failure state.
 
 Full production acceptance, completion notifications and the 1.2.0 release remain pending.
+
+Targets may set `user_agent` to 1–256 printable ASCII characters (not whitespace-only).
+It is sent on both job submissions and polling, including after restart, and supports the
+updater's optional `user_agent_prefix` filter. Bearer credentials remain independently required.
+Omitting the field preserves the existing transport behavior. It identifies the client, not
+a secret; do not place credentials in it. Changing it does not change durable job identity
+or create a second submission of the same catalog.
