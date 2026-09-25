@@ -9905,3 +9905,192 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 503);
 }
+
+#[tokio::test]
+async fn master_database_migration_verifies_committed_chain_before_connection() {
+    use crate::{master, master_database as db, master_registry as registry};
+    let cfg = master_database_config();
+    let (_root, input, source, _) = registry_fixture();
+    let first = registry::current_snapshot(&source).unwrap();
+    let (_, decoder, _) = master_fixture();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let head = registry::current_snapshot(&source).unwrap();
+    // A valid but uncommitted directory must not be discovered by scanning.
+    master::import_directory(&input, &source, &decoder).unwrap();
+    std::fs::write(source.join("CURRENT"), &head).unwrap();
+    let chain = registry::committed_history(&source, registry_scope()).unwrap();
+    assert_eq!(chain.entries.len(), 2);
+    assert_eq!(chain.entries[0].snapshot, head);
+    assert_eq!(chain.entries[1].snapshot, first);
+    // A corrupt historical table is rejected even though CURRENT itself is valid.
+    std::fs::write(source.join(&first).join("MasterFixture.json"), b"{}").unwrap();
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, registry_scope()).await,
+        Err(db::Error::Snapshot)
+    ));
+    // Cycles fail closed rather than silently truncating the migration.
+    let publication = source.join(&head).join("publication.json");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+    record["previous_snapshot"] = json!(head);
+    std::fs::write(&publication, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(registry::committed_history(&source, registry_scope()).is_err());
+    // A legacy head remains an explicit boundary, not a guessed directory chronology.
+    std::fs::remove_file(&publication).unwrap();
+    let chain = registry::committed_history(&source, registry_scope()).unwrap();
+    assert!(chain.legacy_boundary);
+    assert_eq!(chain.entries.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_migration_atomic_order_retention_replay_and_conflict() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master, master_database as db, master_registry as registry};
+    use sqlx::{Connection, Row};
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut scope = registry_scope();
+    scope.environment = format!("migration-{}", uuid::Uuid::new_v4().simple());
+    let key = serde_json::to_string(&scope).unwrap();
+    let (_root, input, source, _) = registry_fixture();
+    let (mut manifest, decoder, _) = master_fixture();
+    for version in ["second", "second", "third"] {
+        manifest.version = version.into();
+        std::fs::write(
+            input.join("MasterManifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        master::import_directory(&input, &source, &decoder).unwrap();
+    }
+    let chain = registry::committed_history(&source, scope.clone()).unwrap();
+    assert_eq!(chain.entries.len(), 4);
+    let head = chain.head.clone();
+    // Establish schema and a populated unrelated scope; migration must not overwrite it.
+    let mut other = scope.clone();
+    other.environment.push_str("-other");
+    let other_receipt = db::publish(&cfg, &source, other.clone()).await.unwrap();
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, other.clone()).await,
+        Err(db::Error::Integrity)
+    ));
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    // The refused migration rolled back its DDL. Create the receipt table via a valid
+    // independent migration before injecting a failure in the final transaction write.
+    let mut schema_scope = scope.clone();
+    schema_scope.environment.push_str("-schema");
+    db::migrate_history(&cfg, &source, schema_scope)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.sirius_master_migrations ADD CONSTRAINT sirius_migration_fixture_reject CHECK (publications < 0) NOT VALID")
+        .execute(&mut conn).await.unwrap();
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Database)
+    ));
+    sqlx::query("ALTER TABLE public.sirius_master_migrations DROP CONSTRAINT sirius_migration_fixture_reject")
+        .execute(&mut conn).await.unwrap();
+    for query in [
+        "SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1",
+        "SELECT COUNT(*) FROM public.sirius_master_documents WHERE scope=$1",
+        "SELECT COUNT(*) FROM public.sirius_master_current WHERE scope=$1",
+        "SELECT COUNT(*) FROM public.sirius_master_history WHERE scope=$1",
+        "SELECT COUNT(*) FROM public.sirius_master_migrations WHERE scope=$1",
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(&key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "partial migration: {query}");
+    }
+    let mut lock = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7369726975731200)")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        db::migrate_history(&cfg, &source, scope.clone())
+    )
+    .await
+    .is_err());
+    lock.rollback().await.unwrap();
+    let (a, b) = tokio::join!(
+        db::migrate_history(&cfg, &source, scope.clone()),
+        db::migrate_history(&cfg, &source, scope.clone())
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.changed, b.changed);
+    assert_eq!(a.source_sha256, b.source_sha256);
+    assert_eq!(a.publications, 4);
+    let rows = sqlx::query("SELECT content_hash,published_at::text AS at FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
+        .bind(&key).fetch_all(&mut conn).await.unwrap();
+    assert_eq!(rows.len(), 4);
+    for (row, entry) in rows.iter().zip(&chain.entries) {
+        assert_eq!(row.get::<String, _>("content_hash"), entry.content_sha256);
+        let at: String = row.get("at");
+        let parsed = chrono::DateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S%.f%#z").unwrap();
+        assert_eq!(
+            parsed.timestamp_micros(),
+            entry.published_at.unwrap().timestamp_micros()
+        );
+    }
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
+            .bind(&key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
+    let reader = db::Reader::new(&cfg).unwrap();
+    let page = reader.history(&scope, 20, None).await.unwrap();
+    assert_eq!(page.entries.iter().filter(|e| e.retained).count(), 3);
+    assert_eq!(registry::current_snapshot(&source).unwrap(), head);
+    // A later normal publication advances CURRENT. Replaying the old migration receipt
+    // must acknowledge it without rewinding that newer database state.
+    manifest.version = "after-migration".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let later = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Integrity)
+    ));
+    std::fs::write(source.join("CURRENT"), &head).unwrap();
+    assert!(
+        !db::migrate_history(&cfg, &source, scope.clone())
+            .await
+            .unwrap()
+            .changed
+    );
+    let current: String =
+        sqlx::query_scalar("SELECT content_hash FROM public.sirius_master_current WHERE scope=$1")
+            .bind(&key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(current, later.content_sha256);
+    let other_doc = reader.document(&other, None, None).await.unwrap();
+    let other_manifest: registry::PublishedManifest =
+        serde_json::from_slice(&other_doc.bytes).unwrap();
+    assert_eq!(other_manifest.content_sha256, other_receipt.content_sha256);
+    assert_eq!(
+        reader
+            .history(&scope, 20, None)
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        5
+    );
+}

@@ -381,6 +381,24 @@ pub fn history_page(
     if !(1..=100).contains(&limit) {
         return Err(MasterError::Limit);
     }
+    history_page_inner(root, scope, limit, before)
+}
+
+/// Traverse only the chain pinned by CURRENT; never include uncommitted directories.
+pub(crate) fn committed_history(root: &Path, scope: Scope) -> Result<History, MasterError> {
+    let history = history_page_inner(root, scope, 10_000, None)?;
+    if history.has_more {
+        return Err(MasterError::Limit);
+    }
+    Ok(history)
+}
+
+fn history_page_inner(
+    root: &Path,
+    scope: Scope,
+    limit: usize,
+    before: Option<&str>,
+) -> Result<History, MasterError> {
     if before.is_some_and(|v| !valid_history_cursor(v)) {
         return Err(MasterError::Format);
     }

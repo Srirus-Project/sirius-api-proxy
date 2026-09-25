@@ -25,9 +25,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("sirius-api-proxy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if args.first().is_some_and(|a| a == "master-db-import") {
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.as_str(), "master-db-import" | "master-db-migrate"))
+    {
         if args.len() != 2 {
-            return Err("usage: sirius-api-proxy master-db-import DATABASE_CONFIG".into());
+            return Err(
+                "usage: sirius-api-proxy master-db-import|master-db-migrate DATABASE_CONFIG".into(),
+            );
         }
         use std::io::Read;
         let mut bytes = Vec::new();
@@ -41,12 +46,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let import: sirius_api_proxy::master_database::Import =
             yaml_serde::from_slice(&bytes).map_err(|_| "invalid database configuration")?;
-        let receipt = sirius_api_proxy::master_database::publish(
-            &import.database,
-            &import.source,
-            import.scope,
-        )
-        .await?;
+        let receipt = if args[0] == "master-db-migrate" {
+            serde_json::to_value(
+                sirius_api_proxy::master_database::migrate_history(
+                    &import.database,
+                    &import.source,
+                    import.scope,
+                )
+                .await?,
+            )?
+        } else {
+            serde_json::to_value(
+                sirius_api_proxy::master_database::publish(
+                    &import.database,
+                    &import.source,
+                    import.scope,
+                )
+                .await?,
+            )?
+        };
         println!("{}", serde_json::to_string(&receipt)?);
         return Ok(());
     }

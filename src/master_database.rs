@@ -146,7 +146,10 @@ struct Snapshot {
     tables: Vec<(registry::File, Vec<u8>, serde_json::Value)>,
 }
 fn verified(source: &Path, scope: Scope) -> Result<Snapshot, Error> {
-    let document = registry::manifest(source, None, scope.clone()).map_err(|_| Error::Snapshot)?;
+    verified_snapshot(source, scope, None)
+}
+fn verified_snapshot(source: &Path, scope: Scope, id: Option<&str>) -> Result<Snapshot, Error> {
+    let document = registry::manifest(source, id, scope.clone()).map_err(|_| Error::Snapshot)?;
     let manifest: PublishedManifest =
         serde_json::from_slice(&document.bytes).map_err(|_| Error::Snapshot)?;
     manifest.validate(&scope).map_err(|_| Error::Snapshot)?;
@@ -225,12 +228,23 @@ async fn publish_snapshot(
         .execute(&mut *tx)
         .await
         .map_err(|_| Error::Database)?;
+    let receipt = store_snapshot(&mut tx, keep, snapshot, None).await?;
+    tx.commit().await.map_err(|_| Error::Database)?;
+    Ok(receipt)
+}
+
+async fn store_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    keep: usize,
+    snapshot: Snapshot,
+    publication: Option<Option<String>>,
+) -> Result<Receipt, Error> {
     let scope = serde_json::to_string(&snapshot.manifest.scope).map_err(|_| Error::Snapshot)?;
     let hash = &snapshot.manifest.content_sha256;
     let current: Option<String> =
         sqlx::query_scalar("SELECT content_hash FROM public.sirius_master_current WHERE scope=$1")
             .bind(&scope)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|_| Error::Database)?;
     let existing: Option<Vec<u8>> = sqlx::query_scalar(
@@ -238,7 +252,7 @@ async fn publish_snapshot(
     )
     .bind(&scope)
     .bind(hash)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|_| Error::Database)?;
     if let Some(bytes) = existing {
@@ -251,7 +265,7 @@ async fn publish_snapshot(
             return Err(Error::Integrity);
         }
         let rows = sqlx::query("SELECT name,sha256,bytes,document FROM public.sirius_master_documents WHERE scope=$1 AND content_hash=$2 ORDER BY name")
-            .bind(&scope).bind(hash).fetch_all(&mut *tx).await.map_err(|_| Error::Database)?;
+            .bind(&scope).bind(hash).fetch_all(&mut **tx).await.map_err(|_| Error::Database)?;
         if rows.len() != snapshot.tables.len() {
             return Err(Error::Integrity);
         }
@@ -266,31 +280,175 @@ async fn publish_snapshot(
         }
     } else {
         sqlx::query("INSERT INTO public.sirius_master_snapshots(scope,content_hash,manifest,touched) VALUES($1,$2,$3,0)")
-            .bind(&scope).bind(hash).bind(&snapshot.manifest_bytes).execute(&mut *tx).await.map_err(|_| Error::Database)?;
+            .bind(&scope).bind(hash).bind(&snapshot.manifest_bytes).execute(&mut **tx).await.map_err(|_| Error::Database)?;
         for (file, bytes, value) in &snapshot.tables {
             sqlx::query("INSERT INTO public.sirius_master_documents(scope,content_hash,name,sha256,bytes,document) VALUES($1,$2,$3,$4,$5,$6)")
                 .bind(&scope).bind(hash).bind(&file.name).bind(&file.sha256).bind(bytes).bind(value)
-                .execute(&mut *tx).await.map_err(|_| Error::Database)?;
+                .execute(&mut **tx).await.map_err(|_| Error::Database)?;
         }
     }
-    let changed = current.as_ref() != Some(hash);
+    let changed = publication.is_some() || current.as_ref() != Some(hash);
     if changed {
-        let sequence: i64 = sqlx::query_scalar("INSERT INTO public.sirius_master_history(scope,content_hash) VALUES($1,$2) RETURNING id")
-            .bind(&scope).bind(hash).fetch_one(&mut *tx).await.map_err(|_| Error::Database)?;
+        let sequence: i64 = sqlx::query_scalar("INSERT INTO public.sirius_master_history(scope,content_hash,published_at) VALUES($1,$2,COALESCE($3::text::timestamptz,CURRENT_TIMESTAMP)) RETURNING id")
+            .bind(&scope).bind(hash).bind(publication.flatten()).fetch_one(&mut **tx).await.map_err(|_| Error::Database)?;
         sqlx::query("UPDATE public.sirius_master_snapshots SET touched=$3 WHERE scope=$1 AND content_hash=$2")
-            .bind(&scope).bind(hash).bind(sequence).execute(&mut *tx).await.map_err(|_| Error::Database)?;
+            .bind(&scope).bind(hash).bind(sequence).execute(&mut **tx).await.map_err(|_| Error::Database)?;
         sqlx::query("INSERT INTO public.sirius_master_current(scope,content_hash) VALUES($1,$2) ON CONFLICT(scope) DO UPDATE SET content_hash=EXCLUDED.content_hash")
-            .bind(&scope).bind(hash).execute(&mut *tx).await.map_err(|_| Error::Database)?;
+            .bind(&scope).bind(hash).execute(&mut **tx).await.map_err(|_| Error::Database)?;
     }
     sqlx::query("DELETE FROM public.sirius_master_snapshots WHERE scope=$1 AND content_hash<>$2 AND content_hash NOT IN (SELECT content_hash FROM public.sirius_master_snapshots WHERE scope=$1 ORDER BY touched DESC,content_hash LIMIT $3)")
-        .bind(&scope).bind(hash).bind(keep as i64).execute(&mut *tx).await.map_err(|_| Error::Database)?;
-    tx.commit().await.map_err(|_| Error::Database)?;
+        .bind(&scope).bind(hash).bind(keep as i64).execute(&mut **tx).await.map_err(|_| Error::Database)?;
     Ok(Receipt {
         content_sha256: hash.clone(),
         tables: snapshot.tables.len(),
         bytes: snapshot.tables.iter().map(|(f, _, _)| f.size).sum(),
         changed,
     })
+}
+
+/// One-time migration of committed file publications into an empty database scope.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MigrationReceipt {
+    pub head: String,
+    pub source_sha256: String,
+    pub publications: usize,
+    pub legacy_boundary: bool,
+    pub changed: bool,
+}
+const MIGRATION_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS public.sirius_master_migrations (
+ scope TEXT PRIMARY KEY, source_hash TEXT NOT NULL, head TEXT NOT NULL,
+ publications BIGINT NOT NULL, legacy_boundary BOOLEAN NOT NULL);
+";
+
+pub async fn migrate_history(
+    config: &Config,
+    source: &Path,
+    scope: Scope,
+) -> Result<MigrationReceipt, Error> {
+    config.validate()?;
+    let root = source.to_owned();
+    let expected_scope = scope.clone();
+    // Verify each source payload before opening a connection, retaining one snapshot
+    // at a time. CURRENT is read once; subsequent installations cannot change the plan.
+    let history = tokio::task::spawn_blocking(move || {
+        let history = registry::committed_history(&root, expected_scope.clone())
+            .map_err(|_| Error::Snapshot)?;
+        for entry in &history.entries {
+            let snapshot = verified_snapshot(&root, expected_scope.clone(), Some(&entry.snapshot))?;
+            if snapshot.manifest.content_sha256 != entry.content_sha256 {
+                return Err(Error::Snapshot);
+            }
+        }
+        Ok::<_, Error>(history)
+    })
+    .await
+    .map_err(|_| Error::Snapshot)??;
+    let source_sha256 =
+        registry::digest(&serde_json::to_vec(&history).map_err(|_| Error::Snapshot)?);
+    let options = config.options()?;
+    let duration = Duration::from_secs(config.timeout_seconds);
+    tokio::time::timeout(duration, async {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(duration)
+            .connect_with(options)
+            .await
+            .map_err(|_| Error::Database)?;
+        let result =
+            migrate_transaction(&pool, config.keep_snapshots, source, history, source_sha256).await;
+        pool.close().await;
+        result
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
+}
+
+async fn migrate_transaction(
+    pool: &PgPool,
+    keep: usize,
+    source: &Path,
+    history: registry::History,
+    source_sha256: String,
+) -> Result<MigrationReceipt, Error> {
+    let mut tx = pool.begin().await.map_err(|_| Error::Database)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(7369726975731200)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| Error::Database)?;
+    sqlx::raw_sql(SCHEMA)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| Error::Database)?;
+    sqlx::raw_sql(MIGRATION_SCHEMA)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| Error::Database)?;
+    let scope = serde_json::to_string(&history.scope).map_err(|_| Error::Snapshot)?;
+    let saved = sqlx::query("SELECT source_hash,head,publications,legacy_boundary FROM public.sirius_master_migrations WHERE scope=$1")
+        .bind(&scope).fetch_optional(&mut *tx).await.map_err(|_| Error::Database)?;
+    let mut receipt = MigrationReceipt {
+        head: history.head.clone(),
+        source_sha256,
+        publications: history.entries.len(),
+        legacy_boundary: history.legacy_boundary,
+        changed: false,
+    };
+    if let Some(row) = saved {
+        if row
+            .try_get::<String, _>("source_hash")
+            .map_err(|_| Error::Database)?
+            != receipt.source_sha256
+            || row
+                .try_get::<String, _>("head")
+                .map_err(|_| Error::Database)?
+                != receipt.head
+            || row
+                .try_get::<i64, _>("publications")
+                .map_err(|_| Error::Database)?
+                != receipt.publications as i64
+            || row
+                .try_get::<bool, _>("legacy_boundary")
+                .map_err(|_| Error::Database)?
+                != receipt.legacy_boundary
+        {
+            return Err(Error::Integrity);
+        }
+        // A durable receipt acknowledges the original migration even after later
+        // publications or retention. Retrying must never rewind the current pointer.
+        tx.commit().await.map_err(|_| Error::Database)?;
+        return Ok(receipt);
+    }
+    let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM public.sirius_master_snapshots WHERE scope=$1 UNION ALL SELECT 1 FROM public.sirius_master_current WHERE scope=$1 UNION ALL SELECT 1 FROM public.sirius_master_history WHERE scope=$1)")
+        .bind(&scope).fetch_one(&mut *tx).await.map_err(|_| Error::Database)?;
+    if occupied {
+        return Err(Error::Integrity);
+    }
+    for entry in history.entries.into_iter().rev() {
+        let root = source.to_owned();
+        let scope = history.scope.clone();
+        let id = entry.snapshot;
+        let snapshot =
+            tokio::task::spawn_blocking(move || verified_snapshot(&root, scope, Some(&id)))
+                .await
+                .map_err(|_| Error::Snapshot)??;
+        if snapshot.manifest.content_sha256 != entry.content_sha256 {
+            return Err(Error::Snapshot);
+        }
+        store_snapshot(
+            &mut tx,
+            keep,
+            snapshot,
+            Some(entry.published_at.map(|t| t.to_rfc3339())),
+        )
+        .await?;
+    }
+    sqlx::query("INSERT INTO public.sirius_master_migrations(scope,source_hash,head,publications,legacy_boundary) VALUES($1,$2,$3,$4,$5)")
+        .bind(&scope).bind(&receipt.source_sha256).bind(&receipt.head).bind(receipt.publications as i64)
+        .bind(receipt.legacy_boundary).execute(&mut *tx).await.map_err(|_| Error::Database)?;
+    tx.commit().await.map_err(|_| Error::Database)?;
+    receipt.changed = true;
+    Ok(receipt)
 }
 
 /// Shared bounded read pool. Construction performs no network I/O.

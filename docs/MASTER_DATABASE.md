@@ -86,7 +86,7 @@ notification and Git credentials in every deployment profile. Profiles may share
 credentials deliberately; rows remain scoped by region/environment/platform. Global Master
 publication remains unsupported. Other service functions do not require the database to be up.
 
-Committed file-history migration and a standalone registry service remain separate pending work.
+A standalone registry service remains separate pending work.
 Only PostgreSQL is implemented; no database fallback occurs.
 
 The optional test `master_database_postgres_atomic_history_retention_integrity_and_retry` requires
@@ -142,3 +142,44 @@ The optional `master_database_read_http_integrity_retention_history_and_scope` t
 PostgreSQL through the actual HTTP router. It covers pinned bytes without local CURRENT,
 conditional reads, pruning/history pagination across new publication, scope isolation, corrupt
 and oversized rows, and database outage without local fallback.
+
+## One-time committed file-history migration
+
+Run `sirius-api-proxy master-db-migrate DATABASE_CONFIG` with the same private configuration
+as `master-db-import`. Stop or leave disabled the background database publisher until migration
+completes. The selected database scope must be empty: existing snapshots, current pointers or
+history cause refusal, including a scope previously populated by `master-db-import`. Other
+scopes are untouched. This command does not merge databases or overwrite existing publications.
+
+The migration pins local CURRENT and follows its predecessor chain, oldest first, up to 10000
+committed snapshots. It never discovers staging/orphan directories by scanning. Every historical
+table is verified before connecting, and each snapshot is verified again as it is written. Only
+one decoded snapshot is held at a time; local files and CURRENT remain unchanged. New local
+installations after the plan is pinned belong to a later normal publication. Missing or corrupt
+history and cycles fail closed. A legacy snapshot without a publication record ends the chain;
+`legacy_boundary: true` reports that older chronology is unknown.
+
+Schema initialization, all events and documents, retention, current and a durable migration
+receipt commit in one transaction. Original publication times are preserved to PostgreSQL's
+microsecond precision; the legacy boundary's unknown time uses the migration transaction time.
+Repeated consecutive content still preserves each committed file publication as an event.
+`keep_snapshots` retains the most recently published distinct content hashes, while every event
+remains. The additional `public.sirius_master_migrations` table stores the scoped source-plan
+hash, head, publication count and legacy-boundary flag. It contains no credentials or paths.
+
+Retrying the same source plan returns `changed: false` without duplicating events or rewinding
+subsequent database publications. A different plan in a previously migrated scope is refused;
+use normal publication for subsequent updates. The receipt acknowledges the completed migration,
+not a new integrity audit of data changed afterward. Retrying requires the original source chain
+to remain available and valid. Keep the files until migration has been confirmed.
+
+The database deadline includes lock admission and all transactional source rereads/writes; the
+initial local verification happens before that deadline. Timeout, cancellation, invalid JSONB
+or any write failure rolls back the transaction. An interrupted response after commit is resolved
+by the durable receipt. Database writers use the same advisory lock, including background imports.
+
+The optional PostgreSQL migration test injects a failure at the final receipt insert and verifies
+that no partial snapshots, documents, history, current or receipt survive. It also covers canceled
+lock admission, concurrent identical migration, exact chronology, retention, occupied-scope refusal,
+scope isolation and receipt replay after a newer publication. Default tests cover corrupt historical
+tables, cycles, orphan exclusion and the explicit legacy boundary without connecting to a database.
