@@ -273,9 +273,11 @@ impl DeploymentConfig {
             configs.into_iter().zip(tokens).zip(peer_tokens)
         {
             let client = GameClient::new(c.clone())?;
-            if c.asset_dispatch.is_some() {
-                asset_dispatchers.push(crate::asset_dispatch::Worker::new(c, client.clone())?);
-            }
+            let dispatcher = if c.asset_dispatch.is_some() {
+                Some(crate::asset_dispatch::Worker::new(c, client.clone())?)
+            } else {
+                None
+            };
             if c.master_notify.is_some() {
                 notifiers.push(crate::master_notify::Worker::new(c, client.clone())?);
             }
@@ -293,6 +295,14 @@ impl DeploymentConfig {
             } else {
                 ("/api/v1".into(), "/internal/v1".into())
             };
+            if let Some(worker) = dispatcher {
+                router = router.merge(crate::asset_dispatch_admin::router(
+                    worker.control(),
+                    &format!("{internal_prefix}/asset-dispatch"),
+                    internal.clone(),
+                ));
+                asset_dispatchers.push(worker);
+            }
             if let Some(token) = peer_token {
                 router = router.merge(crate::peer::router(
                     client.clone(),

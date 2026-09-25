@@ -124,6 +124,8 @@ pub struct Worker {
     config: Config,
     outbox: Outbox,
     remotes: Vec<Remote>,
+    control: crate::asset_dispatch_admin::Control,
+    commands: tokio::sync::mpsc::Receiver<crate::asset_dispatch_admin::Command>,
 }
 impl Worker {
     pub fn new(
@@ -161,7 +163,10 @@ impl Worker {
             )
             .into());
         }
+        let (control, commands) = crate::asset_dispatch_admin::channel();
         Ok(Self {
+            control,
+            commands,
             region: config.region,
             environment: config.environment.clone(),
             platform: config.platform().name().into(),
@@ -170,6 +175,9 @@ impl Worker {
             outbox,
             remotes,
         })
+    }
+    pub fn control(&self) -> crate::asset_dispatch_admin::Control {
+        self.control.clone()
     }
     /// Observation does not dispatch synchronously from any public/internal snapshot route.
     pub fn observe(
@@ -298,7 +306,18 @@ impl Worker {
                 );
                 break;
             }
-            tokio::select! {_=tokio::time::sleep(Duration::from_secs(self.config.interval_seconds))=>{},_=stop.changed()=>break}
+            let pause = tokio::time::sleep(Duration::from_secs(self.config.interval_seconds));
+            tokio::pin!(pause);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => return,
+                    _ = &mut pause => break,
+                    Some(command) = self.commands.recv() => {
+                        crate::asset_dispatch_admin::handle(command, &mut self.outbox);
+                    }
+                }
+            }
         }
     }
 }

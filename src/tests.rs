@@ -4609,8 +4609,26 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     });
     let gc = client(&game, cfg.clone());
     let worker = Worker::new(&cfg, gc.clone()).unwrap();
+    let admin = crate::asset_dispatch_admin::router(
+        worker.control(),
+        "/internal/v1/asset-dispatch",
+        "admin".into(),
+    );
     let (stop, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(worker.run(rx));
+    let response = admin
+        .oneshot(
+            Request::get("/internal/v1/asset-dispatch/entries")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["total"], 1);
     let path = directory.path().join("outbox/outbox.json");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -7394,4 +7412,224 @@ async fn master_notification_shutdown_cancels_active_delivery_without_publicatio
         .unwrap();
     assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), before);
     server.abort();
+}
+
+#[tokio::test]
+async fn asset_dispatch_admin_pages_and_adopts_with_auth_and_durable_transitions() {
+    use crate::{
+        asset_jobs::{Operation, Request as JobRequest},
+        asset_outbox::{Identity, Outbox},
+        region::Region,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Outbox::open(dir.path(), 10).unwrap();
+    let identity = Identity {
+        destination_sha256: "a".repeat(64),
+        request: JobRequest {
+            region: Region::Jp,
+            profile: "full".into(),
+            operation: Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "release".into(),
+        platform: "iOS".into(),
+        resource_version: "1".into(),
+        platform_hash: "h1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let key = store.observe(identity.clone()).unwrap();
+    store.begin_send(&key).unwrap();
+    store.fail(&key, "submission_ambiguous").unwrap();
+    let mut other = identity;
+    other.resource_version = "2".into();
+    let pending = store.observe(other).unwrap();
+    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let owner = tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            crate::asset_dispatch_admin::handle(command, &mut store);
+        }
+        store
+    });
+    let app = crate::asset_dispatch_admin::router(
+        control,
+        "/internal/v1/jp/asset-dispatch",
+        "admin".into(),
+    );
+    let base = "/internal/v1/jp/asset-dispatch/entries";
+    let get = |url: &str, token: &str| {
+        Request::get(url)
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(get(base, "public"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&format!("{base}?limit=0"), "admin"))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&format!("{base}?after=invalid"), "admin"))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let response = app
+        .clone()
+        .oneshot(get(&format!("{base}?limit=1"), "admin"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["total"], 2);
+    let next = page["next_after"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(get(&format!("{base}?limit=1&after={next}"), "admin"))
+        .await
+        .unwrap();
+    let second: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(second["next_after"].is_null());
+    assert_ne!(page["entries"][0]["key"], second["entries"][0]["key"]);
+    let post = |key: &str, token: &str, body: Value| {
+        Request::post(format!("{base}/{key}/adopt"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        app.clone()
+            .oneshot(post(&key, "public", json!({"job_id":id})))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(post(&key, "admin", json!({"job_id":"invalid"})))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(post(&key, "admin", json!({"job_id":id,"submit":true})))
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(post(&pending, "admin", json!({"job_id":id})))
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            app.clone()
+                .oneshot(post(&key, "admin", json!({"job_id":id})))
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(post(
+                &key,
+                "admin",
+                json!({"job_id":uuid::Uuid::new_v4().to_string()})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    drop(app);
+    let store = owner.await.unwrap();
+    assert!(
+        matches!(&store.entries()[&key].state, crate::asset_outbox::State::Submitted { job_id } if job_id == &id)
+    );
+    drop(store);
+    let reopened = Outbox::open(dir.path(), 10).unwrap();
+    assert!(
+        matches!(&reopened.entries()[&key].state, crate::asset_outbox::State::Submitted { job_id } if job_id == &id)
+    );
+}
+
+#[tokio::test]
+async fn asset_dispatch_admin_abandoned_commands_do_not_mutate_after_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::asset_outbox::Outbox::open(dir.path(), 1).unwrap();
+    let identity = crate::asset_outbox::Identity {
+        destination_sha256: "a".repeat(64),
+        request: crate::asset_jobs::Request {
+            region: crate::region::Region::Jp,
+            profile: "full".into(),
+            operation: crate::asset_jobs::Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "release".into(),
+        platform: "iOS".into(),
+        resource_version: "1".into(),
+        platform_hash: "h1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let key = store.observe(identity).unwrap();
+    store.begin_send(&key).unwrap();
+    store.fail(&key, "submission_ambiguous").unwrap();
+    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let app = crate::asset_dispatch_admin::router(control, "/dispatch", "admin".into());
+    let request = Request::post(format!("/dispatch/entries/{key}/adopt"))
+        .header("authorization", "Bearer admin")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&json!({"job_id":uuid::Uuid::new_v4().to_string()})).unwrap(),
+        ))
+        .unwrap();
+    // Simulate a reconciliation pass that outlasts the HTTP control deadline.
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 503);
+    crate::asset_dispatch_admin::handle(commands.recv().await.unwrap(), &mut store);
+    assert!(matches!(
+        store.entries()[&key].state,
+        crate::asset_outbox::State::Failed { .. }
+    ));
+    drop(commands);
+    let response = app
+        .oneshot(
+            Request::get("/dispatch/entries")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
 }

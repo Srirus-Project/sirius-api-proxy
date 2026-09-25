@@ -48,3 +48,5 @@ pub mod master_registry;
 pub mod master_sync;
 
 pub mod master_notify;
+
+pub mod asset_dispatch_admin;

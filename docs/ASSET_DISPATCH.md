@@ -97,8 +97,36 @@ failed-with-known-job, or pending work cannot be reassigned; repeating the same 
 Both commands use exclusive state ownership and reject nonexistent state directories. Status
 prints JSON without credential values. They require no game/CDN credentials or network access.
 
-An online administrative recovery/status endpoint and automatic retry of uncertain POSTs remain
-future work.
+Online administrative routes are available when `asset_dispatch` is configured:
+
+- `GET /internal/v1/asset-dispatch/entries?limit=50&after=DISPATCH_KEY`
+- `POST /internal/v1/asset-dispatch/entries/DISPATCH_KEY/adopt` with
+  `{"job_id":"EXISTING_JOB_UUID"}`
+
+Multi-region deployments insert the region after `/internal/v1`, for example
+`/internal/v1/jp/asset-dispatch/entries`. Use that profile's internal bearer; public tokens
+cannot inspect or change dispatch state. Disabled profiles have no dispatch routes.
+
+Lists return `status`, `total`, `entries` (each has `key` and `entry`) and nullable
+`next_after`. Limit defaults to 50 and accepts 1–200. Entries sort by dispatch key; pass
+`next_after` as `after` for the next page. Pages are live views, not a frozen export:
+new identities can appear before a previous cursor. No origins or credential values are
+included. `ready` means the worker processed this request, not that every remote job is healthy;
+inspect individual persisted states and failure codes.
+
+Adoption returns the persisted entry with HTTP 200, unknown identities return 404,
+and disallowed transitions return 409. Malformed keys/UUIDs return 400; unknown body fields
+are rejected and the body limit is 4 KiB. Adoption does not submit or complete a job. The
+next scheduled reconciliation checks its remote identity and outcome just as offline recovery
+does. Repeating the same UUID is safe; do not switch to a different UUID after an uncertain reply.
+
+Commands use a bounded 16-request queue and wait at most five seconds. The sole worker
+processes them between network reconciliation passes, so a long game/updater request can
+make the management endpoint return 503. Stopped workers and queue saturation also return
+503. Requests abandoned while still queued are discarded. Once persistence has started, a
+lost or timed-out response does not prove the change was rolled back: query state or repeat
+the identical adoption. Management requests do not accelerate observation/polling or race
+in-flight submissions. Automatic replay of uncertain POSTs remains intentionally disabled.
 
 History has a hard capacity and no automatic pruning; a full history refuses new identities while
 existing jobs continue reconciliation. Safe operator compaction still needs implementation.
@@ -109,6 +137,7 @@ copy of its configuration. Coordinate profile changes with active work.
 Writes sync temporary files before atomic replacement. Process restart is tested; power-loss
 persistence across every filesystem is not claimed. Persistence failure stops the dispatch worker
 and emits an error while the HTTP proxy remains available. Monitor these errors and inspect the
-state ledger; a dedicated dispatch health/status endpoint remains pending.
+state ledger. The online endpoint returns 503 once the worker has stopped; it does not restart
+a worker or erase its failure state.
 
 Full production acceptance, completion notifications and the 1.2.0 release remain pending.
