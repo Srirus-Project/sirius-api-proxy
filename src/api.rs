@@ -56,6 +56,16 @@ pub fn router_at(
         .route("/regions", get(regions))
         .route("/master-data", get(master_status))
         .route("/master-data/manifest", get(registry_current))
+        .route("/master-data/database/manifest", get(database_current))
+        .route(
+            "/master-data/database/by-hash/{hash}/manifest",
+            get(database_manifest),
+        )
+        .route(
+            "/master-data/database/by-hash/{hash}/tables/{table}",
+            get(database_table),
+        )
+        .route("/master-data/database/history", get(database_history))
         .route(
             "/master-data/by-hash/{hash}/manifest",
             get(registry_by_hash),
@@ -537,4 +547,94 @@ async fn master_database_status(State(c): State<Arc<GameClient>>) -> Json<Value>
 }
 async fn master_git_status(State(c): State<Arc<GameClient>>) -> Json<Value> {
     Json(c.master_git_status().await)
+}
+
+fn database_error(error: crate::master_database::Error) -> AppError {
+    match error {
+        crate::master_database::Error::NotFound => AppError::NotFound,
+        crate::master_database::Error::InvalidRequest => AppError::InvalidRequest,
+        _ => AppError::MasterUnavailable,
+    }
+}
+fn database_scope(c: &GameClient) -> crate::master_registry::Scope {
+    crate::master_registry::Scope {
+        region: c.region(),
+        environment: c.environment().into(),
+        platform: c.platform(),
+    }
+}
+async fn database_response(
+    c: Arc<GameClient>,
+    hash: Option<String>,
+    table: Option<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    if hash
+        .as_deref()
+        .is_some_and(|h| !crate::master_registry::hash_valid(h))
+        || table
+            .as_deref()
+            .is_some_and(|t| !crate::master::safe_component(t))
+    {
+        return Err(AppError::InvalidRequest);
+    }
+    let reader = c
+        .master_database_reader()
+        .ok_or(AppError::MasterUnavailable)?;
+    let doc = reader
+        .document(&database_scope(&c), hash.as_deref(), table.as_deref())
+        .await
+        .map_err(database_error)?;
+    // Manifests contain the first local snapshot UUID for retained content. Retention
+    // may permit later re-publication with another UUID, so only exact tables are immutable.
+    registry_document(doc, headers, table.is_some())
+}
+async fn database_current(
+    State(c): State<Arc<GameClient>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    database_response(c, None, None, headers).await
+}
+async fn database_manifest(
+    State(c): State<Arc<GameClient>>,
+    Path(hash): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    database_response(c, Some(hash), None, headers).await
+}
+async fn database_table(
+    State(c): State<Arc<GameClient>>,
+    Path((hash, table)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    database_response(c, Some(hash), Some(table), headers).await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseHistoryQuery {
+    before: Option<i64>,
+    #[serde(default = "history_limit")]
+    limit: usize,
+}
+async fn database_history(
+    State(c): State<Arc<GameClient>>,
+    Query(q): Query<DatabaseHistoryQuery>,
+) -> Result<Response, AppError> {
+    if !(1..=200).contains(&q.limit) || q.before.is_some_and(|n| n <= 0) {
+        return Err(AppError::InvalidRequest);
+    }
+    let reader = c
+        .master_database_reader()
+        .ok_or(AppError::MasterUnavailable)?;
+    let page = reader
+        .history(&database_scope(&c), q.limit, q.before)
+        .await
+        .map_err(database_error)?;
+    Response::builder()
+        .header("content-type", "application/json")
+        .header("cache-control", "private, no-store")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&page).map_err(|_| AppError::MasterUnavailable)?,
+        ))
+        .map_err(|_| AppError::MasterUnavailable)
 }

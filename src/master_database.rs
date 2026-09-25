@@ -12,6 +12,10 @@ use std::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Master database document not found")]
+    NotFound,
+    #[error("invalid Master database read request")]
+    InvalidRequest,
     #[error("invalid Master database configuration")]
     Config,
     #[error("Master database secret unavailable")]
@@ -287,4 +291,147 @@ async fn publish_snapshot(
         bytes: snapshot.tables.iter().map(|(f, _, _)| f.size).sum(),
         changed,
     })
+}
+
+/// Shared bounded read pool. Construction performs no network I/O.
+#[derive(Clone)]
+pub struct Reader {
+    pool: std::sync::Arc<tokio::sync::OnceCell<PgPool>>,
+    options: PgConnectOptions,
+    timeout: Duration,
+}
+#[derive(Serialize)]
+pub struct HistoryEntry {
+    pub sequence: String,
+    pub content_sha256: String,
+    pub retained: bool,
+}
+#[derive(Serialize)]
+pub struct HistoryPage {
+    pub entries: Vec<HistoryEntry>,
+    pub next_before: Option<String>,
+}
+impl Reader {
+    pub fn new(config: &Config) -> Result<Self, Error> {
+        let timeout = Duration::from_secs(config.timeout_seconds);
+        Ok(Self {
+            pool: Default::default(),
+            options: config.options()?,
+            timeout,
+        })
+    }
+    async fn pool(&self) -> &PgPool {
+        self.pool
+            .get_or_init(|| async {
+                PgPoolOptions::new()
+                    .max_connections(4)
+                    .acquire_timeout(self.timeout)
+                    .connect_lazy_with(self.options.clone())
+            })
+            .await
+    }
+    pub async fn document(
+        &self,
+        scope: &Scope,
+        hash: Option<&str>,
+        table: Option<&str>,
+    ) -> Result<registry::Document, Error> {
+        if scope.region != crate::region::Region::Jp
+            || hash.is_some_and(|h| !registry::hash_valid(h))
+            || table.is_some_and(|t| hash.is_none() || !crate::master::safe_component(t))
+        {
+            return Err(Error::InvalidRequest);
+        }
+        tokio::time::timeout(self.timeout, self.document_inner(scope, hash, table))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+    async fn document_inner(
+        &self,
+        scope: &Scope,
+        hash: Option<&str>,
+        table: Option<&str>,
+    ) -> Result<registry::Document, Error> {
+        let key = serde_json::to_string(scope).map_err(|_| Error::Config)?;
+        let mut tx = self
+            .pool()
+            .await
+            .begin()
+            .await
+            .map_err(|_| Error::Database)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| Error::Database)?;
+        // Bound bytes on the database side, before decoding/allocating a response.
+        let row=sqlx::query("SELECT content_hash, CASE WHEN octet_length(manifest)<=1048576 THEN manifest END AS manifest FROM public.sirius_master_snapshots WHERE scope=$1 AND content_hash=COALESCE($2,(SELECT content_hash FROM public.sirius_master_current WHERE scope=$1))")
+            .bind(&key).bind(hash).fetch_optional(&mut *tx).await.map_err(|_| Error::Database)?.ok_or(Error::NotFound)?;
+        let selected: String = row.try_get("content_hash").map_err(|_| Error::Database)?;
+        let manifest_bytes: Option<Vec<u8>> =
+            row.try_get("manifest").map_err(|_| Error::Database)?;
+        let manifest_bytes = manifest_bytes.ok_or(Error::Integrity)?;
+        let manifest: PublishedManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| Error::Integrity)?;
+        manifest.validate(scope).map_err(|_| Error::Integrity)?;
+        if manifest.content_sha256 != selected || hash.is_some_and(|h| h != selected) {
+            return Err(Error::Integrity);
+        }
+        let bytes = if let Some(table) = table {
+            let name = format!("{table}.json");
+            let expected = manifest
+                .files
+                .iter()
+                .find(|f| f.name == name)
+                .ok_or(Error::NotFound)?;
+            let row=sqlx::query("SELECT sha256, CASE WHEN octet_length(bytes)<=67108864 THEN bytes END AS bytes FROM public.sirius_master_documents WHERE scope=$1 AND content_hash=$2 AND name=$3")
+                .bind(&key).bind(&selected).bind(name).fetch_optional(&mut *tx).await.map_err(|_| Error::Database)?.ok_or(Error::Integrity)?;
+            let digest: String = row.try_get("sha256").map_err(|_| Error::Database)?;
+            let data: Option<Vec<u8>> = row.try_get("bytes").map_err(|_| Error::Database)?;
+            let data = data.ok_or(Error::Integrity)?;
+            if data.len() as u64 != expected.size
+                || digest != expected.sha256
+                || registry::digest(&data) != expected.sha256
+            {
+                return Err(Error::Integrity);
+            }
+            serde_json::from_slice::<serde_json::Value>(&data).map_err(|_| Error::Integrity)?;
+            data
+        } else {
+            manifest_bytes
+        };
+        tx.commit().await.map_err(|_| Error::Database)?;
+        Ok(registry::Document {
+            etag: format!("\"{}\"", registry::digest(&bytes)),
+            version: manifest.version,
+            bytes,
+        })
+    }
+    pub async fn history(
+        &self,
+        scope: &Scope,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<HistoryPage, Error> {
+        if scope.region != crate::region::Region::Jp
+            || !(1..=200).contains(&limit)
+            || before.is_some_and(|n| n <= 0)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let key = serde_json::to_string(scope).map_err(|_| Error::Config)?;
+        tokio::time::timeout(self.timeout,async {
+            let rows=sqlx::query("SELECT h.id,h.content_hash,EXISTS(SELECT 1 FROM public.sirius_master_snapshots s WHERE s.scope=h.scope AND s.content_hash=h.content_hash) AS retained FROM public.sirius_master_history h WHERE h.scope=$1 AND ($2::bigint IS NULL OR h.id<$2) ORDER BY h.id DESC LIMIT $3")
+                .bind(key).bind(before).bind((limit+1) as i64).fetch_all(self.pool().await).await.map_err(|_| Error::Database)?;
+            let more=rows.len()>limit;
+            let mut entries=Vec::new();
+            for row in rows.into_iter().take(limit) {
+                let sequence:i64=row.try_get("id").map_err(|_| Error::Database)?;
+                let hash:String=row.try_get("content_hash").map_err(|_| Error::Database)?;
+                if sequence<=0 || !registry::hash_valid(&hash) {return Err(Error::Integrity);}
+                entries.push(HistoryEntry{sequence:sequence.to_string(),content_sha256:hash,retained:row.try_get("retained").map_err(|_| Error::Database)?});
+            }
+            let next_before=if more {entries.last().map(|e|e.sequence.clone())} else {None};
+            Ok(HistoryPage{entries,next_before})
+        }).await.map_err(|_| Error::Timeout)?
+    }
 }

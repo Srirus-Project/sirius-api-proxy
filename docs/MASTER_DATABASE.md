@@ -86,8 +86,8 @@ notification and Git credentials in every deployment profile. Profiles may share
 credentials deliberately; rows remain scoped by region/environment/platform. Global Master
 publication remains unsupported. Other service functions do not require the database to be up.
 
-Database-backed HTTP document reads, committed file-history migration and a standalone registry
-service remain separate pending work. Only PostgreSQL is implemented; no database fallback occurs.
+Committed file-history migration and a standalone registry service remain separate pending work.
+Only PostgreSQL is implemented; no database fallback occurs.
 
 The optional test `master_database_postgres_atomic_history_retention_integrity_and_retry` requires
 an isolated PostgreSQL server with a `sirius_test` database and `postgres` user. Set
@@ -100,3 +100,45 @@ The optional `master_database_worker_start_wake_retry_auth_and_shutdown` test ex
 startup publication, independent update hints, a failed database insert followed by timed recovery,
 internal route authorization/redaction, and shutdown during a blocked database transaction.
 The two PostgreSQL tests serialize their schema-failure fixtures within the test process.
+
+## Database mirror read API
+
+These routes use the public API bearer and the configured profile's scope. For multi-region
+services insert the region after `/api/v1`. They read the database mirror explicitly; the existing
+file snapshot endpoints retain their behavior. A configured mirror may lag local installation;
+check its internal publication status when freshness matters.
+
+| Route | Result |
+| --- | --- |
+| `GET /api/v1/master-data/database/manifest` | Current database manifest |
+| `GET /api/v1/master-data/database/by-hash/{hash}/manifest` | Retained manifest by content hash |
+| `GET /api/v1/master-data/database/by-hash/{hash}/tables/{name}` | Exact table JSON; name omits `.json` |
+| `GET /api/v1/master-data/database/history?limit=50&before=123` | Newest-first publication events |
+
+Use `content_sha256` from the manifest to pin table requests. A table response contains the
+original bytes, `x-master-version` and a hash ETag. Manifest ETags cover the whole manifest;
+manifest responses use `private, no-cache` because a pruned then republished content hash can
+have a different local snapshot UUID. Tables use immutable private caching. Hash verification
+runs before conditional 304 handling, so invalid stored bytes cannot be hidden by an old ETag.
+
+A missing/pruned hash or unlisted table is 404. Missing configured database, connection failure,
+missing listed table, oversized or corrupt content is 503. There is no fallback to local files.
+Manifest/table reads share a repeatable-read, read-only transaction, preventing retention or
+current-pointer changes from mixing versions within a response. Manifest and payload reads are
+bounded to 1 MiB and 64 MiB respectively on the database side before allocating response bytes.
+
+History returns `entries` containing decimal-string `sequence`, `content_sha256` and `retained`,
+plus optional `next_before`. Pass that cursor as `before` on the next request. Pages have 1–200
+entries; new publications do not shift an existing sequence cursor. Events remain after payload
+retention, and `retained` reflects availability when that page was read. History has `no-store`
+caching. Sequence identifiers are global database IDs; gaps within a scope are expected.
+
+Each profile lazily opens a shared pool of at most four read connections; publication uses its
+separate single connection. The configured database deadline includes pool admission. Restart
+the service when rotating database settings/passwords so the read pool uses the new values.
+The pool is initialized on the first authenticated valid request, not during configuration checks.
+
+The optional `master_database_read_http_integrity_retention_history_and_scope` test uses real
+PostgreSQL through the actual HTTP router. It covers pinned bytes without local CURRENT,
+conditional reads, pruning/history pagination across new publication, scope isolation, corrupt
+and oversized rows, and database outage without local fallback.

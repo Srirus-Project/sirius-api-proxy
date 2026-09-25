@@ -136,6 +136,8 @@ impl Worker {
             }
             Err(error) => {
                 let code = match error {
+                    db::Error::NotFound => "not_found",
+                    db::Error::InvalidRequest => "invalid_request",
                     db::Error::Config => "configuration",
                     db::Error::Secret => "secret_unavailable",
                     db::Error::Snapshot => "snapshot",

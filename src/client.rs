@@ -59,6 +59,7 @@ pub struct GameClient {
     master_sync_wake: tokio::sync::Notify,
     master_git_wake: tokio::sync::Notify,
     master_database_wake: tokio::sync::Notify,
+    master_database_reader: Option<crate::master_database::Reader>,
     master_publication_wake: tokio::sync::Notify,
     node_routing: Option<crate::node_routing::Router>,
     config: Config,
@@ -139,6 +140,12 @@ impl GameClient {
             master_publication_wake: tokio::sync::Notify::new(),
             master_git_wake: tokio::sync::Notify::new(),
             master_database_wake: tokio::sync::Notify::new(),
+            master_database_reader: config
+                .master_database
+                .as_ref()
+                .map(|c| crate::master_database::Reader::new(&c.connection))
+                .transpose()
+                .map_err(|_| AppError::Config("invalid Master database read configuration"))?,
             node_routing,
             config,
             http,
@@ -250,6 +257,9 @@ impl GameClient {
     }
     pub async fn master_update_status(&self) -> Value {
         self.state.lock().await.master_update.clone()
+    }
+    pub(crate) fn master_database_reader(&self) -> Option<&crate::master_database::Reader> {
+        self.master_database_reader.as_ref()
     }
     pub async fn master_database_status(&self) -> Value {
         self.state.lock().await.master_database.clone()

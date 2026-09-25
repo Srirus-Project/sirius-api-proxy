@@ -9617,3 +9617,291 @@ fn exclusive_file_ownership_ends_while_duplicate_description_remains_open() {
     drop(next);
     assert!(Exclusive::acquire(open()).is_ok());
 }
+
+#[tokio::test]
+async fn database_read_routes_require_public_auth_and_never_fallback_when_disabled() {
+    let app = api::router(
+        GameClient::new(config()).unwrap(),
+        "read".into(),
+        "admin".into(),
+    );
+    for (path, token, expected) in [
+        ("/api/v1/master-data/database/manifest", None, 401),
+        ("/api/v1/master-data/database/manifest", Some("admin"), 401),
+        ("/api/v1/master-data/database/manifest", Some("read"), 503),
+        (
+            "/api/v1/master-data/database/by-hash/bad/manifest",
+            Some("read"),
+            400,
+        ),
+        (
+            "/api/v1/master-data/database/history?limit=201",
+            Some("read"),
+            400,
+        ),
+        (
+            "/api/v1/master-data/database/history?before=0",
+            Some("read"),
+            400,
+        ),
+        (
+            "/api/v1/master-data/database/history?other=1",
+            Some("read"),
+            400,
+        ),
+    ] {
+        let mut req = Request::builder().uri(path);
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            expected
+        );
+    }
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_read_http_integrity_retention_history_and_scope() {
+    use crate::{master, master_database as db, master_registry as registry};
+    use sqlx::Connection;
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    let (_root, input, source, _) = registry_fixture();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.environment = format!("reader-{}", uuid::Uuid::new_v4().simple());
+    cfg.master_directory = Some(source.clone());
+    let mut connection = master_database_config();
+    connection.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.master_database = Some(crate::master_database_worker::Config {
+        connection: connection.clone(),
+        interval_seconds: 86400,
+    });
+    let scope = registry::Scope {
+        region: cfg.region,
+        environment: cfg.environment.clone(),
+        platform: cfg.platform(),
+    };
+    let scope_key = serde_json::to_string(&scope).unwrap();
+    let reader = db::Reader::new(&connection).unwrap();
+    let mut hashes = Vec::new();
+    let (mut manifest, decoder, _) = master_fixture();
+    for n in 0..3 {
+        manifest.version = format!("reader-v{n}");
+        std::fs::write(
+            input.join("MasterManifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        master::import_directory(&input, &source, &decoder).unwrap();
+        hashes.push(
+            db::publish(&connection, &source, scope.clone())
+                .await
+                .unwrap()
+                .content_sha256,
+        );
+    }
+    let app = api::router(
+        GameClient::new(cfg.clone()).unwrap(),
+        "read".into(),
+        "admin".into(),
+    );
+    let request = |path: String, etag: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer read");
+            if let Some(etag) = etag {
+                req = req.header("if-none-match", etag);
+            }
+            let response = app
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let headers = response.headers().clone();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, headers, bytes)
+        }
+    };
+    let (status, headers, bytes) =
+        request("/api/v1/master-data/database/manifest".into(), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-master-version"], "reader-v2");
+    let published: registry::PublishedManifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(published.content_sha256, hashes[2]);
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            "/api/v1/master-data/database/manifest".into(),
+            Some(format!("W/{etag}"))
+        )
+        .await
+        .0,
+        304
+    );
+    let table_path = format!(
+        "/api/v1/master-data/database/by-hash/{}/tables/MasterFixture",
+        hashes[1]
+    );
+    // Database reads do not need the corresponding local files or CURRENT.
+    let current = std::fs::read(source.join("CURRENT")).unwrap();
+    std::fs::remove_file(source.join("CURRENT")).unwrap();
+    let (status, headers, bytes) = request(table_path.clone(), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    assert_eq!(headers["x-master-version"], "reader-v1");
+    assert!(headers["cache-control"]
+        .to_str()
+        .unwrap()
+        .contains("immutable"));
+    std::fs::write(source.join("CURRENT"), current).unwrap();
+    let table_etag = headers["etag"].to_str().unwrap().to_owned();
+    assert_eq!(
+        request(table_path.clone(), Some(table_etag.clone()))
+            .await
+            .0,
+        304
+    );
+    assert_eq!(
+        request(
+            format!(
+                "/api/v1/master-data/database/by-hash/{}/manifest",
+                hashes[0]
+            ),
+            None
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        request(
+            format!(
+                "/api/v1/master-data/database/by-hash/{}/tables/Missing",
+                hashes[2]
+            ),
+            None
+        )
+        .await
+        .0,
+        404
+    );
+    let page = reader.history(&scope, 1, None).await.unwrap();
+    assert_eq!(page.entries[0].content_sha256, hashes[2]);
+    let cursor = page.next_before.unwrap().parse().unwrap();
+    manifest.version = "reader-v3".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let fourth = db::publish(&connection, &source, scope.clone())
+        .await
+        .unwrap();
+    let remaining = reader.history(&scope, 200, Some(cursor)).await.unwrap();
+    assert_eq!(
+        remaining
+            .entries
+            .iter()
+            .map(|e| &e.content_sha256)
+            .collect::<Vec<_>>(),
+        [&hashes[1], &hashes[0]]
+    );
+    assert!(remaining.entries.iter().all(|e| !e.retained));
+    assert!(remaining.next_before.is_none());
+    let (status, _, history) =
+        request("/api/v1/master-data/database/history?limit=1".into(), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&history).unwrap()["entries"][0]["content_sha256"],
+        fourth.content_sha256
+    );
+    let mut other = scope.clone();
+    other.environment.push_str("-missing");
+    assert!(matches!(
+        reader
+            .document(&other, Some(&fourth.content_sha256), None)
+            .await,
+        Err(db::Error::NotFound)
+    ));
+    assert!(reader
+        .history(&other, 200, None)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    let mut conn = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    let current_table = format!(
+        "/api/v1/master-data/database/by-hash/{}/tables/MasterFixture",
+        fourth.content_sha256
+    );
+    let (_, headers, _) = request(current_table.clone(), None).await;
+    sqlx::query(
+        "UPDATE public.sirius_master_documents SET bytes=$3 WHERE scope=$1 AND content_hash=$2",
+    )
+    .bind(&scope_key)
+    .bind(&fourth.content_sha256)
+    .bind(b"corrupt".as_slice())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        request(
+            current_table,
+            Some(headers["etag"].to_str().unwrap().into())
+        )
+        .await
+        .0,
+        503
+    );
+    sqlx::query("UPDATE public.sirius_master_snapshots SET manifest=repeat('x',1048577)::bytea WHERE scope=$1 AND content_hash=$2")
+        .bind(&scope_key).bind(&fourth.content_sha256).execute(&mut conn).await.unwrap();
+    assert_eq!(
+        request(
+            "/api/v1/master-data/database/manifest".into(),
+            Some("*".into())
+        )
+        .await
+        .0,
+        503
+    );
+    // A disconnected database never falls back to the still-valid local snapshot.
+    let mut down = cfg;
+    down.master_database.as_mut().unwrap().connection.port = 1;
+    down.master_database
+        .as_mut()
+        .unwrap()
+        .connection
+        .timeout_seconds = 1;
+    let unavailable = api::router(
+        GameClient::new(down).unwrap(),
+        "read".into(),
+        "admin".into(),
+    );
+    let response = unavailable
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/master-data/database/manifest")
+                .header("authorization", "Bearer read")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+}
