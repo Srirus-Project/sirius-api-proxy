@@ -336,7 +336,7 @@ async fn commit_internal(
     policy: &CommitPolicy,
 ) -> Result<Receipt, Error> {
     policy.validate()?;
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return Err(Error::Git);
     }
     let source = source.to_owned();

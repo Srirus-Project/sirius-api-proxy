@@ -7901,15 +7901,23 @@ async fn git_execution_runs_real_git_and_bounds_output_without_error_leaks() {
     ));
 }
 
-/// Windows counterpart of the Unix process-group tests: cmd.exe helpers started with
-/// `start /B` stay in the Job Object and must die with it.
+/// Windows counterpart of the Unix process-group tests. Scripts live in batch files
+/// because cmd.exe does not understand the `\"` quoting Rust uses for arguments.
+/// A helper started with `start /B` stays in the Job Object and must die with it.
 #[cfg(windows)]
 #[tokio::test]
 async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
     use crate::git_process::{run, Error};
     use std::{ffi::OsString, path::Path};
     let root = tempfile::tempdir().unwrap();
-    let cmd = |script: &str| vec![OsString::from("/C"), OsString::from(script)];
+    let script = |name: &str, body: &str| {
+        std::fs::write(root.path().join(name), format!("@echo off\r\n{body}\r\n")).unwrap();
+        vec![
+            OsString::from("/D"),
+            OsString::from("/C"),
+            OsString::from(name),
+        ]
+    };
     run(
         Path::new("git"),
         root.path(),
@@ -7922,7 +7930,7 @@ async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
     let error = run(
         Path::new("cmd.exe"),
         root.path(),
-        &cmd("echo fixture-private-value 1>&2 & exit /b 1"),
+        &script("fail.cmd", "echo fixture-private-value 1>&2\r\nexit /b 1"),
         Duration::from_secs(5),
         1024,
     )
@@ -7930,15 +7938,21 @@ async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
     .unwrap_err();
     assert!(matches!(error, Error::Failed));
     assert!(!format!("{error:?} {error}").contains("fixture-private-value"));
-    for script in [
-        "for /L %i in (0,0,1) do @echo abcdefghijklmnopqrstuvwxyz",
-        "for /L %i in (0,0,1) do @echo abcdefghijklmnopqrstuvwxyz 1>&2",
+    for (name, body) in [
+        (
+            "stdout.cmd",
+            ":loop\r\necho abcdefghijklmnopqrstuvwxyz\r\ngoto loop",
+        ),
+        (
+            "stderr.cmd",
+            ":loop\r\necho abcdefghijklmnopqrstuvwxyz 1>&2\r\ngoto loop",
+        ),
     ] {
         assert!(matches!(
             run(
                 Path::new("cmd.exe"),
                 root.path(),
-                &cmd(script),
+                &script(name, body),
                 Duration::from_secs(5),
                 1024
             )
@@ -7947,14 +7961,21 @@ async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
         ));
     }
     // The helper writes `finished` after ~2 s unless the whole tree is terminated.
-    let script = "start /B cmd /C \"ping -n 3 127.0.0.1 >NUL & echo survived> finished\" & echo ready> ready & ping -n 30 127.0.0.1 >NUL";
+    script(
+        "helper.cmd",
+        "ping -n 3 127.0.0.1 >NUL\r\necho survived> finished",
+    );
+    let parent = script(
+        "parent.cmd",
+        "start \"\" /B cmd.exe /D /C helper.cmd\r\necho ready> ready\r\nping -n 30 127.0.0.1 >NUL",
+    );
     let start = std::time::Instant::now();
     assert!(matches!(
         run(
             Path::new("cmd.exe"),
             root.path(),
-            &cmd(script),
-            Duration::from_millis(500),
+            &parent,
+            Duration::from_secs(1),
             1024
         )
         .await,
@@ -7966,11 +7987,12 @@ async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
     assert!(!root.path().join("finished").exists());
     std::fs::remove_file(root.path().join("ready")).unwrap();
     let path = root.path().to_owned();
+    let owned = parent.clone();
     let task = tokio::spawn(async move {
         run(
             Path::new("cmd.exe"),
             &path,
-            &cmd(script),
+            &owned,
             Duration::from_secs(60),
             1024,
         )
@@ -7987,12 +8009,17 @@ async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
     assert!(task.await.unwrap_err().is_cancelled());
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!root.path().join("finished").exists());
-    // Positive control: without cancellation the helper performs the delayed write.
+    // Positive control: the same helper completes when its parent outlives it,
+    // proving the negative checks above observed containment, not a broken script.
+    let control = script(
+        "control.cmd",
+        "start \"\" /B cmd.exe /D /C helper.cmd\r\nping -n 6 127.0.0.1 >NUL",
+    );
     run(
         Path::new("cmd.exe"),
         root.path(),
-        &cmd("start /B cmd /C \"ping -n 2 127.0.0.1 >NUL & echo survived> finished\" & ping -n 5 127.0.0.1 >NUL"),
-        Duration::from_secs(20),
+        &control,
+        Duration::from_secs(30),
         1024,
     )
     .await

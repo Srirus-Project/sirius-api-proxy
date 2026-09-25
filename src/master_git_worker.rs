@@ -24,7 +24,7 @@ impl Config {
         self.commit
             .validate()
             .map_err(|_| AppError::Config("invalid Master Git commit policy"))?;
-        if !cfg!(unix)
+        if !cfg!(any(unix, windows))
             || game.region != crate::region::Region::Jp
             || self.state_directory.as_os_str().is_empty()
             || game
