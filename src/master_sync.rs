@@ -93,7 +93,7 @@ pub struct Syncer {
     root: reqwest::Url,
     scope: Scope,
     output: PathBuf,
-    game: Arc<GameClient>,
+    game: Option<Arc<GameClient>>,
     gate: Mutex<()>,
 }
 impl Syncer {
@@ -106,6 +106,46 @@ impl Syncer {
             .master_sync
             .clone()
             .ok_or(AppError::Config("Master sync is not configured"))?;
+        Self::construct(
+            policy,
+            Scope {
+                region: config.region,
+                environment: config.environment.clone(),
+                platform: config.platform(),
+            },
+            config
+                .master_directory
+                .clone()
+                .ok_or(AppError::Config("Master sync output is required"))?,
+            Some(game),
+        )
+    }
+    /// Shared verified transfer engine for standalone registry owners.
+    pub fn standalone(
+        policy: Config,
+        scope: Scope,
+        output: PathBuf,
+    ) -> Result<Arc<Self>, AppError> {
+        Self::construct(policy, scope, output, None)
+    }
+    fn construct(
+        policy: Config,
+        scope: Scope,
+        output: PathBuf,
+        game: Option<Arc<GameClient>>,
+    ) -> Result<Arc<Self>, AppError> {
+        policy.validate()?;
+        if scope.region != crate::region::Region::Jp
+            || scope.environment.is_empty()
+            || scope.environment.len() > 256
+            || !scope
+                .environment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || output.as_os_str().is_empty()
+        {
+            return Err(AppError::Config("invalid Master sync scope or output"));
+        }
         let token = secret(&policy.token_env)?;
         if token.len() > 4096 || !token.bytes().all(|b| (33..=126).contains(&b)) {
             return Err(AppError::Config("invalid Master owner token"));
@@ -124,7 +164,7 @@ impl Syncer {
         let mut root = reqwest::Url::parse(&policy.origin)
             .map_err(|_| AppError::Config("invalid Master owner origin"))?;
         root.set_path(&if policy.regional_paths {
-            format!("/api/v1/{}/master-data/", config.region.name())
+            format!("/api/v1/{}/master-data/", scope.region.name())
         } else {
             "/api/v1/master-data/".into()
         });
@@ -133,15 +173,8 @@ impl Syncer {
             http,
             authorization,
             root,
-            scope: Scope {
-                region: config.region,
-                environment: config.environment.clone(),
-                platform: config.platform(),
-            },
-            output: config
-                .master_directory
-                .clone()
-                .ok_or(AppError::Config("Master sync output is required"))?,
+            scope,
+            output,
             game,
             gate: Mutex::new(()),
         }))
@@ -191,14 +224,17 @@ impl Syncer {
             tokio::time::Instant::now() + Duration::from_secs(self.config.timeout_seconds);
         let result = tokio::time::timeout_at(deadline, async {
             let _gate = self.gate.lock().await;
-            self.game
-                .record_master_update(json!({"mode":"sync","status":"running"}))
-                .await;
+            if let Some(game) = &self.game {
+                game.record_master_update(json!({"mode":"sync","status":"running"}))
+                    .await;
+            }
             self.update(deadline).await
         })
         .await
         .unwrap_or(Err(Error::Timeout));
-        self.game.record_master_update(match &result {Ok(v)=>json!({"mode":"sync","status":"ready","completed_at":chrono::Utc::now(),"result":v}),Err(e)=>json!({"mode":"sync","status":"failed","error":e.to_string()})}).await;
+        if let Some(game) = &self.game {
+            game.record_master_update(match &result {Ok(v)=>json!({"mode":"sync","status":"ready","completed_at":chrono::Utc::now(),"result":v}),Err(e)=>json!({"mode":"sync","status":"failed","error":e.to_string()})}).await;
+        }
         result
     }
     async fn update(&self, deadline: tokio::time::Instant) -> Result<Value, Error> {
@@ -317,7 +353,7 @@ impl Syncer {
             }}
             tokio::select! {biased;
                 _=shutdown.changed()=>break,
-                _=self.game.master_sync_notified()=>{},
+                _=async { match &self.game { Some(game)=>game.master_sync_notified().await, None=>std::future::pending().await } }=>{},
                 _=tokio::time::sleep(Duration::from_secs(self.config.interval_seconds))=>{}
             }
         }

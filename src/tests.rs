@@ -10104,6 +10104,7 @@ fn standalone_registry_config(directory: std::path::PathBuf) -> crate::registry_
         scope: registry_scope(),
         regional_paths: false,
         backend: crate::registry_service::Backend::Files { directory },
+        owner: None,
         tls: None,
         logging: None,
         access_log: None,
@@ -10673,4 +10674,342 @@ async fn master_bundle_postgres_http_integrity_and_retention() {
     let packed: registry::PublishedManifest =
         serde_json::from_slice(&files["metadata/manifest.json"]).unwrap();
     assert_eq!(packed.version, "after-bundle");
+}
+
+fn registry_owner_config(
+    origin: String,
+    directory: std::path::PathBuf,
+) -> crate::registry_service::Config {
+    let mut cfg = standalone_registry_config(directory.clone());
+    std::env::set_var(&cfg.token_env, "registry-read");
+    let internal = format!("SIRIUS_REGISTRY_ADMIN_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&internal, "registry-admin");
+    cfg.owner = Some(crate::registry_owner::Config {
+        source: master_sync_config(origin, directory).master_sync.unwrap(),
+        internal_token_env: internal,
+        staging_directory: None,
+    });
+    cfg
+}
+async fn registry_owner_wait(owner: &crate::registry_owner::Worker, status: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let value = owner.status().await;
+            if value["status"] == status {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn standalone_registry_owner_start_hint_recovery_auth_and_shutdown() {
+    use axum::{body::Body, response::IntoResponse};
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let (_root, input, source, _) = registry_fixture();
+    let mode = Arc::new(AtomicU8::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let state = mode.clone();
+    let signal = entered.clone();
+    let app = standalone_registry_config(source.clone())
+        .prepare()
+        .unwrap()
+        .router
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let state = state.clone();
+                let signal = signal.clone();
+                async move {
+                    match state.load(Ordering::SeqCst) {
+                        1 => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        2 => {
+                            signal.notify_one();
+                            std::future::pending().await
+                        }
+                        _ => next.run(request).await,
+                    }
+                }
+            },
+        ));
+    let (origin, server) = peer_http_server(app).await;
+    let local = tempfile::tempdir().unwrap();
+    let output = local.path().join("master");
+    let mut cfg = registry_owner_config(origin, output.clone());
+    cfg.owner.as_mut().unwrap().source.request_timeout_ms = 60_000;
+    cfg.owner.as_mut().unwrap().source.timeout_seconds = 60;
+    let prepared = cfg.prepare().unwrap();
+    let app = prepared.router;
+    let worker = prepared.owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    let first = registry_owner_wait(&worker, "ready").await;
+    let before = std::fs::read(output.join("CURRENT")).unwrap();
+    let status = "/internal/v1/master-data/updater";
+    let refresh = "/internal/v1/master-data/refresh";
+    for token in ["registry-read", "owner-read", "wrong"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::get(status)
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(status)
+                .header("authorization", "Bearer registry-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        !text.contains("registry-admin")
+            && !text.contains("owner-read")
+            && !text.contains(&output.to_string_lossy().to_string())
+    );
+    mode.store(1, Ordering::SeqCst);
+    let request = || {
+        Request::post(refresh)
+            .header("authorization", "Bearer registry-admin")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), 202);
+    let failed = registry_owner_wait(&worker, "failed").await;
+    assert_eq!(failed["last_success"], first["last_success"]);
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), before);
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "registry-owner-second".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    mode.store(0, Ordering::SeqCst);
+    let mut hint = crate::master_sync::UpdateHint {
+        scope: cfg.scope.clone(),
+        content_sha256: "0".repeat(64),
+    };
+    hint.scope.environment = "wrong".into();
+    let hint_request = |hint: &crate::master_sync::UpdateHint| {
+        Request::post("/internal/v1/master-data/sync")
+            .header("authorization", "Bearer registry-admin")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(hint).unwrap()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(hint_request(&hint))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    hint.scope = cfg.scope.clone();
+    assert_eq!(
+        app.clone()
+            .oneshot(hint_request(&hint))
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    let ready = registry_owner_wait(&worker, "ready").await;
+    assert_eq!(
+        ready["last_success"]["receipt"]["sync"]["receipt"]["version"],
+        "registry-owner-second"
+    );
+    mode.store(2, Ordering::SeqCst);
+    worker.refresh();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(worker.status().await["status"], "stopped");
+    server.abort();
+    let mut bad = cfg.clone();
+    std::env::set_var(
+        &bad.owner.as_ref().unwrap().internal_token_env,
+        "registry-read",
+    );
+    assert!(bad.prepare().is_err());
+    std::env::set_var(
+        &bad.owner.as_ref().unwrap().internal_token_env,
+        "registry-admin",
+    );
+    bad.owner.as_mut().unwrap().staging_directory = Some(output);
+    assert!(bad.prepare().is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn standalone_registry_owner_database_failure_retry_and_canceled_publish() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master_database as db, registry_service as service};
+    use sqlx::Connection;
+    let (_root, input, source, _) = registry_fixture();
+    let mut upstream = standalone_registry_config(source.clone());
+    upstream.scope.environment = format!("owner-{}", uuid::Uuid::new_v4().simple());
+    let (origin, server) = peer_http_server(upstream.prepare().unwrap().router).await;
+    let local = tempfile::tempdir().unwrap();
+    let output = local.path().join("master");
+    let mut cfg = registry_owner_config(origin, output.clone());
+    cfg.scope = upstream.scope.clone();
+    let mut database = master_database_config();
+    database.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.backend = service::Backend::Postgres {
+        connection: database.clone(),
+    };
+    cfg.owner.as_mut().unwrap().staging_directory = Some(output.clone());
+    let worker = cfg.prepare().unwrap().owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    let first = registry_owner_wait(&worker, "ready").await;
+    let old = first["last_success"]["receipt"]["database"]["content_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut conn = sqlx::PgConnection::connect_with(&database.options().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.sirius_master_documents ADD CONSTRAINT sirius_owner_fixture_reject CHECK (name <> 'MasterFixture.json') NOT VALID").execute(&mut conn).await.unwrap();
+    let (mut next, decoder, _) = master_fixture();
+    next.version = format!("owner-next-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    worker.refresh();
+    let failed = registry_owner_wait(&worker, "failed").await;
+    assert_eq!(failed["error_code"], "database_publish_failed");
+    assert_eq!(failed["last_success"], first["last_success"]);
+    let reader = db::Reader::new(&database).unwrap();
+    let document = reader.document(&cfg.scope, None, None).await.unwrap();
+    let saved: Value = serde_json::from_slice(&document.bytes).unwrap();
+    assert_eq!(saved["content_sha256"], old);
+    let local_current = crate::master_registry::manifest(&output, None, cfg.scope.clone()).unwrap();
+    let local_current: Value = serde_json::from_slice(&local_current.bytes).unwrap();
+    assert_eq!(local_current["version"], next.version);
+    sqlx::query(
+        "ALTER TABLE public.sirius_master_documents DROP CONSTRAINT sirius_owner_fixture_reject",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    worker.refresh();
+    let ready = registry_owner_wait(&worker, "ready").await;
+    assert_eq!(
+        ready["last_success"]["receipt"]["sync"]["action"],
+        "unchanged"
+    );
+    assert_ne!(
+        ready["last_success"]["receipt"]["database"]["content_sha256"],
+        old
+    );
+    let mut lock = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7369726975731200)")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    worker.refresh();
+    registry_owner_wait(&worker, "running").await;
+    tokio::time::timeout(Duration::from_secs(3),async { loop {
+        sqlx::query("SELECT pg_stat_clear_snapshot()").execute(&mut *lock).await.unwrap();
+            let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='sirius-master-database' AND wait_event_type='Lock' AND wait_event='advisory')").fetch_one(&mut *lock).await.unwrap();
+        if waiting {break;}
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }}).await.unwrap();
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    lock.rollback().await.unwrap();
+    let restarted = cfg.prepare().unwrap().owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(restarted.clone().run(receiver));
+    let status = registry_owner_wait(&restarted, "ready").await;
+    assert_eq!(
+        status["last_success"]["receipt"]["database"]["changed"],
+        false
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "runs a real 60-second registry owner retry interval"]
+async fn standalone_registry_owner_periodic_retry_without_hint() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_root, _input, source, _) = registry_fixture();
+    let deny = Arc::new(AtomicBool::new(true));
+    let state = deny.clone();
+    let app = standalone_registry_config(source)
+        .prepare()
+        .unwrap()
+        .router
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let deny = state.clone();
+                async move {
+                    if deny.load(Ordering::SeqCst) {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ));
+    let (origin, server) = peer_http_server(app).await;
+    let local = tempfile::tempdir().unwrap();
+    let cfg = registry_owner_config(origin, local.path().join("master"));
+    let owner = cfg.prepare().unwrap().owner.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(owner.clone().run(receiver));
+    registry_owner_wait(&owner, "failed").await;
+    let start = tokio::time::Instant::now();
+    deny.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(70), async {
+        loop {
+            if owner.status().await["status"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(59));
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    server.abort();
 }

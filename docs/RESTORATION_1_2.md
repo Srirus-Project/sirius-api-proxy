@@ -149,3 +149,12 @@ backends. Bundles contain only a pinned verified manifest and its original table
 fully built before successful response headers, and have bounded temporary storage/admission
 through streaming. Conditional reads verify content first. Owner pull/poll and authenticated
 refresh/publication hints remain registry work; final production/platform/release gates remain.
+
+
+### Standalone owner synchronization
+
+Extracted the verified Master transfer engine from mandatory GameClient initialization and added
+optional startup/poll/hint-driven registry owner synchronization. File backends publish locally;
+PostgreSQL backends publish verified local snapshots transactionally with retry after database failures.
+Scoped internal status/refresh/update-hint routes use distinct credentials and retain last success.
+Local-only rescan/publication triggers and final platform/production/release gates remain open.

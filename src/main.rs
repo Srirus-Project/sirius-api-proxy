@@ -11,21 +11,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _logging = config.logging.clone().unwrap_or_default().init()?;
         let prepared = config.prepare()?;
         let listener = tokio::net::TcpListener::bind(prepared.listen).await?;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let worker = prepared
+            .owner
+            .map(|owner| tokio::spawn(owner.run(receiver)));
+        let signal_shutdown = shutdown.clone();
         tracing::info!(listen=%prepared.listen,"Sirius Master registry listening");
-        sirius_api_proxy::server::serve(listener, prepared.router, prepared.tls, async {
-            #[cfg(unix)]
-            {
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("signal handler");
-                tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        })
-        .await?;
+        let result =
+            sirius_api_proxy::server::serve(listener, prepared.router, prepared.tls, async move {
+                #[cfg(unix)]
+                {
+                    let mut term =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("signal handler");
+                    tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                let _ = signal_shutdown.send(true);
+            })
+            .await;
+        let _ = shutdown.send(true);
+        if let Some(worker) = worker {
+            worker.await?;
+        }
+        result?;
         return Ok(());
     }
     let path = if args.is_empty() || (args == ["master-update"] || args == ["master-sync"]) {

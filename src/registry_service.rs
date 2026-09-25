@@ -5,7 +5,7 @@ use axum::{
     http::HeaderMap,
     middleware,
     response::Response,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -26,6 +26,7 @@ pub struct Config {
     #[serde(default)]
     pub regional_paths: bool,
     pub backend: Backend,
+    pub owner: Option<crate::registry_owner::Config>,
     pub tls: Option<crate::server::TlsConfig>,
     pub logging: Option<crate::application_log::Config>,
     pub access_log: Option<crate::access_log::Config>,
@@ -97,9 +98,61 @@ impl Config {
                 ))
             }
         };
+        let mut internal_token = None;
+        let owner = if let Some(owner) = &self.owner {
+            owner.source.validate()?;
+            if owner.internal_token_env.is_empty()
+                || owner.internal_token_env.len() > 128
+                || !owner
+                    .internal_token_env
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(invalid());
+            }
+            let internal = crate::config::secret(&owner.internal_token_env)?;
+            let upstream = crate::config::secret(&owner.source.token_env)?;
+            if internal.is_empty()
+                || internal.len() > 4096
+                || !internal.bytes().all(|b| (33..=126).contains(&b))
+                || internal == token
+                || upstream == token
+                || upstream == internal
+            {
+                return Err(invalid());
+            }
+            let (directory, database) = match &self.backend {
+                Backend::Files { directory } => {
+                    if owner.staging_directory.is_some() {
+                        return Err(invalid());
+                    }
+                    (directory.clone(), None)
+                }
+                Backend::Postgres { connection } => {
+                    let password = crate::config::secret(&connection.password_env)?;
+                    if password == internal || password == upstream {
+                        return Err(invalid());
+                    }
+                    (
+                        owner.staging_directory.clone().ok_or_else(invalid)?,
+                        Some(connection.clone()),
+                    )
+                }
+            };
+            internal_token = Some(internal);
+            Some(crate::registry_owner::Worker::new(
+                owner,
+                self.scope.clone(),
+                directory,
+                database,
+            )?)
+        } else {
+            None
+        };
         let state = Arc::new(Service {
             scope: self.scope.clone(),
             backend,
+            owner: owner.clone(),
         });
         let routes = Router::new()
             .route("/manifest", get(current))
@@ -113,13 +166,35 @@ impl Config {
                 Arc::<str>::from(token),
                 crate::api::authorize,
             ))
-            .with_state(state);
+            .with_state(state.clone());
         let prefix = if self.regional_paths {
             "/api/v1/jp/master-data"
         } else {
             "/api/v1/master-data"
         };
         let mut router = Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-master-registry","version":env!("CARGO_PKG_VERSION")}))})).nest(prefix,routes);
+        if let Some(token) = internal_token {
+            let internal = Router::new()
+                .route("/master-data/updater", get(owner_status))
+                .route("/master-data/refresh", post(owner_refresh))
+                .route(
+                    "/master-data/sync",
+                    post(owner_hint).layer(axum::extract::DefaultBodyLimit::max(4096)),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    Arc::<str>::from(token),
+                    crate::api::authorize,
+                ))
+                .with_state(state);
+            router = router.nest(
+                if self.regional_paths {
+                    "/internal/v1/jp"
+                } else {
+                    "/internal/v1"
+                },
+                internal,
+            );
+        }
         if let Some(log) = &self.access_log {
             router = crate::access_log::AccessLog::new(log.clone())
                 .map_err(|_| invalid())?
@@ -129,6 +204,7 @@ impl Config {
             listen: self.listen,
             tls,
             router,
+            owner,
         })
     }
 }
@@ -139,6 +215,7 @@ pub struct Prepared {
     pub listen: SocketAddr,
     pub tls: Option<crate::server::LoadedTls>,
     pub router: Router,
+    pub owner: Option<Arc<crate::registry_owner::Worker>>,
 }
 enum Source {
     Files(PathBuf),
@@ -147,6 +224,7 @@ enum Source {
 struct Service {
     scope: registry::Scope,
     backend: Source,
+    owner: Option<Arc<crate::registry_owner::Worker>>,
 }
 enum Selection {
     Current,
@@ -379,4 +457,29 @@ async fn bundle(
     )
     .await?;
     bundle.response(headers, &version, &hash)
+}
+
+async fn owner_status(State(s): State<Arc<Service>>) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.owner.as_ref().ok_or(AppError::NotFound)?.status().await,
+    ))
+}
+async fn owner_refresh(
+    State(s): State<Arc<Service>>,
+) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
+    s.owner.as_ref().ok_or(AppError::NotFound)?.refresh();
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({"status":"accepted"})),
+    ))
+}
+async fn owner_hint(
+    State(s): State<Arc<Service>>,
+    Json(hint): Json<crate::master_sync::UpdateHint>,
+) -> Result<(axum::http::StatusCode, Json<Value>), AppError> {
+    s.owner.as_ref().ok_or(AppError::NotFound)?.hint(&hint)?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(json!({"status":"accepted"})),
+    ))
 }

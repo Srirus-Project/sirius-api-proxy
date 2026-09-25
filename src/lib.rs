@@ -65,3 +65,5 @@ mod file_lock;
 pub mod registry_service;
 
 mod master_bundle;
+
+pub mod registry_owner;

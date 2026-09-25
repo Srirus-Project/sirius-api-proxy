@@ -26,3 +26,15 @@ backend:
 #   format: json
 #   output:
 #     type: stderr
+
+# Optional verified Master owner (credentials must all differ):
+# owner:
+#   internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+#   source:
+#     origin: https://owner.example.invalid
+#     token_env: SIRIUS_MASTER_OWNER_TOKEN
+#     regional_paths: false
+#     interval_seconds: 300
+#     timeout_seconds: 600
+#     request_timeout_ms: 60000
+#   staging_directory: ./registry-master # PostgreSQL only; omit for files

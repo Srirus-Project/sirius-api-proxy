@@ -3,7 +3,7 @@
 Run `sirius-api-proxy registry-serve REGISTRY_CONFIG` using a private copy of
 [the example](examples/master-registry.yaml). Set `SIRIUS_REGISTRY_TOKEN` to a dedicated
 random bearer token. This command initializes no game client, account pool, CDN transport,
-background game updater or runtime Protobuf bundle. It can run from a directory without
+background game updater or runtime Protobuf bundle. An optional owner worker fetches only verified Master data. It can run from a directory without
 `protocol/`. It shares the normal binary's TLS listener, application/access logging and
 SIGINT/SIGTERM shutdown. Configuration is bounded to 64 KiB and rejects unknown fields.
 
@@ -56,10 +56,8 @@ not pretend that file installation chronology and database publication chronolog
 
 ## Remaining registry work
 
-This command currently serves data written by the existing file importer, owner updater,
-background database publisher or explicit database commands. Standalone owner pull/poll,
-authenticated refresh/publication hints are separate
-remaining restoration work. No Sekai-specific music metadata or app-identity overrides are
+The service can serve files or database state written externally or by the optional owner worker
+below. An explicit local-only rescan/publication trigger remains separate restoration work. No Sekai-specific music metadata or app-identity overrides are
 introduced. Final candidate and packaged cross-platform acceptance are still required for 1.2.0.
 
 
@@ -87,3 +85,58 @@ scoped content hash and a safe content-derived download filename. Bundle respons
 therefore the archive bytes. Conditional 304 is considered only after full source verification
 and archive construction, so it cannot conceal later corruption. Range/resume is not implemented.
 Clients must still check successful HTTP completion before using or extracting a downloaded file.
+
+
+## Optional owner pull and publication
+
+Configure `owner` to synchronize from a verified Sirius Master endpoint on startup, at the
+configured interval, and when an authenticated refresh or update hint arrives:
+
+```yaml
+owner:
+  internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+  source:
+    origin: https://owner.example.invalid
+    token_env: SIRIUS_MASTER_OWNER_TOKEN
+    regional_paths: false
+    interval_seconds: 300 # 60–86400
+    timeout_seconds: 600
+    request_timeout_ms: 60000
+  # PostgreSQL backends require this local verified snapshot directory:
+  # staging_directory: ./registry-master
+```
+
+File backends synchronize into their configured serving directory and reject `staging_directory`
+to avoid ambiguous ownership. PostgreSQL backends require that directory: first the worker
+installs a fully verified local snapshot, then it transactionally publishes to the database.
+With this worker enabled, the database role needs the writer's schema/publication permissions;
+a SELECT-only role is suitable only for a registry without an owner worker.
+
+Public read, internal administration and source bearer values must all differ. Database passwords
+must also differ from all three. Source transport uses verified HTTPS, no ambient proxy, no redirects
+or hidden retries; explicit HTTP is limited to the existing loopback-only testing policy. No game
+account, game server access or runtime proto bundle is needed. Restart to rotate configuration/secrets.
+
+| Internal route under `/internal/v1` (or `/internal/v1/jp`) | Behavior |
+| --- | --- |
+| `GET /master-data/updater` | Pending/running/ready/failed/stopped and process-local last success |
+| `POST /master-data/refresh` | Queue a coalesced source reconciliation; return 202 |
+| `POST /master-data/sync` | Validate a bounded scoped `{scope, content_sha256}` hint, queue reconciliation; return 202 |
+
+These routes exist only with an owner configured and require its internal token. The update hint
+matches the existing `master_notify` contract; point a producer's notification target at this registry.
+A hint never supplies a URL, content or authority: the configured source's current manifest remains
+authoritative. Acceptance means a wakeup was queued, not that publication finished. Hints during an
+active transfer coalesce into a subsequent reconciliation. Wakes are process-local; startup reconciliation
+and polling recover after restarts or lost notifications.
+
+Each worker serializes its transfers. Failed source download/integrity checks preserve local CURRENT
+and published database state. Failed database publication may leave a newer verified local snapshot,
+while the served database and last-success status remain at their previous version. Retry reuses local
+verified tables and reconciles the database by content identity. There is no file fallback for database
+reads. Errors expose fixed codes without credentials, URLs or paths. Shutdown cancels in-flight owner
+requests/database work; the normal snapshot and transaction cancellation protections remain in force.
+
+Tests exercise a real HTTP owner, startup, authorization, scoped hints, source failure/recovery,
+stalled-request shutdown, actual PostgreSQL insertion failure/retry, observed advisory-lock blocking
+at shutdown, restart deduplication, and a separately executed real 60-second periodic retry without hints.
