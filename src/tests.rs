@@ -6946,3 +6946,178 @@ async fn master_sync_notifications_are_scoped_coalesced_and_fetch_verified_owner
     assert!(game.received.lock().unwrap().is_empty());
     server.abort();
 }
+
+#[tokio::test]
+async fn master_notification_delivery_retries_only_unaccepted_content() {
+    use crate::{
+        master_notify::Target,
+        master_registry::Scope,
+        region::{Platform, Region},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let app = axum::Router::new().route(
+        "/internal/v1/jp/master-data/sync",
+        axum::routing::post({
+            let count = count.clone();
+            let seen = seen.clone();
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let count = count.clone();
+                let seen = seen.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer notification-only");
+                    assert_eq!(body["scope"]["region"], "jp");
+                    seen.lock().await.push(body);
+                    let n = count.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                    } else if n == 1 {
+                        // A successful status alone must not acknowledge delivery.
+                        (
+                            axum::http::StatusCode::ACCEPTED,
+                            "{\"status\":\"completed\"}",
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::ACCEPTED,
+                            "{\"status\":\"accepted\"}",
+                        )
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let scope = Scope {
+        region: Region::Jp,
+        environment: "release".into(),
+        platform: Platform::Ios,
+    };
+    let make = || {
+        Target::new(
+            &origin,
+            "notification-only",
+            scope.clone(),
+            true,
+            true,
+            1000,
+        )
+        .unwrap()
+    };
+    let mut target = make();
+    let first = "a".repeat(64);
+    let next = "b".repeat(64);
+    assert!(target.deliver("invalid").await.is_err());
+    assert!(target.deliver(&first).await.is_err());
+    assert!(target.deliver(&first).await.is_err());
+    // Supersede a failed old hint with current committed content.
+    assert!(target.deliver(&next).await.unwrap());
+    assert!(!target.deliver(&next).await.unwrap());
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    // Delivery state is deliberately transient: restart resends CURRENT.
+    assert!(make().deliver(&next).await.unwrap());
+    assert_eq!(count.load(Ordering::SeqCst), 4);
+    assert_eq!(seen.lock().await[2]["content_sha256"], next);
+    assert!(Target::new(
+        &origin,
+        "notification-only",
+        scope.clone(),
+        true,
+        false,
+        1000
+    )
+    .is_err());
+    assert!(Target::new(
+        &(origin + "/custom"),
+        "notification-only",
+        scope,
+        true,
+        true,
+        1000
+    )
+    .is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn master_notification_rejects_redirects_unbounded_and_stalled_replies() {
+    use crate::{
+        master_notify::Target,
+        master_registry::Scope,
+        region::{Platform, Region},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mode = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/internal/v1/master-data/sync",
+        axum::routing::post({
+            let mode = mode.clone();
+            let calls = calls.clone();
+            move || {
+                let mode = mode.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    match mode.load(Ordering::SeqCst) {
+                        0 => axum::http::Response::builder()
+                            .status(307)
+                            .header("location", "/internal/v1/master-data/sync")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                        1 => axum::http::Response::builder()
+                            .status(202)
+                            .body(axum::body::Body::from("x".repeat(1025)))
+                            .unwrap(),
+                        2 => axum::http::Response::builder()
+                            .status(202)
+                            .body(axum::body::Body::from(
+                                "{\"status\":\"accepted\",\"extra\":true}",
+                            ))
+                            .unwrap(),
+                        3 => {
+                            let stream = futures::stream::once(async {
+                                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"))
+                            })
+                            .chain(futures::stream::pending());
+                            axum::http::Response::builder()
+                                .status(202)
+                                .body(axum::body::Body::from_stream(stream))
+                                .unwrap()
+                        }
+                        _ => axum::http::Response::builder()
+                            .status(202)
+                            .body(axum::body::Body::from("{\"status\":\"accepted\"}"))
+                            .unwrap(),
+                    }
+                }
+            }
+        }),
+    );
+    use futures::StreamExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let scope = Scope {
+        region: Region::Jp,
+        environment: "release".into(),
+        platform: Platform::Ios,
+    };
+    let mut target = Target::new(&origin, "notify-token", scope, false, true, 200).unwrap();
+    let hash = "a".repeat(64);
+    for n in 0..4 {
+        mode.store(n, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            assert!(target.deliver(&hash).await.is_err());
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), n + 1);
+    }
+    mode.store(4, Ordering::SeqCst);
+    assert!(target.deliver(&hash).await.unwrap());
+    server.abort();
+}

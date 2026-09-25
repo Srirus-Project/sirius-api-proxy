@@ -80,7 +80,7 @@ impl From<MasterError> for Error {
     }
 }
 /// A wakeup hint only; the configured owner manifest remains authoritative.
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateHint {
     pub scope: Scope,

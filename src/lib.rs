@@ -46,3 +46,5 @@ pub mod node_routing;
 pub mod master_registry;
 
 pub mod master_sync;
+
+pub mod master_notify;

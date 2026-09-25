@@ -180,3 +180,17 @@ content is accepted from the hint. A stale digest therefore cannot roll back a c
 Periodic polling remains the fallback, and service restart performs an immediate poll,
 so notification loss does not disable eventual synchronization. This receiver does not yet
 provide owner-side delivery, retries or publication notifications to unrelated services.
+
+### Owner transport restoration status
+
+The owner transport now has a bounded one-attempt sender with per-target in-memory
+acknowledgements. Only HTTP 202 with the strict JSON status `accepted` advances that
+state; errors leave the same content eligible for retry, and newer committed content
+can supersede an unaccepted older hint. Restart intentionally permits resending CURRENT.
+Requests use explicit origins, normal TLS verification, no ambient proxies, no redirects
+and no implicit retries. Response bodies are bounded to 1 KiB and the request deadline
+covers body consumption. Acceptance does not prove consumer synchronization.
+
+This transport is not yet wired into deployment configuration or background workers.
+Publication-driven reconciliation, scheduling and outgoing credential-scope checks remain
+pending; no automatic owner notifications are enabled by this change.
