@@ -56,6 +56,10 @@ pub fn router_at(
         .route("/regions", get(regions))
         .route("/master-data", get(master_status))
         .route("/master-data/manifest", get(registry_current))
+        .route(
+            "/master-data/by-hash/{hash}/manifest",
+            get(registry_by_hash),
+        )
         .route("/master-data/history", get(registry_history))
         .route(
             "/master-data/snapshots/{snapshot}/manifest",
@@ -391,6 +395,13 @@ async fn registry_response(
         crate::master::MasterError::NotFound => AppError::NotFound,
         _ => AppError::MasterUnavailable,
     })?;
+    registry_document(document, headers, pinned)
+}
+fn registry_document(
+    document: crate::master_registry::Document,
+    headers: axum::http::HeaderMap,
+    pinned: bool,
+) -> Result<Response, AppError> {
     let unchanged = headers
         .get("if-none-match")
         .and_then(|h| h.to_str().ok())
@@ -488,4 +499,33 @@ async fn registry_history(
             serde_json::to_vec(&value).map_err(|_| AppError::MasterUnavailable)?,
         ))
         .map_err(|_| AppError::MasterUnavailable)
+}
+
+async fn registry_by_hash(
+    State(c): State<Arc<GameClient>>,
+    Path(hash): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    if !crate::master_registry::hash_valid(&hash) {
+        return Err(AppError::InvalidRequest);
+    }
+    let root = c
+        .master_directory()
+        .ok_or(AppError::MasterUnavailable)?
+        .to_owned();
+    let scope = crate::master_registry::Scope {
+        region: c.region(),
+        environment: c.environment().into(),
+        platform: c.platform(),
+    };
+    let document = tokio::task::spawn_blocking(move || {
+        crate::master_registry::manifest_by_hash(&root, scope, &hash)
+    })
+    .await
+    .map_err(|_| AppError::MasterUnavailable)?
+    .map_err(|e| match e {
+        crate::master::MasterError::NotFound => AppError::NotFound,
+        _ => AppError::MasterUnavailable,
+    })?;
+    registry_document(document, headers, false)
 }

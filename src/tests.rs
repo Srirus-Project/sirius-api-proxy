@@ -7633,3 +7633,151 @@ async fn asset_dispatch_admin_abandoned_commands_do_not_mutate_after_timeout() {
         .unwrap();
     assert_eq!(response.status(), 503);
 }
+
+#[tokio::test]
+async fn master_content_hash_lookup_is_committed_scoped_and_conditionally_cached() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let initial = registry::manifest(&output, None, registry_scope()).unwrap();
+    let initial_value: registry::PublishedManifest =
+        serde_json::from_slice(&initial.bytes).unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "second-content".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &output, &decoder).unwrap();
+    let latest = master::import_directory(&input, &output, &decoder).unwrap();
+    let latest_doc = registry::manifest(&output, None, registry_scope()).unwrap();
+    let latest_value: registry::PublishedManifest =
+        serde_json::from_slice(&latest_doc.bytes).unwrap();
+    let old = registry::manifest_by_hash(&output, registry_scope(), &initial_value.content_sha256)
+        .unwrap();
+    let old_value: registry::PublishedManifest = serde_json::from_slice(&old.bytes).unwrap();
+    assert_eq!(old_value.snapshot, first.snapshot);
+    let found = registry::manifest_by_hash(&output, registry_scope(), &latest_value.content_sha256)
+        .unwrap();
+    assert_eq!(found.bytes, latest_doc.bytes);
+    // A fully staged snapshot not in CURRENT's predecessor chain is not published.
+    manifest.version = "orphan-content".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &output, &decoder).unwrap();
+    let orphan: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    std::fs::write(output.join("CURRENT"), &latest.snapshot).unwrap();
+    assert!(matches!(
+        registry::manifest_by_hash(&output, registry_scope(), &orphan.content_sha256),
+        Err(master::MasterError::NotFound)
+    ));
+    let mut other_scope = registry_scope();
+    other_scope.environment = "review".into();
+    assert!(matches!(
+        registry::manifest_by_hash(&output, other_scope, &initial_value.content_sha256),
+        Err(master::MasterError::NotFound)
+    ));
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(
+        GameClient::new(cfg).unwrap(),
+        "api".into(),
+        "internal".into(),
+    );
+    let get = |hash: &str, token: &str, etag: Option<&str>| {
+        let mut request = Request::get(format!("/api/v1/master-data/by-hash/{hash}/manifest"))
+            .header("authorization", format!("Bearer {token}"));
+        if let Some(etag) = etag {
+            request = request.header("if-none-match", etag);
+        }
+        request.body(axum::body::Body::empty()).unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&initial_value.content_sha256, "internal", None))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for bad in ["bad".to_owned(), "A".repeat(64), "g".repeat(64)] {
+        assert_eq!(
+            app.clone()
+                .oneshot(get(&bad, "api", None))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&orphan.content_sha256, "api", None))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let response = app
+        .clone()
+        .oneshot(get(&initial_value.content_sha256, "api", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "private, no-cache");
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), initial.bytes);
+    let response = app
+        .clone()
+        .oneshot(get(&initial_value.content_sha256, "api", Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 304);
+    assert!(response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .is_empty());
+    // Legacy boundaries are explicit: do not discover older directories by scanning disk.
+    std::fs::remove_file(output.join(&latest.snapshot).join("publication.json")).unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&initial_value.content_sha256, "api", None))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&latest_value.content_sha256, "api", None))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // Corrupt existing history fails rather than bypassing the history boundary.
+    std::fs::write(
+        output.join(&latest.snapshot).join("publication.json"),
+        b"invalid",
+    )
+    .unwrap();
+    assert_eq!(
+        app.oneshot(get(&latest_value.content_sha256, "api", None))
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+}

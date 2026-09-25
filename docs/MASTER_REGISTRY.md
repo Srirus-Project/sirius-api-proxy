@@ -10,6 +10,7 @@ For a single-region deployment:
 | GET path under `/api/v1/master-data` | Result |
 | --- | --- |
 | `/manifest` | Current snapshot's scoped plaintext manifest |
+| `/by-hash/{content_sha256}/manifest` | Newest committed installation with that scoped content identity |
 | `/history?limit=20` | Recent installations in committed predecessor order |
 | `/snapshots/{snapshot}/manifest` | The named snapshot's manifest, independent of CURRENT |
 | `/snapshots/{snapshot}/tables/{table}/{sha256}` | Exact JSON bytes matching the pinned SHA-256 |
@@ -229,3 +230,25 @@ only wakes the consumer; its configured owner and full verification determine in
 data. Periodic consumer polling remains necessary even after an accepted notification.
 General publication webhooks, central registry persistence and Git publication remain
 separate restoration work.
+
+## Lookup by content identity
+
+`GET /api/v1/master-data/by-hash/{content_sha256}/manifest` resolves a content identity
+without requiring the caller to know a node's snapshot UUID. The hash must be exactly
+64 lowercase hexadecimal characters (otherwise 400). Authorization is the normal public
+Master-read bearer, and regional deployments use the corresponding regional prefix.
+
+The lookup pins CURRENT and walks its committed predecessor chain. It selects the newest
+matching installation, returns 404 when no reachable match exists, and stops at a legacy
+snapshot without a publication record. It does not scan unrelated directories, so a staged
+or orphaned snapshot is never exposed as a published hash. Corruption and the 10,000-link
+traversal limit return 503 rather than an incomplete successful result. This is a bounded
+local-history lookup; a persistent deep-history index and optional database backend remain
+separate work.
+
+Content identity includes region/environment/platform. Identical data in another scope
+does not match. Reimporting the same content may change the selected snapshot UUID and
+response ETag while preserving `content_sha256`; responses therefore use private/no-cache
+and support If-None-Match, rather than promising immutable response bytes for the hash URL.
+Pin the returned snapshot and table hashes when fetching files. As with other manifest
+reads, indexed metadata is validated here; exact table payloads are verified when read.

@@ -101,7 +101,7 @@ pub fn file(name: String, bytes: &[u8]) -> File {
         sha256: digest(bytes),
     }
 }
-fn hash_valid(hash: &str) -> bool {
+pub fn hash_valid(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
@@ -401,28 +401,10 @@ pub fn history_page(
         let doc = manifest(root, Some(&snapshot), scope.clone())?;
         let value: PublishedManifest =
             serde_json::from_slice(&doc.bytes).map_err(|_| MasterError::Format)?;
-        let publication = match regular(&directory.join("publication.json"), 4096) {
-            Ok(bytes) => {
-                let record: Publication =
-                    serde_json::from_slice(&bytes).map_err(|_| MasterError::Format)?;
-                if record.schema_version != 1
-                    || record.snapshot != snapshot
-                    || record.previous_snapshot.as_ref().is_some_and(|previous| {
-                        !previous.starts_with("master-")
-                            || !master::safe_component(previous)
-                            || visited.contains(previous)
-                    })
-                {
-                    return Err(MasterError::Format);
-                }
-                Some(record)
-            }
-            Err(MasterError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                legacy_boundary = true;
-                None
-            }
-            Err(e) => return Err(e),
-        };
+        let publication = publication(&directory, &snapshot, &visited)?;
+        if publication.is_none() {
+            legacy_boundary = true;
+        }
         let published_at = publication.as_ref().map(|p| p.published_at);
         next = publication.and_then(|p| p.previous_snapshot);
         if !cursor_found {
@@ -458,4 +440,57 @@ pub fn history_page(
         next_before,
         legacy_boundary,
     })
+}
+
+fn publication(
+    directory: &Path,
+    snapshot: &str,
+    visited: &std::collections::BTreeSet<String>,
+) -> Result<Option<Publication>, MasterError> {
+    match regular(&directory.join("publication.json"), 4096) {
+        Ok(bytes) => {
+            let record: Publication =
+                serde_json::from_slice(&bytes).map_err(|_| MasterError::Format)?;
+            if record.schema_version != 1
+                || record.snapshot != snapshot
+                || record.previous_snapshot.as_ref().is_some_and(|previous| {
+                    !previous.starts_with("master-")
+                        || !master::safe_component(previous)
+                        || visited.contains(previous)
+                })
+            {
+                return Err(MasterError::Format);
+            }
+            Ok(Some(record))
+        }
+        Err(MasterError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+/// Find the newest committed installation with this scoped content identity.
+/// UUID and response ETag may change after an identical reimport; content identity does not.
+pub fn manifest_by_hash(root: &Path, scope: Scope, hash: &str) -> Result<Document, MasterError> {
+    if !hash_valid(hash) {
+        return Err(MasterError::Format);
+    }
+    let mut next = predecessor(root)?;
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(snapshot) = next.take() {
+        if visited.len() == 10_000 {
+            return Err(MasterError::Limit);
+        }
+        if !visited.insert(snapshot.clone()) {
+            return Err(MasterError::Format);
+        }
+        let directory = snapshot_directory(root, &snapshot)?;
+        let record = publication(&directory, &snapshot, &visited)?;
+        let document = manifest(root, Some(&snapshot), scope.clone())?;
+        let value: PublishedManifest =
+            serde_json::from_slice(&document.bytes).map_err(|_| MasterError::Format)?;
+        if value.content_sha256 == hash {
+            return Ok(document);
+        }
+        next = record.and_then(|r| r.previous_snapshot);
+    }
+    Err(MasterError::NotFound)
 }
