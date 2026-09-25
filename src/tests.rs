@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        master_database: None,
         master_git: None,
         master_notify: None,
         master_sync: None,
@@ -9153,6 +9154,8 @@ async fn dispatch_archive_admin_requires_auth_completion_and_survives_owner_rest
     assert_eq!(store.entries().len(), 1);
 }
 
+static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn master_database_config() -> crate::master_database::Config {
     crate::master_database::Config {
         host: "127.0.0.1".into(),
@@ -9213,6 +9216,7 @@ async fn master_database_policy_rejects_unsafe_transport_and_source_before_conne
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
 async fn master_database_postgres_atomic_history_retention_integrity_and_retry() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
     use crate::{master, master_database as db, master_registry as registry};
     use sqlx::{Connection, Row};
     let mut cfg = master_database_config();
@@ -9370,4 +9374,246 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
     tls.plaintext_loopback = false;
     assert!(db::publish(&tls, &source, scope).await.is_err());
     assert!(registry::hash_valid(&third.content_sha256));
+}
+
+#[test]
+fn master_database_worker_config_and_credentials_are_scoped() {
+    use crate::master_database_worker::{self as worker, Config as Policy};
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    let root = tempfile::tempdir().unwrap();
+    cfg.master_directory = Some(root.path().into());
+    let mut connection = master_database_config();
+    connection.password_env = format!("SIRIUS_DB_SCOPE_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&connection.password_env, "separate-database-password");
+    cfg.master_database = Some(Policy {
+        connection: connection.clone(),
+        interval_seconds: 10,
+    });
+    cfg.validate().unwrap();
+    worker::validate_tokens(&[&cfg]).unwrap();
+    for interval in [0, 9, 86401] {
+        let mut invalid = cfg.clone();
+        invalid.master_database.as_mut().unwrap().interval_seconds = interval;
+        assert!(invalid.validate().is_err());
+    }
+    let mut missing = cfg.clone();
+    missing.master_directory = None;
+    assert!(missing.validate().is_err());
+    let mut global = cfg.clone();
+    global.region = crate::region::Region::En;
+    assert!(global
+        .master_database
+        .as_ref()
+        .unwrap()
+        .validate(&global)
+        .is_err());
+    let other = regional_config(crate::region::Region::En);
+    for name in [
+        &cfg.api_token_env,
+        &cfg.internal_token_env,
+        &other.api_token_env,
+    ] {
+        std::env::set_var(&connection.password_env, std::env::var(name).unwrap());
+        assert!(worker::validate_tokens(&[&cfg, &other]).is_err());
+    }
+    std::env::set_var(&connection.password_env, "separate-database-password");
+    let mut proxy = cfg.clone();
+    let proxy_env = format!("SIRIUS_DB_PROXY_{}", uuid::Uuid::new_v4().simple());
+    use base64::Engine;
+    std::env::set_var(
+        &proxy_env,
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:separate-database-password")
+        ),
+    );
+    proxy.upstream.proxy_authorization_env = Some(proxy_env);
+    assert!(worker::validate_tokens(&[&cfg, &proxy]).is_err());
+    let prepared = crate::deployment::DeploymentConfig::Single(Box::new(cfg))
+        .prepare()
+        .unwrap();
+    assert_eq!(prepared.database_publishers.len(), 1);
+}
+
+async fn wait_database_status(game: &GameClient, status: &str, old_hash: Option<&str>) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = game.master_database_status().await;
+            if state["status"] == status
+                && old_hash
+                    .is_none_or(|old| state["last_success"]["content_sha256"].as_str() != Some(old))
+            {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_worker_start_wake_retry_auth_and_shutdown() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master, master_database_worker as worker};
+    use sqlx::Connection;
+    let (root, input, source, _) = registry_fixture();
+    let version_suffix = uuid::Uuid::new_v4().simple().to_string();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.master_directory = Some(source.clone());
+    let mut connection = master_database_config();
+    connection.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.master_database = Some(worker::Config {
+        connection: connection.clone(),
+        interval_seconds: 10,
+    });
+    let game = GameClient::new(cfg.clone()).unwrap();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker::Worker::new(&cfg, game.clone()).unwrap().run(rx));
+    let first = wait_database_status(&game, "ready", None).await;
+    let (mut manifest, decoder, _) = master_fixture();
+    let mut conn = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.sirius_master_documents DROP CONSTRAINT IF EXISTS sirius_worker_reject",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE public.sirius_master_documents ADD CONSTRAINT sirius_worker_reject CHECK(name <> 'MasterFixture.json') NOT VALID").execute(&mut conn).await.unwrap();
+    manifest.version = format!("db-worker-update-{version_suffix}");
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    game.record_master_update(json!({"status":"ready","result":{"action":"updated"}}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), game.master_publication_notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), game.master_git_notified())
+        .await
+        .unwrap();
+    let failed = wait_database_status(&game, "failed", None).await;
+    assert_eq!(failed["last_success"], first["last_success"]);
+    assert_eq!(failed["error_code"], "database_operation");
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    sqlx::query("ALTER TABLE public.sirius_master_documents DROP CONSTRAINT sirius_worker_reject")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // No notification here: actual periodic retry must recover.
+    let next = wait_database_status(
+        &game,
+        "ready",
+        first["last_success"]["content_sha256"].as_str(),
+    )
+    .await;
+    let router = api::router(game.clone(), "read".into(), "admin".into());
+    for (token, status) in [(None, 401), (Some("read"), 401), (Some("admin"), 200)] {
+        let mut req = Request::builder().uri("/internal/v1/master-data/database");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        if status == 200 {
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains(root.path().to_str().unwrap()));
+            assert!(!text.contains(&std::env::var(&connection.password_env).unwrap()));
+            assert!(!text.contains("postgres"));
+        }
+    }
+    let mut lock = conn.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(7369726975731200)")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    manifest.version = format!("db-worker-cancel-{version_suffix}");
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    game.record_master_update(json!({"status":"ready","result":{"action":"updated"}}))
+        .await;
+    wait_database_status(&game, "running", None).await;
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    lock.rollback().await.unwrap();
+    assert_eq!(game.master_database_status().await["status"], "stopped");
+    let scope_key = serde_json::to_string(&registry_scope()).unwrap();
+    let current: String =
+        sqlx::query_scalar("SELECT content_hash FROM public.sirius_master_current WHERE scope=$1")
+            .bind(scope_key)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(current, next["last_success"]["content_sha256"]);
+    let restarted = GameClient::new(cfg.clone()).unwrap();
+    let restored = worker::Worker::new(&cfg, restarted.clone())
+        .unwrap()
+        .update_once()
+        .await
+        .unwrap();
+    assert!(restored.changed); // catches the local snapshot that was cancelled before commit
+    let again = worker::Worker::new(&cfg, GameClient::new(cfg.clone()).unwrap())
+        .unwrap()
+        .update_once()
+        .await
+        .unwrap();
+    assert!(!again.changed);
+    assert_eq!(restored.content_sha256, again.content_sha256);
+
+    assert_eq!(
+        GameClient::new(config())
+            .unwrap()
+            .master_database_status()
+            .await["status"],
+        "disabled"
+    );
+}
+
+#[test]
+fn exclusive_file_ownership_ends_while_duplicate_description_remains_open() {
+    use crate::file_lock::Exclusive;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("owner.lock");
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap()
+    };
+    let first = Exclusive::acquire(open()).unwrap();
+    let inherited = first.duplicate().unwrap();
+    assert!(Exclusive::acquire(open()).is_err());
+    drop(first);
+    let next = Exclusive::acquire(open()).expect("duplicate must not extend logical ownership");
+    drop(inherited);
+    assert!(
+        Exclusive::acquire(open()).is_err(),
+        "old duplicate close must not release the next owner"
+    );
+    drop(next);
+    assert!(Exclusive::acquire(open()).is_ok());
 }

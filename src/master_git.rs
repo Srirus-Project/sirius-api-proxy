@@ -152,7 +152,7 @@ impl CommitPolicy {
 }
 struct Prepared {
     policy: CommitPolicy,
-    _owner: fs::File,
+    _owner: crate::file_lock::Exclusive,
     directory: PathBuf,
     staging: tempfile::TempDir,
     manifest: PublishedManifest,
@@ -177,7 +177,7 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
         .write(true)
         .open(lock)
         .map_err(|_| Error::Snapshot)?;
-    owner.try_lock().map_err(|_| Error::Locked)?;
+    let owner = crate::file_lock::Exclusive::acquire(owner).map_err(|_| Error::Locked)?;
     let marker = directory.join("sirius-git.json");
     let expected = serde_json::json!({"schema_version":1,"scope":scope});
     if marker.exists() {

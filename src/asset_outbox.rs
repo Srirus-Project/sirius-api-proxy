@@ -96,7 +96,7 @@ struct Ledger {
 }
 pub struct Outbox {
     directory: PathBuf,
-    _owner: File,
+    _owner: crate::file_lock::Exclusive,
     ledger: Ledger,
     capacity: usize,
 }
@@ -113,7 +113,7 @@ impl Outbox {
             .write(true)
             .open(directory.join("owner.lock"))
             .map_err(|_| Error::Storage)?;
-        owner.try_lock().map_err(|_| Error::Locked)?;
+        let owner = crate::file_lock::Exclusive::acquire(owner).map_err(|_| Error::Locked)?;
         let path = directory.join("outbox.json");
         let ledger: Ledger = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::Storage)?,

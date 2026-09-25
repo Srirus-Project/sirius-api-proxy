@@ -157,3 +157,15 @@ response_cache:
 #     # proxy_url_env: SIRIUS_MASTER_GIT_PROXY_URL
 #     allow_http: false
 #     allow_file: false
+
+# Optional verified Master database mirror, independent of local snapshot availability.
+# See docs/MASTER_DATABASE.md. Set master_directory before enabling.
+# master_database:
+#   interval_seconds: 300
+#   connection:
+#     host: database.example.invalid
+#     database: sirius_master
+#     username: sirius_master
+#     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
+#     timeout_seconds: 120
+#     keep_snapshots: 20

@@ -52,12 +52,42 @@ and leaves historical event hashes and every local file intact. History is not a
 pruned. PostgreSQL JSONB's supported numeric/string range still applies; a value PostgreSQL
 cannot represent causes transaction rollback even though exact JSON bytes are also retained.
 
-## Current integration boundary
+## Background publication
 
-This is a working explicit importer and database mirror. Background publication/retry, database
-HTTP reads, file-to-database registry migration and a standalone registry service are not yet
-connected. Do not configure `master_database` on the API service until that integration exists.
-Only PostgreSQL is implemented; there is no silent fallback to another database.
+Configure `master_database` on the JP single-region configuration or JP profile of a multi-region
+deployment. `master_directory` must be set. The connection fields match the CLI example:
+
+```yaml
+master_directory: ./master
+master_database:
+  interval_seconds: 300 # 10–86400; startup always reconciles CURRENT
+  connection:
+    host: database.example.invalid
+    database: sirius_master
+    username: sirius_master
+    password_env: SIRIUS_MASTER_DATABASE_PASSWORD
+    timeout_seconds: 120
+    keep_snapshots: 20
+```
+
+Successful in-process Master installations wake the database worker independently of Git and
+consumer notifications. External file imports are found on the next interval. Notifications
+coalesce; only one import runs per profile. Failures preserve local CURRENT and the last successful
+receipt, then retry periodically. Shutdown cancels active database work and waits for the worker;
+restart rechecks content identity, including recovery from an uncertain commit.
+
+`GET /internal/v1/master-data/database` (or the regional internal prefix) requires the internal
+token and returns `disabled`, `pending`, `running`, `ready`, `failed` or `stopped`, plus the last
+successful receipt and static error code where applicable. It never returns connection settings,
+passwords or filesystem paths. Last-success status is process-local and rebuilt after restart.
+
+Use a dedicated database password distinct from API, internal, game, CDN, peer, updater,
+notification and Git credentials in every deployment profile. Profiles may share database
+credentials deliberately; rows remain scoped by region/environment/platform. Global Master
+publication remains unsupported. Other service functions do not require the database to be up.
+
+Database-backed HTTP document reads, committed file-history migration and a standalone registry
+service remain separate pending work. Only PostgreSQL is implemented; no database fallback occurs.
 
 The optional test `master_database_postgres_atomic_history_retention_integrity_and_retry` requires
 an isolated PostgreSQL server with a `sirius_test` database and `postgres` user. Set
@@ -65,3 +95,8 @@ an isolated PostgreSQL server with a `sirius_test` database and `postgres` user.
 It creates synthetic scoped data, injects a document-insert failure, exercises lock timeout and
 cancellation, verifies concurrent deduplication, retention/isolation and corruption refusal,
 and checks that verified TLS refuses a plaintext-only server. Never point it at production.
+
+The optional `master_database_worker_start_wake_retry_auth_and_shutdown` test exercises real
+startup publication, independent update hints, a failed database insert followed by timed recovery,
+internal route authorization/redaction, and shutdown during a blocked database transaction.
+The two PostgreSQL tests serialize their schema-failure fixtures within the test process.

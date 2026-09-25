@@ -36,7 +36,7 @@ pub enum MasterError {
 }
 
 pub(crate) struct WriterLock {
-    _file: fs::File,
+    _file: crate::file_lock::Exclusive,
 }
 impl WriterLock {
     pub(crate) fn acquire(directory: &Path) -> Result<Self, MasterError> {
@@ -47,7 +47,7 @@ impl WriterLock {
             .read(true)
             .write(true)
             .open(directory.join(".writer.lock"))?;
-        file.try_lock().map_err(|_| MasterError::Busy)?;
+        let file = crate::file_lock::Exclusive::acquire(file).map_err(|_| MasterError::Busy)?;
         Ok(Self { _file: file })
     }
 }

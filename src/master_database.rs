@@ -59,7 +59,7 @@ pub struct Import {
     pub scope: Scope,
     pub database: Config,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
     pub content_sha256: String,
     pub tables: usize,

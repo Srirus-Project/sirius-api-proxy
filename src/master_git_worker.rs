@@ -45,7 +45,7 @@ impl Config {
         Ok(())
     }
 }
-fn credential_parts(value: &str) -> Result<Vec<String>, AppError> {
+pub(crate) fn credential_parts(value: &str) -> Result<Vec<String>, AppError> {
     let bad = || AppError::Config("invalid Master Git authorization");
     let mut parts = vec![value.to_owned()];
     if let Some(token) = value.strip_prefix("Authorization: Bearer ") {
