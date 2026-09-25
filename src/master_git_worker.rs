@@ -9,6 +9,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub commit: master_git::CommitPolicy,
     pub state_directory: PathBuf,
     #[serde(default = "interval")]
     pub interval_seconds: u64,
@@ -19,6 +21,9 @@ fn interval() -> u64 {
 }
 impl Config {
     pub fn validate(&self, game: &GameConfig) -> Result<(), AppError> {
+        self.commit
+            .validate()
+            .map_err(|_| AppError::Config("invalid Master Git commit policy"))?;
         if !cfg!(unix)
             || game.region != crate::region::Region::Jp
             || self.state_directory.as_os_str().is_empty()
@@ -129,19 +134,21 @@ impl Worker {
             .await;
         let result = match &self.config.remote {
             Some(remote) => {
-                master_git::publish(
+                master_git::publish_with_policy(
                     &self.source,
                     &self.config.state_directory,
                     self.scope.clone(),
                     remote,
+                    &self.config.commit,
                 )
                 .await
             }
             None => {
-                master_git::commit(
+                master_git::commit_with_policy(
                     &self.source,
                     &self.config.state_directory,
                     self.scope.clone(),
+                    &self.config.commit,
                 )
                 .await
             }
@@ -153,6 +160,7 @@ impl Worker {
             }
             Err(error) => {
                 let code = match error {
+                    master_git::Error::CommitConfig => "commit_config",
                     master_git::Error::Ownership => "ownership",
                     master_git::Error::Locked => "locked",
                     master_git::Error::Snapshot => "snapshot",

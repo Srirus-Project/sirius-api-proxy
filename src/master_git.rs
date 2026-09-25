@@ -1,4 +1,4 @@
-//! Local Git publication over verified immutable Master snapshots. No network commands.
+//! Managed Git publication over verified immutable Master snapshots.
 use crate::{
     git_process,
     master_registry::{self, PublishedManifest, Scope},
@@ -14,6 +14,8 @@ use std::{
 pub enum Error {
     #[error("invalid or unowned Master Git repository")]
     Ownership,
+    #[error("invalid Master Git commit policy")]
+    CommitConfig,
     #[error("invalid Master Git remote configuration")]
     RemoteConfig,
     #[error("Master Git remote history is incompatible or could not be verified")]
@@ -32,7 +34,124 @@ pub struct Receipt {
     pub changed: bool,
     pub remote_verified: bool,
 }
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
+}
+impl Default for Identity {
+    fn default() -> Self {
+        Self {
+            name: "Sirius Master Publisher".into(),
+            email: "sirius-master@localhost".into(),
+        }
+    }
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningFormat {
+    #[serde(alias = "gpg")]
+    Openpgp,
+    Ssh,
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signing {
+    pub format: SigningFormat,
+    /// OpenPGP fingerprint or absolute SSH key path, never private key material.
+    pub key: String,
+    pub program: Option<PathBuf>,
+}
+#[derive(Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitPolicy {
+    #[serde(default)]
+    pub author: Identity,
+    pub committer: Option<Identity>,
+    pub signing: Option<Signing>,
+}
+impl CommitPolicy {
+    pub fn validate(&self) -> Result<(), Error> {
+        for identity in [
+            &self.author,
+            self.committer.as_ref().unwrap_or(&self.author),
+        ] {
+            if identity.name.trim().is_empty()
+                || identity.name.len() > 256
+                || identity.email.is_empty()
+                || identity.email.len() > 320
+                || !identity.email.contains('@')
+                || identity.email.chars().any(char::is_whitespace)
+                || [&identity.name, &identity.email]
+                    .iter()
+                    .any(|v| v.chars().any(|c| c.is_control() || matches!(c, '<' | '>')))
+            {
+                return Err(Error::CommitConfig);
+            }
+        }
+        if let Some(signing) = &self.signing {
+            if signing.key.is_empty()
+                || signing.key.len() > 1024
+                || signing.key.chars().any(char::is_control)
+            {
+                return Err(Error::CommitConfig);
+            }
+            match signing.format {
+                SigningFormat::Openpgp
+                    if !(16..=64).contains(&signing.key.len())
+                        || !signing.key.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    return Err(Error::CommitConfig)
+                }
+                SigningFormat::Ssh if !Path::new(&signing.key).is_absolute() => {
+                    return Err(Error::CommitConfig)
+                }
+                _ => {}
+            }
+            if let Some(program) = &signing.program {
+                // Git may shell-interpret a custom signing program; permit one executable path only.
+                if !program.is_absolute()
+                    || program.to_str().is_none_or(|p| {
+                        p.len() > 1024
+                            || !p
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+                    })
+                {
+                    return Err(Error::CommitConfig);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn arguments(&self) -> Vec<OsString> {
+        let committer = self.committer.as_ref().unwrap_or(&self.author);
+        let mut values = vec![
+            format!("author.name={}", self.author.name),
+            format!("author.email={}", self.author.email),
+            format!("committer.name={}", committer.name),
+            format!("committer.email={}", committer.email),
+        ];
+        if let Some(signing) = &self.signing {
+            let (format, program_key) = match signing.format {
+                SigningFormat::Openpgp => ("openpgp", "gpg.openpgp.program"),
+                SigningFormat::Ssh => ("ssh", "gpg.ssh.program"),
+            };
+            values.push(format!("gpg.format={format}"));
+            values.push(format!("user.signingkey={}", signing.key));
+            if let Some(program) = &signing.program {
+                values.push(format!("{program_key}={}", program.display()));
+            }
+        }
+        values
+            .into_iter()
+            .flat_map(|v| [OsString::from("-c"), v.into()])
+            .collect()
+    }
+}
 struct Prepared {
+    policy: CommitPolicy,
     _owner: fs::File,
     directory: PathBuf,
     staging: tempfile::TempDir,
@@ -122,6 +241,7 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
     names.push("sirius-publication.json".into());
     names.sort();
     Ok(Prepared {
+        policy: CommitPolicy::default(),
         _owner: owner,
         directory,
         staging,
@@ -165,6 +285,7 @@ async fn command(
         "-c".into(),
         "user.email=sirius-master@localhost".into(),
     ];
+    all.extend(prepared.policy.arguments());
     all.extend(args);
     git_process::run_with_input(
         Path::new("git"),
@@ -179,7 +300,7 @@ async fn command(
 }
 /// Publish a local bare Git commit only; a receipt is not a remote push acknowledgement.
 pub async fn commit(source: &Path, destination: &Path, scope: Scope) -> Result<Receipt, Error> {
-    commit_internal(source, destination, scope, None).await
+    commit_with_policy(source, destination, scope, &CommitPolicy::default()).await
 }
 pub async fn publish(
     source: &Path,
@@ -187,23 +308,43 @@ pub async fn publish(
     scope: Scope,
     remote: &Remote,
 ) -> Result<Receipt, Error> {
+    publish_with_policy(source, destination, scope, remote, &CommitPolicy::default()).await
+}
+pub async fn commit_with_policy(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    policy: &CommitPolicy,
+) -> Result<Receipt, Error> {
+    commit_internal(source, destination, scope, None, policy).await
+}
+pub async fn publish_with_policy(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    remote: &Remote,
+    policy: &CommitPolicy,
+) -> Result<Receipt, Error> {
     remote.validate()?;
-    commit_internal(source, destination, scope, Some(remote)).await
+    commit_internal(source, destination, scope, Some(remote), policy).await
 }
 async fn commit_internal(
     source: &Path,
     destination: &Path,
     scope: Scope,
     remote: Option<&Remote>,
+    policy: &CommitPolicy,
 ) -> Result<Receipt, Error> {
+    policy.validate()?;
     if !cfg!(unix) {
         return Err(Error::Git);
     }
     let source = source.to_owned();
     let destination = destination.to_owned();
-    let prepared = tokio::task::spawn_blocking(move || prepare(&source, &destination, scope))
+    let mut prepared = tokio::task::spawn_blocking(move || prepare(&source, &destination, scope))
         .await
         .map_err(|_| Error::Snapshot)??;
+    prepared.policy = policy.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     command(
         &prepared,
@@ -314,6 +455,9 @@ async fn commit_internal(
     ];
     if let Some(parent) = &parent {
         args.extend(["-p".into(), parent.into()]);
+    }
+    if policy.signing.is_some() {
+        args.push("-S".into());
     }
     let commit = oid(command(&prepared, args, &[], deadline).await?)?;
     command(

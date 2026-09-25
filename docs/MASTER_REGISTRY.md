@@ -156,8 +156,8 @@ Existing snapshot directories are not pruned.
 ## Remaining restoration
 
 Producer reads and consumer synchronization operate over atomic local snapshots.
-Central registry persistence, general completion notifications and optional Git
-publication remain separate restoration work. Local manifest/file tests do not replace yhm01
+Central registry persistence, general completion notifications and the remaining Git
+platform/proxy capabilities remain restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.
 
 ## Consumer update notifications
@@ -228,8 +228,8 @@ content, and intermediate versions can coalesce to the newest committed state. T
 no promise to deliver every installation event, or to deliver exactly once. A notification
 only wakes the consumer; its configured owner and full verification determine installed
 data. Periodic consumer polling remains necessary even after an accepted notification.
-General publication webhooks, central registry persistence and Git publication remain
-separate restoration work.
+General publication webhooks and central registry persistence remain separate restoration work.
+Optional Git publication is described below.
 
 ## Lookup by content identity
 
@@ -267,9 +267,9 @@ child; cancellation uses Tokio's kill-on-drop/reaping behavior. Process-group co
 not a sandbox against a helper deliberately escaping its group. Non-Unix execution currently
 returns an explicit unsupported error until platform-specific process-tree cleanup is added.
 
-Local commits and explicit remote pushes are available through the commands below. Signing,
-configurable author/proxy policies, service configuration/background integration and Windows
-process-tree handling remain pending. No Git network commands run automatically.
+Local commits, explicit remote pushes, configured author/signing policy and optional service
+background publication are available below. Proxy configuration and Windows process-tree
+handling remain pending. Without master_git configured, no background Git commands run.
 
 ### Local Master Git commits
 
@@ -306,11 +306,11 @@ reference update is ambiguous: rerun the identical operation to inspect/reuse th
 The source CURRENT pointer is never changed by Git publication. Git commands share a 120-second
 budget after local preparation; synchronous local reads can exceed that preparation time.
 
-Commits currently use the fixed local identity `Sirius Master Publisher <sirius-master@localhost>`
-and are unsigned. Ambient `GIT_*` variables are removed before process execution to prevent
+By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and are unsigned.
+The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
 repository redirects, injected config and trace destinations; terminal prompting is disabled.
 Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Explicit remote push and environment-referenced HTTP authorization are described below;
-configured identities/signing/proxies and Windows support still remain
+configured proxies and Windows support still remain
 before the full optional Git publication feature is complete.
 
 ### Explicit remote Git push
@@ -349,7 +349,7 @@ are rejected. CLI network publication accepts HTTPS only.
 
 An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
 mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
-the CLI. Configurable proxy/signing/author settings, Windows process containment and final production Git acceptance remain
+the CLI. Configurable proxy settings, Windows process containment and final production Git acceptance remain
 separate restoration requirements.
 
 ### Background Git publication
@@ -375,3 +375,43 @@ or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must b
 Git credential: deployment preparation rejects reuse of other service credentials, including
 underlying Bearer tokens and decoded Basic passwords. No remote is contacted at preparation;
 the configured background worker performs publication after service startup.
+
+### Commit identity and signatures
+
+Both the background worker and `master-git-commit` / `master-git-push` use the profile's
+`master_git.commit` policy when present. Omitted policy preserves the default unsigned identity.
+
+```yaml
+master_git:
+  state_directory: ./data/master-git
+  commit:
+    author:
+      name: Sirius Data Maintainer
+      email: maintainer@example.invalid
+    committer:
+      name: Sirius Publisher
+      email: publisher@example.invalid
+    signing:
+      format: ssh
+      key: /run/secrets/master-signing-key
+      # program: /usr/bin/ssh-keygen
+```
+
+Omit `committer` to reuse `author`. Omit `signing` for explicitly unsigned new commits.
+SSH signing requires an absolute key path; use an agent-backed public key path or an
+unattended private key as appropriate for your deployment. OpenPGP uses `format: openpgp`
+(`gpg` is also accepted) and a hexadecimal key fingerprint in `key`, referencing the service
+account's keyring. Keys and passphrases must not be embedded in YAML. An optional `program`
+selects one absolute executable path containing only ASCII letters/digits, `/`, `.`, `_`, `-`;
+shell expressions and appended arguments are rejected. Omit it to use Git's signing executable
+default. Configure any required agent/keyring for unattended operation before starting service.
+
+Signers run inside the existing publication deadline and owned process group. Signing failures
+return a static error and do not advance the branch or alter installed Master data. The next
+retry can publish after the signer is repaired. No raw signer diagnostics are returned over HTTP.
+
+Identity/signing changes apply to newly created commits. Identical content still reuses the
+existing commit, including an older unsigned commit: enabling signing does not retroactively
+rewrite or re-sign history. Verify signatures using a separately trusted public key/keyring
+(for SSH, supply `gpg.ssh.allowedSignersFile` to `git verify-commit`). A successful push receipt
+confirms the remote ref, not a remote hosting provider's signature-trust badge.

@@ -8264,6 +8264,7 @@ async fn master_git_worker_publishes_on_start_and_update_with_independent_notifi
     cfg.listen = Some("127.0.0.1:0".parse().unwrap());
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
         remote: None,
@@ -8341,6 +8342,7 @@ async fn master_git_worker_periodically_retries_rejected_push_preserving_install
     let mut cfg = config();
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
@@ -8392,6 +8394,7 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
     let name = format!("SIRIUS_GIT_WORKER_{}", uuid::Uuid::new_v4().simple());
     cfg.master_directory = Some(source);
     cfg.master_git = Some(crate::master_git_worker::Config {
+        commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
@@ -8470,6 +8473,7 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
     let mut cfg = config();
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
@@ -8501,4 +8505,253 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
             .is_ok()
     );
     server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_policy_signs_with_ssh_and_preserves_refs_when_signer_fails() {
+    use crate::master_git::{self, CommitPolicy, Identity, Signing, SigningFormat};
+    let (root, input, source, _) = registry_fixture();
+    let state = root.path().join("git-state");
+    let key = root.path().join("signing-key");
+    let generated = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let policy = CommitPolicy {
+        author: Identity {
+            name: "Snapshot Author".into(),
+            email: "author@example.test".into(),
+        },
+        committer: Some(Identity {
+            name: "Release Publisher".into(),
+            email: "publisher@example.test".into(),
+        }),
+        signing: Some(Signing {
+            format: SigningFormat::Ssh,
+            key: key.to_str().unwrap().into(),
+            program: None,
+        }),
+    };
+    let first = master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
+        .await
+        .unwrap();
+    let repo = state.join("repository.git");
+    let read = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let identities = read(&["show", "-s", "--format=%an|%ae|%cn|%ce", "HEAD"]);
+    assert_eq!(
+        identities.trim(),
+        "Snapshot Author|author@example.test|Release Publisher|publisher@example.test"
+    );
+    assert!(read(&["cat-file", "commit", "HEAD"]).contains("BEGIN SSH SIGNATURE"));
+    let allowed = root.path().join("allowed-signers");
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    std::fs::write(&allowed, format!("publisher@example.test {public}")).unwrap();
+    let verify = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .arg("-c")
+        .arg(format!("gpg.ssh.allowedSignersFile={}", allowed.display()))
+        .args(["verify-commit", &first.commit])
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "SSH signature must verify against independently supplied public key"
+    );
+    assert!(
+        !master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
+            .await
+            .unwrap()
+            .changed
+    );
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "signing-failure".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let mut invalid = policy.clone();
+    invalid.signing.as_mut().unwrap().program = Some(root.path().join("missing-signer"));
+    assert!(
+        master_git::commit_with_policy(&source, &state, registry_scope(), &invalid)
+            .await
+            .is_err()
+    );
+    assert_eq!(read(&["rev-parse", "HEAD"]).trim(), first.commit);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    let next = master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
+        .await
+        .unwrap();
+    assert!(next.changed);
+    assert_eq!(read(&["rev-list", "--count", "HEAD"]).trim(), "2");
+    let untrusted = root.path().join("untrusted-signers");
+    std::fs::write(&untrusted, "").unwrap();
+    assert!(!std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .arg("-c")
+        .arg(format!(
+            "gpg.ssh.allowedSignersFile={}",
+            untrusted.display()
+        ))
+        .args(["verify-commit", &next.commit])
+        .output()
+        .unwrap()
+        .status
+        .success());
+}
+
+#[test]
+fn master_git_commit_policy_rejects_injected_identity_key_and_signer_program() {
+    use crate::master_git::{CommitPolicy, Signing, SigningFormat};
+    let mut policy = CommitPolicy::default();
+    for name in ["", "a\nb", "a<b", "a>b"] {
+        policy.author.name = name.into();
+        assert!(policy.validate().is_err());
+    }
+    policy = CommitPolicy::default();
+    for email in ["", "no-address", "a b@example.test", "a\nb@example.test"] {
+        policy.author.email = email.into();
+        assert!(policy.validate().is_err());
+    }
+    policy = CommitPolicy::default();
+    policy.signing = Some(Signing {
+        format: SigningFormat::Openpgp,
+        key: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
+        program: None,
+    });
+    assert!(policy.validate().is_ok());
+    for program in [
+        "gpg",
+        "/bin/gpg --extra",
+        "/bin/gpg;touch",
+        "/bin/$(gpg)",
+        "/bin/gpg\n",
+    ] {
+        policy.signing.as_mut().unwrap().program = Some(program.into());
+        assert!(policy.validate().is_err());
+    }
+    policy.signing.as_mut().unwrap().program = None;
+    for key in ["", "-----BEGIN PRIVATE KEY-----", "1234567890ABCDEF\n"] {
+        policy.signing.as_mut().unwrap().key = key.into();
+        assert!(policy.validate().is_err());
+    }
+    policy.signing = Some(Signing {
+        format: SigningFormat::Ssh,
+        key: "relative-key".into(),
+        program: None,
+    });
+    assert!(policy.validate().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires SIRIUS_TEST_GPG_PROGRAM and gpgconf for isolated OpenPGP signing"]
+async fn master_git_openpgp_policy_signs_and_verifies_with_isolated_keyring() {
+    use crate::master_git::{self, CommitPolicy, Signing, SigningFormat};
+    use std::os::unix::fs::PermissionsExt;
+    let program = std::env::var("SIRIUS_TEST_GPG_PROGRAM").unwrap();
+    let home_root = tempfile::tempdir_in("/tmp").unwrap();
+    let home = home_root.path().join("keyring");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    struct AgentCleanup(std::path::PathBuf);
+    impl Drop for AgentCleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("gpgconf")
+                .arg("--homedir")
+                .arg(&self.0)
+                .args(["--kill", "gpg-agent"])
+                .output();
+        }
+    }
+    let _agent = AgentCleanup(home.clone());
+    let generated = std::process::Command::new(&program)
+        .arg("--homedir")
+        .arg(&home)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "Sirius Fixture <fixture@example.test>",
+            "ed25519",
+            "sign",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "temporary OpenPGP key generation failed"
+    );
+    let keys = std::process::Command::new(&program)
+        .arg("--homedir")
+        .arg(&home)
+        .args(["--batch", "--with-colons", "--list-secret-keys"])
+        .output()
+        .unwrap();
+    assert!(keys.status.success());
+    let listing = String::from_utf8(keys.stdout).unwrap();
+    let fingerprint = listing
+        .lines()
+        .find(|line| line.starts_with("fpr:"))
+        .unwrap()
+        .split(':')
+        .nth(9)
+        .unwrap();
+    let wrapper = home_root.path().join("signer");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec {} --homedir {} --batch --pinentry-mode loopback \"$@\"\n",
+            quote(&program),
+            quote(home.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_root, _, source, _) = registry_fixture();
+    let state = home_root.path().join("git-state");
+    let policy = CommitPolicy {
+        signing: Some(Signing {
+            format: SigningFormat::Openpgp,
+            key: fingerprint.into(),
+            program: Some(wrapper.clone()),
+        }),
+        ..Default::default()
+    };
+    let receipt = master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
+        .await
+        .unwrap();
+    let verified = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(state.join("repository.git"))
+        .args(["-c", "gpg.format=openpgp", "-c"])
+        .arg(format!("gpg.openpgp.program={}", wrapper.display()))
+        .args(["verify-commit", &receipt.commit])
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "OpenPGP commit signature verification failed"
+    );
 }

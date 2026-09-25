@@ -71,6 +71,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             environment: config.environment.clone(),
             platform: config.platform(),
         };
+        let policy = config
+            .master_git
+            .as_ref()
+            .map(|g| g.commit.clone())
+            .unwrap_or_default();
         let receipt = if push {
             let remote = sirius_api_proxy::master_git::Remote {
                 url: args[2].clone(),
@@ -79,16 +84,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_http: false,
                 allow_file: args[2].starts_with("file://"),
             };
-            sirius_api_proxy::master_git::publish(
+            sirius_api_proxy::master_git::publish_with_policy(
                 source,
                 std::path::Path::new(&args[1]),
                 scope,
                 &remote,
+                &policy,
             )
             .await?
         } else {
-            sirius_api_proxy::master_git::commit(source, std::path::Path::new(&args[1]), scope)
-                .await?
+            sirius_api_proxy::master_git::commit_with_policy(
+                source,
+                std::path::Path::new(&args[1]),
+                scope,
+                &policy,
+            )
+            .await?
         };
         println!("{}", serde_json::to_string(&receipt)?);
         return Ok(());

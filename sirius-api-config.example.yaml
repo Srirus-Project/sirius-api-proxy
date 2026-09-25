@@ -142,6 +142,15 @@ response_cache:
 # master_git:
 #   state_directory: ./data/master-git
 #   interval_seconds: 300
+#   commit:
+#     author:
+#       name: Sirius Master Publisher
+#       email: sirius-master@localhost
+#     # committer defaults to author; omit signing for unsigned commits.
+#     # signing:
+#     #   format: ssh # or openpgp with a hexadecimal fingerprint in key
+#     #   key: /run/secrets/master-signing-key
+#     #   program: /usr/bin/ssh-keygen
 #   remote:
 #     url: https://git.example.invalid/master-data.git
 #     authorization_env: SIRIUS_MASTER_GIT_AUTHORIZATION
