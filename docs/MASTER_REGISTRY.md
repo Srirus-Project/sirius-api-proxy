@@ -435,3 +435,14 @@ Authorization; origin headers are not attached to CONNECT. Origin and HTTPS-prox
 remain verified. Proxy refusal/authentication/transport failures fail publication without direct
 fallback, preserving the pending local commit and installed Master. Ambient bypass lists are
 removed from the owned Git subprocess, so they cannot silently override this explicit routing.
+
+
+## Complete snapshot tar downloads
+
+`GET /api/v1/master-data/bundle` and `/api/v1/master-data/by-hash/{content_sha256}/bundle`
+serve one verified local snapshot under the public bearer (regional deployments insert the
+region after `/api/v1`). They share the standalone registry's [bundle format and bounds](REGISTRY_SERVICE.md#verified-snapshot-bundles):
+exact original JSON tables, pinned manifest, full verification before response, temporary-file
+streaming, content ETag, and process-wide admission held through download completion.
+The API routes read local file snapshots; PostgreSQL bundles are available through the standalone
+PostgreSQL registry backend. No implicit fallback between backends occurs.

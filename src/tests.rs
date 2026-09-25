@@ -10390,3 +10390,287 @@ async fn standalone_registry_postgres_pinned_contract_consumer_and_outage() {
         503
     );
 }
+
+static BUNDLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+fn unpack_master_bundle(bytes: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use std::io::Read;
+    let mut archive = tar::Archive::new(bytes);
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        assert!(entry.header().entry_type().is_file());
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+        assert_eq!(entry.header().mtime().unwrap(), 0);
+        let path = entry.path().unwrap().to_str().unwrap().to_owned();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        assert!(files.insert(path, body).is_none());
+    }
+    files
+}
+#[tokio::test]
+async fn master_bundle_pins_verifies_limits_admission_and_cleans_cancellation() {
+    let _guard = BUNDLE_TEST_LOCK.lock().await;
+    use crate::{master_bundle as bundle, master_registry as registry};
+    use axum::body::to_bytes;
+    let (_root, input, source, _) = registry_fixture();
+    let doc = registry::manifest(&source, None, registry_scope()).unwrap();
+    let manifest: registry::PublishedManifest = serde_json::from_slice(&doc.bytes).unwrap();
+    let original = manifest.snapshot.clone();
+    std::fs::write(
+        source.join(&original).join("unlisted.json"),
+        b"{\"private\":true}",
+    )
+    .unwrap();
+    let (mut newer, decoder, _) = master_fixture();
+    newer.version = "during-bundle".into();
+    let decoder = Arc::new(decoder);
+    let archive = bundle::build(
+        manifest.clone(),
+        |file| {
+            let root = source.clone();
+            let input = input.clone();
+            let id = original.clone();
+            let newer = newer.clone();
+            let decoder = decoder.clone();
+            async move {
+                std::fs::write(
+                    input.join("MasterManifest.json"),
+                    serde_json::to_vec(&newer).unwrap(),
+                )
+                .unwrap();
+                crate::master::import_directory(&input, &root, &decoder).unwrap();
+                registry::table(
+                    &root,
+                    &id,
+                    file.name.strip_suffix(".json").unwrap(),
+                    &file.sha256,
+                )
+                .map(|d| d.bytes)
+                .map_err(|_| crate::error::AppError::MasterUnavailable)
+            }
+        },
+        bundle::permit().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(registry::current_snapshot(&source).unwrap(), original);
+    let response = archive
+        .response(
+            Default::default(),
+            &manifest.version,
+            &manifest.content_sha256,
+        )
+        .unwrap();
+    let length = response.headers()["content-length"]
+        .to_str()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    // Admission spans both construction and the response body lifetime.
+    let second = bundle::permit().unwrap();
+    assert!(bundle::permit().is_err());
+    drop(second);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(bytes.len(), length);
+    assert_eq!(etag, format!("\"{}\"", registry::digest(&bytes)));
+    let files = unpack_master_bundle(&bytes);
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        files["tables/MasterFixture.json"],
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    let packed: registry::PublishedManifest =
+        serde_json::from_slice(&files["metadata/manifest.json"]).unwrap();
+    assert_eq!(packed.snapshot, original);
+    assert!(bundle::build(
+        manifest.clone(),
+        |_| async { Ok(b"{}".to_vec()) },
+        bundle::permit().unwrap()
+    )
+    .await
+    .is_err());
+    let task = tokio::spawn(bundle::build(
+        manifest.clone(),
+        |_| async { std::future::pending().await },
+        bundle::permit().unwrap(),
+    ));
+    tokio::task::yield_now().await;
+    task.abort();
+    let _ = task.await;
+    // A canceled blocking write may finish briefly, but must release its anonymous file/permit.
+    let both = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(first) = bundle::permit() {
+                if let Ok(second) = bundle::permit() {
+                    break (first, second);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(both);
+}
+
+#[tokio::test]
+async fn master_bundle_file_http_auth_pinned_hash_conditional_and_corruption() {
+    let _guard = BUNDLE_TEST_LOCK.lock().await;
+    use axum::body::{to_bytes, Body};
+    let (_root, input, source, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(source.clone());
+    let proxy = api::router(client(&game, cfg), "owner-read".into(), "admin".into());
+    let standalone = standalone_registry_config(source.clone())
+        .prepare()
+        .unwrap()
+        .router;
+    let doc = crate::master_registry::manifest(&source, None, registry_scope()).unwrap();
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&doc.bytes).unwrap();
+    let (mut newer, decoder, _) = master_fixture();
+    newer.version = "bundle-newer".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&newer).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let path = format!(
+        "/api/v1/master-data/by-hash/{}/bundle",
+        manifest.content_sha256
+    );
+    for app in [proxy, standalone] {
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let request = || {
+            Request::get(&path)
+                .header("authorization", "Bearer owner-read")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/x-tar");
+        let etag = response.headers()["etag"].clone();
+        let files =
+            unpack_master_bundle(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap());
+        let packed: Value = serde_json::from_slice(&files["metadata/manifest.json"]).unwrap();
+        assert_eq!(packed["snapshot"], manifest.snapshot);
+        let cached = || {
+            Request::get(&path)
+                .header("authorization", "Bearer owner-read")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(app.clone().oneshot(cached()).await.unwrap().status(), 304);
+        let table = source.join(&manifest.snapshot).join("MasterFixture.json");
+        let before = std::fs::read(&table).unwrap();
+        std::fs::write(&table, b"{}").unwrap();
+        let rejected = app.oneshot(cached()).await.unwrap();
+        assert_eq!(rejected.status(), 503);
+        assert_eq!(rejected.headers()["content-type"], "application/json");
+        std::fs::write(table, before).unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_bundle_postgres_http_integrity_and_retention() {
+    let _database = POSTGRES_TEST_LOCK.lock().await;
+    let _bundle = BUNDLE_TEST_LOCK.lock().await;
+    use crate::{master_database as db, master_registry as registry, registry_service as service};
+    use axum::body::{to_bytes, Body};
+    use sqlx::Connection;
+    let mut connection = master_database_config();
+    connection.keep_snapshots = 1;
+    connection.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (_root, input, source, _) = registry_fixture();
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.scope.environment = format!("bundle-{}", uuid::Uuid::new_v4().simple());
+    let receipt = db::publish(&connection, &source, cfg.scope.clone())
+        .await
+        .unwrap();
+    cfg.backend = service::Backend::Postgres {
+        connection: connection.clone(),
+    };
+    let app = cfg.prepare().unwrap().router;
+    let path = format!(
+        "/api/v1/master-data/by-hash/{}/bundle",
+        receipt.content_sha256
+    );
+    let request = |path: &str| {
+        Request::get(path)
+            .header("authorization", "Bearer owner-read")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request(&path)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let etag = response.headers()["etag"].clone();
+    let files = unpack_master_bundle(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap());
+    let packed: registry::PublishedManifest =
+        serde_json::from_slice(&files["metadata/manifest.json"]).unwrap();
+    assert_eq!(
+        packed.snapshot,
+        format!("master-{}", receipt.content_sha256)
+    );
+    packed.validate(&cfg.scope).unwrap();
+    assert_eq!(
+        registry::digest(&files["tables/MasterFixture.json"]),
+        packed.files[0].sha256
+    );
+    let mut conn = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    let key = serde_json::to_string(&cfg.scope).unwrap();
+    sqlx::query("UPDATE public.sirius_master_documents SET bytes=$2 WHERE scope=$1")
+        .bind(&key)
+        .bind(b"{}".as_slice())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let cached = Request::get(&path)
+        .header("authorization", "Bearer owner-read")
+        .header("if-none-match", etag)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(cached).await.unwrap().status(), 503);
+    let (mut next, decoder, _) = master_fixture();
+    next.version = "after-bundle".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    db::publish(&connection, &source, cfg.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request(&path)).await.unwrap().status(),
+        404
+    );
+    let current = app
+        .oneshot(request("/api/v1/master-data/bundle"))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), 200);
+    let files = unpack_master_bundle(&to_bytes(current.into_body(), 1024 * 1024).await.unwrap());
+    let packed: registry::PublishedManifest =
+        serde_json::from_slice(&files["metadata/manifest.json"]).unwrap();
+    assert_eq!(packed.version, "after-bundle");
+}

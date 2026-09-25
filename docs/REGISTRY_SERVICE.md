@@ -33,6 +33,7 @@ routes are absent.
 | `/by-hash/{content_sha256}/manifest` | Retained manifest by scoped content identity |
 | `/snapshots/{snapshot}/manifest` | Pinned manifest |
 | `/snapshots/{snapshot}/tables/{table}/{sha256}` | Pinned original JSON bytes; table omits `.json` |
+| `/bundle` or `/by-hash/{content_sha256}/bundle` | Verified tar of one complete snapshot |
 | `/history?limit=20&before=...` | Backend-tagged publication history, 1–100 entries |
 
 The standard manifest and pinned-table contract works with existing `master_sync` consumers.
@@ -57,6 +58,32 @@ not pretend that file installation chronology and database publication chronolog
 
 This command currently serves data written by the existing file importer, owner updater,
 background database publisher or explicit database commands. Standalone owner pull/poll,
-authenticated refresh/publication hints and whole-snapshot bundle delivery are separate
+authenticated refresh/publication hints are separate
 remaining restoration work. No Sekai-specific music metadata or app-identity overrides are
 introduced. Final candidate and packaged cross-platform acceptance are still required for 1.2.0.
+
+
+## Verified snapshot bundles
+
+The two bundle routes return `application/x-tar` with `metadata/manifest.json` and only the
+listed `tables/<name>.json` entries. They do not scan directories or include runtime config,
+credentials, encrypted inputs, orphan files or unrelated publication records. Table JSON bytes
+are preserved exactly. Headers use regular files, mode 0644, UID/GID 0 and mtime 0. Manifests
+retain the backend's snapshot identity; archive entries are an export format, not a writable
+Master directory or an automatically extracted import request.
+
+The service pins one manifest, verifies every table's size/hash/JSON and builds the whole tar
+in an anonymous temporary file before returning 200. A change to CURRENT cannot mix versions.
+A database retention race or unreadable/corrupt file fails the request rather than returning a
+successful partial archive. Build work is bounded to 120 seconds after manifest selection,
+528 MiB of temporary archive bytes, and one decoded table at a time (existing 64 MiB/table and
+512 MiB total source limits). Two process-wide permits cover construction and response streaming;
+additional simultaneous bundle requests return 503. Temporary files and permits are dropped on
+failure, disconnect or completion, including cancellation while a bounded blocking write finishes.
+
+The response includes exact Content-Length, an ETag covering the actual tar bytes, Master version,
+scoped content hash and a safe content-derived download filename. Bundle responses use private
+`no-cache`: reimporting identical file content can change the embedded local snapshot UUID and
+therefore the archive bytes. Conditional 304 is considered only after full source verification
+and archive construction, so it cannot conceal later corruption. Range/resume is not implemented.
+Clients must still check successful HTTP completion before using or extracting a downloaded file.

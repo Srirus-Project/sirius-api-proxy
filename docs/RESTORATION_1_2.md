@@ -140,3 +140,12 @@ proto bundles. It reuses TLS/logging and authenticated versioned Master routes, 
 content-addressed virtual snapshot IDs compatible with existing consumers. File/database history
 semantics are explicit. Owner pull/poll, authenticated refresh/publish hints and bundle delivery
 remain pending; this read service does not close those original registry capabilities.
+
+
+### Complete snapshot bundles
+
+Restored generic Master tar delivery for local API snapshots and both standalone registry
+backends. Bundles contain only a pinned verified manifest and its original table bytes, are
+fully built before successful response headers, and have bounded temporary storage/admission
+through streaming. Conditional reads verify content first. Owner pull/poll and authenticated
+refresh/publication hints remain registry work; final production/platform/release gates remain.

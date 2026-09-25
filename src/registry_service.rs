@@ -103,6 +103,8 @@ impl Config {
         });
         let routes = Router::new()
             .route("/manifest", get(current))
+            .route("/bundle", get(bundle_current))
+            .route("/by-hash/{hash}/bundle", get(bundle_hash))
             .route("/by-hash/{hash}/manifest", get(by_hash))
             .route("/snapshots/{snapshot}/manifest", get(snapshot_manifest))
             .route("/snapshots/{snapshot}/tables/{table}/{hash}", get(table))
@@ -330,4 +332,51 @@ async fn history(
             serde_json::to_vec(&value).map_err(|_| AppError::MasterUnavailable)?,
         ))
         .map_err(|_| AppError::MasterUnavailable)
+}
+
+async fn bundle_current(
+    State(s): State<Arc<Service>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    bundle(s, Selection::Current, headers).await
+}
+async fn bundle_hash(
+    State(s): State<Arc<Service>>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    bundle(s, Selection::Hash(hash), headers).await
+}
+async fn bundle(
+    s: Arc<Service>,
+    selection: Selection,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let permit = crate::master_bundle::permit()?;
+    let document = s.document(selection, None).await?;
+    let manifest: registry::PublishedManifest =
+        serde_json::from_slice(&document.bytes).map_err(|_| AppError::MasterUnavailable)?;
+    let snapshot = manifest.snapshot.clone();
+    let version = manifest.version.clone();
+    let hash = manifest.content_sha256.clone();
+    let bundle = crate::master_bundle::build(
+        manifest,
+        move |file| {
+            let s = s.clone();
+            let snapshot = snapshot.clone();
+            async move {
+                let name = file
+                    .name
+                    .strip_suffix(".json")
+                    .ok_or(AppError::MasterUnavailable)?
+                    .to_owned();
+                s.document(Selection::Snapshot(snapshot), Some((name, file.sha256)))
+                    .await
+                    .map(|d| d.bytes)
+            }
+        },
+        permit,
+    )
+    .await?;
+    bundle.response(headers, &version, &hash)
 }

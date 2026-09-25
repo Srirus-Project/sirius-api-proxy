@@ -57,6 +57,11 @@ pub fn router_at(
         .route("/regions", get(regions))
         .route("/master-data", get(master_status))
         .route("/master-data/manifest", get(registry_current))
+        .route("/master-data/bundle", get(registry_bundle_current))
+        .route(
+            "/master-data/by-hash/{hash}/bundle",
+            get(registry_bundle_hash),
+        )
         .route("/master-data/database/manifest", get(database_current))
         .route(
             "/master-data/database/by-hash/{hash}/manifest",
@@ -638,4 +643,72 @@ async fn database_history(
             serde_json::to_vec(&page).map_err(|_| AppError::MasterUnavailable)?,
         ))
         .map_err(|_| AppError::MasterUnavailable)
+}
+
+async fn registry_bundle_current(
+    State(c): State<Arc<GameClient>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    registry_bundle(c, None, headers).await
+}
+async fn registry_bundle_hash(
+    State(c): State<Arc<GameClient>>,
+    Path(hash): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    if !crate::master_registry::hash_valid(&hash) {
+        return Err(AppError::InvalidRequest);
+    }
+    registry_bundle(c, Some(hash), headers).await
+}
+async fn registry_bundle(
+    c: Arc<GameClient>,
+    hash: Option<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    let permit = crate::master_bundle::permit()?;
+    let root = c
+        .master_directory()
+        .ok_or(AppError::MasterUnavailable)?
+        .to_owned();
+    let scope = database_scope(&c);
+    let source = root.clone();
+    let document = tokio::task::spawn_blocking(move || match hash {
+        Some(hash) => crate::master_registry::manifest_by_hash(&source, scope, &hash),
+        None => crate::master_registry::manifest(&source, None, scope),
+    })
+    .await
+    .map_err(|_| AppError::MasterUnavailable)?
+    .map_err(|e| match e {
+        crate::master::MasterError::NotFound => AppError::NotFound,
+        _ => AppError::MasterUnavailable,
+    })?;
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&document.bytes).map_err(|_| AppError::MasterUnavailable)?;
+    let snapshot = manifest.snapshot.clone();
+    let version = manifest.version.clone();
+    let hash = manifest.content_sha256.clone();
+    let bundle = crate::master_bundle::build(
+        manifest,
+        move |file| {
+            let root = root.clone();
+            let snapshot = snapshot.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let name = file
+                        .name
+                        .strip_suffix(".json")
+                        .ok_or(crate::master::MasterError::Format)?;
+                    crate::master_registry::table(&root, &snapshot, name, &file.sha256)
+                })
+                .await
+                .map_err(|_| AppError::MasterUnavailable)?
+                .map(|d| d.bytes)
+                .map_err(|_| AppError::MasterUnavailable)
+            }
+        },
+        permit,
+    )
+    .await?;
+    bundle.response(headers, &version, &hash)
 }

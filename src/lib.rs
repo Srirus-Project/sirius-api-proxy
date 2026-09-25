@@ -63,3 +63,5 @@ pub mod master_database_worker;
 mod file_lock;
 
 pub mod registry_service;
+
+mod master_bundle;
