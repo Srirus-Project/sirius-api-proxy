@@ -1,0 +1,28 @@
+# Private deployment configuration: no game account, CDN key or runtime proto bundle required.
+listen: 127.0.0.1:9998
+token_env: SIRIUS_REGISTRY_TOKEN
+scope:
+  region: jp
+  environment: release
+  platform: iOS
+regional_paths: false
+backend:
+  kind: files
+  directory: ./master
+# Or replace backend with:
+# backend:
+#   kind: postgres
+#   connection:
+#     host: database.example.invalid
+#     database: sirius_master
+#     username: sirius_reader
+#     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
+#     timeout_seconds: 30
+# Use a dedicated SELECT-only role on already initialized sirius_master_* tables.
+# tls:
+#   certificate_file: ./registry-cert.pem
+#   private_key_file: ./registry-key.pem
+# access_log:
+#   format: json
+#   output:
+#     type: stderr

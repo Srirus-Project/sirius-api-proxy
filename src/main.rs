@@ -2,6 +2,32 @@ use sirius_api_proxy::{client::GameClient, deployment::DeploymentConfig};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "registry-serve") {
+        if args.len() != 2 {
+            return Err("usage: sirius-api-proxy registry-serve REGISTRY_CONFIG".into());
+        }
+        let config =
+            sirius_api_proxy::registry_service::Config::load(std::path::Path::new(&args[1]))?;
+        let _logging = config.logging.clone().unwrap_or_default().init()?;
+        let prepared = config.prepare()?;
+        let listener = tokio::net::TcpListener::bind(prepared.listen).await?;
+        tracing::info!(listen=%prepared.listen,"Sirius Master registry listening");
+        sirius_api_proxy::server::serve(listener, prepared.router, prepared.tls, async {
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("signal handler");
+                tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        })
+        .await?;
+        return Ok(());
+    }
     let path = if args.is_empty() || (args == ["master-update"] || args == ["master-sync"]) {
         Some(std::path::PathBuf::from(
             std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into()),

@@ -10094,3 +10094,299 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
         5
     );
 }
+
+fn standalone_registry_config(directory: std::path::PathBuf) -> crate::registry_service::Config {
+    let token_env = format!("SIRIUS_REGISTRY_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, "owner-read");
+    crate::registry_service::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        token_env,
+        scope: registry_scope(),
+        regional_paths: false,
+        backend: crate::registry_service::Backend::Files { directory },
+        tls: None,
+        logging: None,
+        access_log: None,
+    }
+}
+#[tokio::test]
+async fn standalone_registry_files_auth_integrity_scope_and_real_consumer() {
+    use crate::{master_registry as registry, registry_service as service};
+    use axum::body::{to_bytes, Body};
+    let (_root, input, source, _) = registry_fixture();
+    let cfg = standalone_registry_config(source.clone());
+    let app = cfg.prepare().unwrap().router;
+    let path = "/api/v1/master-data/manifest";
+    for headers in [
+        vec![],
+        vec!["Bearer wrong"],
+        vec!["Bearer owner-read", "Bearer owner-read"],
+    ] {
+        let mut request = Request::get(path);
+        for header in headers {
+            request = request.header("authorization", header);
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+    let request = || {
+        Request::get(path)
+            .header("authorization", "Bearer owner-read")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let manifest: registry::PublishedManifest =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    manifest.validate(&cfg.scope).unwrap();
+    let table_path = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        manifest.snapshot, manifest.files[0].sha256
+    );
+    let reply = app
+        .clone()
+        .oneshot(
+            Request::get(&table_path)
+                .header("authorization", "Bearer owner-read")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    let etag = reply.headers()["etag"].clone();
+    assert_eq!(
+        to_bytes(reply.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    let (origin, server) = peer_http_server(app.clone()).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let consumer_config = master_sync_config(origin, consumer.path().join("master"));
+    let sync = crate::master_sync::Syncer::new(
+        &consumer_config,
+        GameClient::new(consumer_config.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sync.update_once().await.unwrap()["action"], "updated");
+    assert_eq!(sync.update_once().await.unwrap()["action"], "unchanged");
+    let (mut next, decoder, _) = master_fixture();
+    next.version = "standalone-v2".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    assert_eq!(
+        sync.update_once().await.unwrap()["receipt"]["version"],
+        "standalone-v2"
+    );
+    // Old pinned reads remain valid after a new CURRENT publication.
+    let cached = app
+        .clone()
+        .oneshot(
+            Request::get(&table_path)
+                .header("authorization", "Bearer owner-read")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), 304);
+    std::fs::write(
+        source.join(&manifest.snapshot).join("MasterFixture.json"),
+        b"{}",
+    )
+    .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::get(&table_path)
+                    .header("authorization", "Bearer owner-read")
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    server.abort();
+    for region in [
+        crate::region::Region::Tw,
+        crate::region::Region::En,
+        crate::region::Region::Kr,
+        crate::region::Region::Cn,
+    ] {
+        let mut bad = cfg.clone();
+        bad.scope.region = region;
+        assert!(bad.prepare().is_err());
+    }
+    let mut regional = cfg.clone();
+    regional.regional_paths = true;
+    let app = regional.prepare().unwrap().router;
+    for (p, status) in [
+        ("/api/v1/master-data/manifest", 404),
+        ("/api/v1/jp/master-data/manifest", 200),
+        ("/api/v1/cn/master-data/manifest", 404),
+        ("/internal/v1/protocol", 404),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::get(p)
+                        .header("authorization", "Bearer owner-read")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    let health = app
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let health: Value =
+        serde_json::from_slice(&to_bytes(health.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(health["service"], "sirius-master-registry");
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("invalid.yaml");
+    std::fs::write(&path, vec![b' '; 65537]).unwrap();
+    assert!(service::Config::load(&path).is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn standalone_registry_postgres_pinned_contract_consumer_and_outage() {
+    use axum::body::{to_bytes, Body};
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master_database as db, master_registry as registry, registry_service as service};
+    use sqlx::Connection;
+    let mut connection = master_database_config();
+    connection.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (_root, _input, source, _) = registry_fixture();
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.scope.environment = format!("registry-{}", uuid::Uuid::new_v4().simple());
+    db::publish(&connection, &source, cfg.scope.clone())
+        .await
+        .unwrap();
+    cfg.backend = service::Backend::Postgres {
+        connection: connection.clone(),
+    };
+    // No local Master directory or proto path participates in serving the database.
+    std::fs::remove_dir_all(&source).unwrap();
+    let app = cfg.prepare().unwrap().router;
+    let auth = |path: &str| {
+        Request::get(path)
+            .header("authorization", "Bearer owner-read")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(auth("/api/v1/master-data/manifest"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let manifest: registry::PublishedManifest =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest.snapshot,
+        format!("master-{}", manifest.content_sha256)
+    );
+    manifest.validate(&cfg.scope).unwrap();
+    let table = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        manifest.snapshot, manifest.files[0].sha256
+    );
+    let response = app.clone().oneshot(auth(&table)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let etag = response.headers()["etag"].clone();
+    assert_eq!(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    for p in [
+        format!(
+            "/api/v1/master-data/by-hash/{}/manifest",
+            manifest.content_sha256
+        ),
+        format!(
+            "/api/v1/master-data/snapshots/{}/manifest",
+            manifest.snapshot
+        ),
+    ] {
+        let reply = app.clone().oneshot(auth(&p)).await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let pinned: registry::PublishedManifest =
+            serde_json::from_slice(&to_bytes(reply.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(pinned.snapshot, manifest.snapshot);
+    }
+    let (origin, server) = peer_http_server(app.clone()).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let mut cc = master_sync_config(origin, consumer.path().join("master"));
+    cc.environment = cfg.scope.environment.clone();
+    let sync = crate::master_sync::Syncer::new(&cc, GameClient::new(cc.clone()).unwrap()).unwrap();
+    assert_eq!(sync.update_once().await.unwrap()["action"], "updated");
+    assert_eq!(sync.update_once().await.unwrap()["action"], "unchanged");
+    let key = serde_json::to_string(&cfg.scope).unwrap();
+    let mut conn = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE public.sirius_master_documents SET bytes=$2 WHERE scope=$1")
+        .bind(&key)
+        .bind(b"{}".as_slice())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let request = Request::get(&table)
+        .header("authorization", "Bearer owner-read")
+        .header("if-none-match", etag)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), 503);
+    assert!(sync.update_once().await.is_ok()); // Already verified local content needs no table redownload.
+    let history = app
+        .oneshot(auth("/api/v1/master-data/history"))
+        .await
+        .unwrap();
+    assert_eq!(history.status(), 200);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(history.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(body["backend"], "postgres");
+    server.abort();
+    connection.port = 1;
+    cfg.backend = service::Backend::Postgres { connection };
+    let app = cfg.prepare().unwrap().router;
+    assert_eq!(
+        app.oneshot(auth("/api/v1/master-data/manifest"))
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+}

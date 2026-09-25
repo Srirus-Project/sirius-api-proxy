@@ -23,6 +23,9 @@ The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has a separate dis
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 
+An account-free [Master registry reader](docs/REGISTRY_SERVICE.md) can serve file or PostgreSQL snapshots
+with `registry-serve`, using the same manifest contract as Master consumers.
+
 ## Regions
 
 Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejected before

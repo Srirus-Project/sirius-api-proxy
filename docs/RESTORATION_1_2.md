@@ -131,3 +131,12 @@ atomically per empty scope, with retention and a persistent idempotent receipt. 
 state and changed replay plans, preserves files, excludes orphan directories and reports legacy
 chronology boundaries. See `MASTER_DATABASE.md` for limits and recovery. Standalone registry
 hosting and final candidate production/platform acceptance remain outstanding.
+
+
+### Standalone registry read service
+
+`registry-serve` serves files or PostgreSQL without constructing a GameClient or reading runtime
+proto bundles. It reuses TLS/logging and authenticated versioned Master routes, with database
+content-addressed virtual snapshot IDs compatible with existing consumers. File/database history
+semantics are explicit. Owner pull/poll, authenticated refresh/publish hints and bundle delivery
+remain pending; this read service does not close those original registry capabilities.

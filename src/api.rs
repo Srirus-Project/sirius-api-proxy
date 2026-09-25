@@ -19,11 +19,12 @@ pub(crate) async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    if request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        != Some(&format!("Bearer {token}"))
+    if request.headers().get_all("authorization").iter().count() != 1
+        || request
+            .headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            != Some(&format!("Bearer {token}"))
     {
         return Err(AppError::Unauthorized);
     }
@@ -409,7 +410,7 @@ async fn registry_response(
     })?;
     registry_document(document, headers, pinned)
 }
-fn registry_document(
+pub(crate) fn registry_document(
     document: crate::master_registry::Document,
     headers: axum::http::HeaderMap,
     pinned: bool,
