@@ -175,3 +175,11 @@ Startup, successful owner work and interval retries reconcile each target indepe
 per-target deduplication; status is internal-token protected and redacted, and shutdown cancels
 delivery. Outgoing tokens are separated from read/internal/source/database credentials. Tests include
 a real consumer woken by local publication and an actual PostgreSQL failure/recovery case.
+
+Added Windows Git process-tree containment. Git starts suspended with no console, is assigned to a
+kill-on-close Job Object before resuming, and the job is terminated on timeout, error or future
+cancellation; successful commands release it like the Unix process group. Windows uses the NUL
+global config and no askpass fallback. A cmd.exe helper test with timeout/cancellation/positive
+control, plus real Git commit and stalled HTTP remote shutdown tests, are enabled for Windows and
+run by a new Windows CI job; locally they are cross-compiled only, so Windows runtime evidence
+depends on that job.

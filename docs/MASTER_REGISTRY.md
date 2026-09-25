@@ -255,24 +255,36 @@ reads, indexed metadata is validated here; exact table payloads are verified whe
 
 ## Git publication restoration status
 
-The bounded Git execution primitive is implemented and locally tested on Unix. It invokes
+The bounded Git execution primitive supports Unix and Windows. It invokes
 commands directly, disables terminal prompting, drains stdout/stderr concurrently, limits
 each stream to a caller-selected 1 KiB–16 MiB, and applies a command timeout up to 600 seconds.
 Failures return static error categories without raw argv, stderr or stdout. Successful callers
 receive bounded stdout only and must avoid exposing any credential-bearing command results.
 
-Cancellation or failure kills the owned Git process group, including ordinary Git transport
-helpers. Timeout/error cleanup explicitly waits up to two additional seconds for the direct
-child; cancellation uses Tokio's kill-on-drop/reaping behavior. Process-group containment is
-not a sandbox against a helper deliberately escaping its group. Non-Unix execution currently
-returns an explicit unsupported error until platform-specific process-tree cleanup is added.
+Cancellation or failure kills the owned process tree, including ordinary Git transport and
+signing helpers. On Unix this is the child's own process group. On Windows the child is created
+suspended, assigned to a dedicated Job Object and only then resumed, so no helper can start
+outside the job; the job is terminated on timeout, error or cancellation, and is also marked
+kill-on-close so an abnormal service exit does not leave Git running. As on Unix, a successful
+command releases the tree without killing helpers that outlive it. Timeout/error cleanup
+explicitly waits up to two additional seconds for the direct child; cancellation uses Tokio's
+kill-on-drop/reaping behavior. Neither mechanism is a sandbox against a helper deliberately
+escaping it (for example a Windows helper created with job breakaway by a privileged parent).
+Windows uses `NUL` for the global Git config, does not set an askpass program and removes
+`SSH_ASKPASS`, so credential prompts fail rather than wait. Other platforms return an explicit
+unsupported error.
+
+Windows containment is covered by a dedicated `cmd.exe` helper test (timeout, cancellation and
+a positive control), output bounds and real Git commit/stalled-remote shutdown tests, run by the
+Windows CI job. Local development on macOS only cross-compiles and links those tests.
 
 Local commits, explicit remote pushes, configured author/signing policy and optional service
-background publication are available below. Windows process-tree handling remains pending. Without master_git configured, no background Git commands run.
+background publication are available below. Without master_git configured, no background Git
+commands run.
 
 ### Local Master Git commits
 
-On Unix, with Git available on PATH, a single-region configuration can commit its installed
+With Git available on PATH, a single-region configuration can commit its installed
 Master snapshot into a dedicated managed bare repository:
 
 ```sh
@@ -348,8 +360,8 @@ are rejected. CLI network publication accepts HTTPS only.
 
 An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
 mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
-the CLI. Windows process containment and final production Git acceptance remain
-separate restoration requirements.
+the CLI. Final production Git acceptance, including a packaged Windows binary, remains a
+separate release requirement.
 
 ### Background Git publication
 

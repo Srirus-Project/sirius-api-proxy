@@ -7901,6 +7901,107 @@ async fn git_execution_runs_real_git_and_bounds_output_without_error_leaks() {
     ));
 }
 
+/// Windows counterpart of the Unix process-group tests: cmd.exe helpers started with
+/// `start /B` stay in the Job Object and must die with it.
+#[cfg(windows)]
+#[tokio::test]
+async fn git_execution_on_windows_bounds_output_and_contains_helpers() {
+    use crate::git_process::{run, Error};
+    use std::{ffi::OsString, path::Path};
+    let root = tempfile::tempdir().unwrap();
+    let cmd = |script: &str| vec![OsString::from("/C"), OsString::from(script)];
+    run(
+        Path::new("git"),
+        root.path(),
+        &[OsString::from("init"), OsString::from("--quiet")],
+        Duration::from_secs(10),
+        4096,
+    )
+    .await
+    .unwrap();
+    let error = run(
+        Path::new("cmd.exe"),
+        root.path(),
+        &cmd("echo fixture-private-value 1>&2 & exit /b 1"),
+        Duration::from_secs(5),
+        1024,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Failed));
+    assert!(!format!("{error:?} {error}").contains("fixture-private-value"));
+    for script in [
+        "for /L %i in (0,0,1) do @echo abcdefghijklmnopqrstuvwxyz",
+        "for /L %i in (0,0,1) do @echo abcdefghijklmnopqrstuvwxyz 1>&2",
+    ] {
+        assert!(matches!(
+            run(
+                Path::new("cmd.exe"),
+                root.path(),
+                &cmd(script),
+                Duration::from_secs(5),
+                1024
+            )
+            .await,
+            Err(Error::OutputLimit)
+        ));
+    }
+    // The helper writes `finished` after ~2 s unless the whole tree is terminated.
+    let script = "start /B cmd /C \"ping -n 3 127.0.0.1 >NUL & echo survived> finished\" & echo ready> ready & ping -n 30 127.0.0.1 >NUL";
+    let start = std::time::Instant::now();
+    assert!(matches!(
+        run(
+            Path::new("cmd.exe"),
+            root.path(),
+            &cmd(script),
+            Duration::from_millis(500),
+            1024
+        )
+        .await,
+        Err(Error::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(root.path().join("ready").exists());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!root.path().join("finished").exists());
+    std::fs::remove_file(root.path().join("ready")).unwrap();
+    let path = root.path().to_owned();
+    let task = tokio::spawn(async move {
+        run(
+            Path::new("cmd.exe"),
+            &path,
+            &cmd(script),
+            Duration::from_secs(60),
+            1024,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.path().join("ready").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!root.path().join("finished").exists());
+    // Positive control: without cancellation the helper performs the delayed write.
+    run(
+        Path::new("cmd.exe"),
+        root.path(),
+        &cmd("start /B cmd /C \"ping -n 2 127.0.0.1 >NUL & echo survived> finished\" & ping -n 5 127.0.0.1 >NUL"),
+        Duration::from_secs(20),
+        1024,
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::read_to_string(root.path().join("finished"))
+        .unwrap()
+        .starts_with("survived"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn git_execution_timeout_and_future_cancellation_kill_helpers() {
@@ -7964,7 +8065,7 @@ async fn git_execution_timeout_and_future_cancellation_kill_helpers() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn master_git_commits_verified_content_reuses_identical_imports_and_preserves_history() {
     use crate::{master, master_git, master_registry as registry};
@@ -8496,7 +8597,7 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
     std::env::remove_var(name);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
     let entered = Arc::new(tokio::sync::Notify::new());
