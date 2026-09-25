@@ -42,3 +42,5 @@ pub mod peer;
 pub mod peer_transport;
 
 pub mod node_routing;
+
+pub mod master_registry;

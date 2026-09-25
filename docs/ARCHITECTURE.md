@@ -17,6 +17,7 @@ Authenticated queries first establish the Master version; anonymous RPCs omit ac
 - `src/client.rs`: metadata, TLS, trailers, configurable deadlines/concurrency/response limits and bounded anonymous retries.
 - `src/resources.rs`: compatible resource version selection and credential references.
 - `src/master.rs`, `src/rijndael.rs`: validated Master decoding and atomic local snapshots.
+- `src/master_registry.rs`: scoped plaintext manifests, pinned files and integrity indexes.
 - `src/master_update.rs`: manifest downloads, version rechecks, writer locking and periodic updates.
 - `src/config.rs`, `src/error.rs`: configuration validation and sanitized errors.
 - `src/tests.rs`: local protocol, boundary and integration fixtures.

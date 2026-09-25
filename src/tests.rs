@@ -5977,3 +5977,230 @@ async fn node_routing_public_ranking_strips_remote_account_fields() {
     assert!(data.get("myScore").is_none());
     server.abort();
 }
+
+fn registry_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    crate::master::ImportReceipt,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("input");
+    let output = root.path().join("output");
+    std::fs::create_dir(&input).unwrap();
+    let (manifest, decoder, data) = master_fixture();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(input.join("MasterFixture.bin"), data).unwrap();
+    let receipt = crate::master::import_directory(&input, &output, &decoder).unwrap();
+    (root, input, output, receipt)
+}
+fn registry_scope() -> crate::master_registry::Scope {
+    crate::master_registry::Scope {
+        region: crate::region::Region::Jp,
+        environment: "release".into(),
+        platform: crate::region::Platform::Ios,
+    }
+}
+#[test]
+fn master_registry_indexes_raw_json_and_pins_old_snapshots_across_current_changes() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, first) = registry_fixture();
+    let document = registry::manifest(&output, None, registry_scope()).unwrap();
+    let published: registry::PublishedManifest = serde_json::from_slice(&document.bytes).unwrap();
+    assert_eq!(published.snapshot, first.snapshot);
+    // Independent Python hashlib/json(sort_keys=True, compact separators) vectors.
+    assert_eq!(
+        published.files[0].sha256,
+        "7f991b00bf418634d0afd203936c3d9f49101a11be8818361d0c4e04c8b50be9"
+    );
+    assert_eq!(
+        published.content_sha256,
+        "bd6ee90cf8032681e2001c44c481dd3aa2165fb74318496d51c5fe3a39769a71"
+    );
+    let bytes = include_bytes!("../tests/fixtures/master-synthetic.json");
+    assert_eq!(published.files[0].size, bytes.len() as u64);
+    assert_eq!(published.files[0].sha256, registry::digest(bytes));
+    let (_, decoder, _) = master_fixture();
+    let second = master::import_directory(&input, &output, &decoder).unwrap();
+    assert_ne!(first.snapshot, second.snapshot);
+    let next = registry::manifest(&output, None, registry_scope()).unwrap();
+    let next_manifest: registry::PublishedManifest = serde_json::from_slice(&next.bytes).unwrap();
+    assert_eq!(published.content_sha256, next_manifest.content_sha256);
+    assert_ne!(document.etag, next.etag);
+    assert_eq!(
+        registry::manifest(&output, Some(&first.snapshot), registry_scope())
+            .unwrap()
+            .bytes,
+        document.bytes
+    );
+    assert_eq!(
+        registry::table(
+            &output,
+            &first.snapshot,
+            "MasterFixture",
+            &published.files[0].sha256
+        )
+        .unwrap()
+        .bytes,
+        bytes
+    );
+    let mut scope = registry_scope();
+    scope.environment = "review".into();
+    let other: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, Some(&first.snapshot), scope)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_ne!(published.content_sha256, other.content_sha256);
+    let mut source = published.source_manifest.clone();
+    source.files[0].name = "MasterManifest.bin".into();
+    assert!(master::Manifest::parse(&serde_json::to_vec(&source).unwrap()).is_err());
+}
+#[test]
+fn master_registry_corruption_and_legacy_snapshots_have_explicit_integrity_behavior() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, receipt) = registry_fixture();
+    let path = output.join(&receipt.snapshot);
+    let first: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let hash = &first.files[0].sha256;
+    std::fs::write(path.join("MasterFixture.json"), b"[]").unwrap();
+    assert!(matches!(
+        master::read_current(&output, Some("MasterFixture")),
+        Err(master::MasterError::Integrity)
+    ));
+    assert!(registry::table(&output, &receipt.snapshot, "MasterFixture", hash).is_err());
+    std::fs::write(
+        path.join("MasterFixture.json"),
+        include_bytes!("../tests/fixtures/master-synthetic.json"),
+    )
+    .unwrap();
+    std::fs::write(path.join("tables.json"), b"{}").unwrap();
+    assert!(registry::manifest(&output, None, registry_scope()).is_err());
+    // Missing indexes are the legacy 1.1 format; malformed existing indexes never use that fallback.
+    std::fs::remove_file(path.join("tables.json")).unwrap();
+    let legacy: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(first.content_sha256, legacy.content_sha256);
+    assert!(!path.join("tables.json").exists());
+    assert!(registry::table(&output, &receipt.snapshot, "MasterFixture", hash).is_ok());
+    std::fs::write(path.join("MasterFixture.json"), b"invalid JSON").unwrap();
+    assert!(registry::manifest(&output, None, registry_scope()).is_err());
+}
+#[cfg(unix)]
+#[test]
+fn master_registry_rejects_symbolic_links_and_unlisted_files() {
+    use crate::master_registry as registry;
+    let (root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let outside = root.path().join("outside.json");
+    std::fs::write(&outside, b"[]").unwrap();
+    std::fs::remove_file(snapshot.join("MasterFixture.json")).unwrap();
+    std::os::unix::fs::symlink(&outside, snapshot.join("MasterFixture.json")).unwrap();
+    assert!(registry::table(
+        &output,
+        &receipt.snapshot,
+        "MasterFixture",
+        &manifest.files[0].sha256
+    )
+    .is_err());
+    assert!(registry::table(&output, &receipt.snapshot, "receipt", &"0".repeat(64)).is_err());
+    assert!(registry::manifest(&output, Some("../outside"), registry_scope()).is_err());
+    std::os::unix::fs::symlink(&snapshot, output.join("master-link")).unwrap();
+    assert!(registry::manifest(&output, Some("master-link"), registry_scope()).is_err());
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    std::os::unix::fs::symlink(&outside, snapshot.join("tables.json")).unwrap();
+    assert!(registry::manifest(&output, None, registry_scope()).is_err());
+}
+#[tokio::test]
+async fn master_registry_http_auth_conditional_reads_and_pinned_bytes_work_without_game_calls() {
+    let (_root, _input, output, receipt) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let get = |path: &str, token: &str, etag: Option<&str>| {
+        let mut request = Request::get(path).header("authorization", format!("Bearer {token}"));
+        if let Some(etag) = etag {
+            request = request.header("if-none-match", etag);
+        }
+        request.body(axum::body::Body::empty()).unwrap()
+    };
+    let path = "/api/v1/master-data/manifest";
+    assert_eq!(
+        app.clone()
+            .oneshot(get(path, "internal", None))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let response = app.clone().oneshot(get(path, "api", None)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let manifest = body(response).await;
+    assert_eq!(manifest["scope"]["region"], "jp");
+    let response = app
+        .clone()
+        .oneshot(get(path, "api", Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 304);
+    assert!(response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .is_empty());
+    let blob = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        receipt.snapshot,
+        manifest["files"][0]["sha256"].as_str().unwrap()
+    );
+    let response = app.clone().oneshot(get(&blob, "api", None)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["cache-control"]
+        .to_str()
+        .unwrap()
+        .contains("immutable"));
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    std::fs::write(
+        output.join(&receipt.snapshot).join("MasterFixture.json"),
+        b"[]",
+    )
+    .unwrap();
+    assert_eq!(
+        app.oneshot(get(&blob, "api", None)).await.unwrap().status(),
+        503
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+}

@@ -78,7 +78,9 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         {
             return Err(MasterError::NotFound);
         }
-        read_bounded(&directory.join(format!("{table}.json")), MAX_JSON)?
+        let bytes = read_bounded(&directory.join(format!("{table}.json")), MAX_JSON)?;
+        crate::master_registry::verify_indexed(&directory, &manifest, table, &bytes)?;
+        bytes
     } else {
         let receipt: serde_json::Value =
             serde_json::from_slice(&read_bounded(&directory.join("receipt.json"), 4096)?)
@@ -183,7 +185,8 @@ impl Manifest {
         let mut total = 0;
         for entry in &manifest.files {
             let stem = entry.name.strip_suffix(".bin").ok_or(MasterError::Format)?;
-            if !stem.starts_with("Master")
+            if stem == "MasterManifest"
+                || !stem.starts_with("Master")
                 || !safe_component(stem)
                 || !names.insert(&entry.name)
                 || entry.hash.len() != 64
@@ -283,6 +286,7 @@ pub(crate) fn prepare_directory(
         .prefix(".master-stage-")
         .tempdir_in(output)?;
     let mut total = 0;
+    let mut indexed_files = Vec::new();
     for entry in &manifest.files {
         let bytes = read_bounded(&input.join(&entry.name), MAX_ENCRYPTED)?;
         let json = decoder.decode(entry, &bytes)?;
@@ -294,7 +298,22 @@ pub(crate) fn prepare_directory(
             &staging.path().join(entry.name.replace(".bin", ".json")),
             &json,
         )?;
+        indexed_files.push(crate::master_registry::file(
+            entry.name.replace(".bin", ".json"),
+            &json,
+        ));
     }
+    indexed_files.sort_by(|a, b| a.name.cmp(&b.name));
+    let index = crate::master_registry::Inventory {
+        schema_version: 1,
+        version: manifest.version.clone(),
+        files: indexed_files,
+    };
+    index.validate(&manifest)?;
+    write_synced(
+        &staging.path().join("tables.json"),
+        &serde_json::to_vec(&index).map_err(|_| MasterError::Format)?,
+    )?;
     write_synced(&staging.path().join("MasterManifest.json"), &manifest_bytes)?;
     let snapshot = format!("master-{}", uuid::Uuid::new_v4().simple());
     let receipt = ImportReceipt {

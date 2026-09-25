@@ -1,0 +1,277 @@
+//! Content-verified plaintext manifests over immutable Sirius Master snapshots.
+use crate::{
+    master::{self, Manifest, MasterError},
+    region::{Platform, Region},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+const MAX_JSON: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL: u64 = 512 * 1024 * 1024;
+const MAX_INDEX: u64 = 1024 * 1024;
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct File {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inventory {
+    pub schema_version: u32,
+    pub version: String,
+    pub files: Vec<File>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scope {
+    pub region: Region,
+    pub environment: String,
+    pub platform: Platform,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedManifest {
+    pub schema_version: u32,
+    pub scope: Scope,
+    pub snapshot: String,
+    pub version: String,
+    pub content_sha256: String,
+    pub files: Vec<File>,
+    /// Original encrypted-file metadata, without any CDN credentials or keys.
+    pub source_manifest: Manifest,
+}
+pub struct Document {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+    pub version: String,
+}
+pub fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+pub fn file(name: String, bytes: &[u8]) -> File {
+    File {
+        name,
+        size: bytes.len() as u64,
+        sha256: digest(bytes),
+    }
+}
+fn hash_valid(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+impl Inventory {
+    pub fn validate(&self, source: &Manifest) -> Result<(), MasterError> {
+        if self.schema_version != 1
+            || self.version != source.version
+            || self.files.len() != source.files.len()
+        {
+            return Err(MasterError::Format);
+        }
+        let mut expected = source
+            .files
+            .iter()
+            .map(|e| e.name.replace(".bin", ".json"))
+            .collect::<Vec<_>>();
+        expected.sort();
+        let mut total = 0u64;
+        for (entry, name) in self.files.iter().zip(expected) {
+            if entry.name != name
+                || entry.size == 0
+                || entry.size > MAX_JSON
+                || !hash_valid(&entry.sha256)
+            {
+                return Err(MasterError::Format);
+            }
+            total = total.checked_add(entry.size).ok_or(MasterError::Limit)?;
+        }
+        if total > MAX_TOTAL {
+            return Err(MasterError::Limit);
+        }
+        Ok(())
+    }
+}
+fn regular(path: &Path, limit: u64) -> Result<Vec<u8>, MasterError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(MasterError::Format);
+    }
+    master::read_bounded(path, limit)
+}
+fn snapshot_directory(root: &Path, snapshot: &str) -> Result<PathBuf, MasterError> {
+    if !snapshot.starts_with("master-") || !master::safe_component(snapshot) {
+        return Err(MasterError::NotFound);
+    }
+    let path = root.join(snapshot);
+    let metadata = fs::symlink_metadata(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            MasterError::NotFound
+        } else {
+            e.into()
+        }
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(MasterError::Format);
+    }
+    Ok(path)
+}
+fn source(directory: &Path) -> Result<Manifest, MasterError> {
+    let source = Manifest::parse(&regular(
+        &directory.join("MasterManifest.json"),
+        master::MAX_MANIFEST,
+    )?)?;
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&regular(&directory.join("receipt.json"), 4096)?)
+            .map_err(|_| MasterError::Format)?;
+    if receipt["version"] != source.version
+        || receipt["snapshot"].as_str() != directory.file_name().and_then(|name| name.to_str())
+        || receipt["tables"].as_u64() != Some(source.files.len() as u64)
+        || !matches!(receipt["source"].as_str(), Some("local-import" | "remote"))
+    {
+        return Err(MasterError::Format);
+    }
+    Ok(source)
+}
+fn inventory(directory: &Path, source: &Manifest) -> Result<Inventory, MasterError> {
+    let path = directory.join("tables.json");
+    let value = match fs::symlink_metadata(&path) {
+        Ok(_) => serde_json::from_slice::<Inventory>(&regular(&path, MAX_INDEX)?)
+            .map_err(|_| MasterError::Format)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Existing 1.1 snapshots remain readable. Compute their manifest in memory;
+            // pinned blob reads still verify the caller's digest, without rescanning all tables.
+            let mut files = Vec::new();
+            let mut total = 0u64;
+            for entry in &source.files {
+                let name = entry.name.replace(".bin", ".json");
+                let bytes = regular(&directory.join(&name), MAX_JSON)?;
+                total += bytes.len() as u64;
+                if total > MAX_TOTAL {
+                    return Err(MasterError::Limit);
+                }
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|_| MasterError::Format)?;
+                files.push(file(name, &bytes));
+            }
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+            Inventory {
+                schema_version: 1,
+                version: source.version.clone(),
+                files,
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    value.validate(source)?;
+    Ok(value)
+}
+pub fn current_snapshot(root: &Path) -> Result<String, MasterError> {
+    let bytes = regular(&root.join("CURRENT"), 128)?;
+    let snapshot = String::from_utf8(bytes).map_err(|_| MasterError::Format)?;
+    snapshot_directory(root, &snapshot)?;
+    Ok(snapshot)
+}
+pub fn manifest(
+    root: &Path,
+    snapshot: Option<&str>,
+    scope: Scope,
+) -> Result<Document, MasterError> {
+    if scope.region != Region::Jp
+        || scope.environment.is_empty()
+        || scope.environment.len() > 256
+        || !scope
+            .environment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(MasterError::Format);
+    }
+    let snapshot = match snapshot {
+        Some(v) => v.to_owned(),
+        None => current_snapshot(root)?,
+    };
+    let directory = snapshot_directory(root, &snapshot)?;
+    let mut source = source(&directory)?;
+    source.files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inventory = inventory(&directory, &source)?;
+    let content =
+        serde_json::to_vec(&serde_json::json!({"schema_version":1,"scope":scope,"source_manifest":source,"files":inventory.files})).map_err(|_| MasterError::Format)?;
+    let manifest = PublishedManifest {
+        schema_version: 1,
+        scope,
+        snapshot,
+        version: source.version.clone(),
+        content_sha256: digest(&content),
+        files: inventory.files,
+        source_manifest: source,
+    };
+    let bytes = serde_json::to_vec(&manifest).map_err(|_| MasterError::Format)?;
+    Ok(Document {
+        etag: format!("\"{}\"", digest(&bytes)),
+        version: manifest.version,
+        bytes,
+    })
+}
+pub fn table(
+    root: &Path,
+    snapshot: &str,
+    table: &str,
+    expected_hash: &str,
+) -> Result<Document, MasterError> {
+    if !master::safe_component(table) || !hash_valid(expected_hash) {
+        return Err(MasterError::NotFound);
+    }
+    let directory = snapshot_directory(root, snapshot)?;
+    let source = source(&directory)?;
+    if !source
+        .files
+        .iter()
+        .any(|entry| entry.name == format!("{table}.bin"))
+    {
+        return Err(MasterError::NotFound);
+    }
+    let bytes = regular(&directory.join(format!("{table}.json")), MAX_JSON)?;
+    if digest(&bytes) != expected_hash {
+        return Err(MasterError::Integrity);
+    }
+    verify_indexed(&directory, &source, table, &bytes)?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
+    Ok(Document {
+        etag: format!("\"{expected_hash}\""),
+        version: source.version,
+        bytes,
+    })
+}
+/// Strengthens ordinary table reads as well; absent indexes preserve 1.1 compatibility.
+pub(crate) fn verify_indexed(
+    directory: &Path,
+    source: &Manifest,
+    table: &str,
+    bytes: &[u8],
+) -> Result<(), MasterError> {
+    let path = directory.join("tables.json");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let index: Inventory = serde_json::from_slice(&regular(&path, MAX_INDEX)?)
+                .map_err(|_| MasterError::Format)?;
+            index.validate(source)?;
+            let entry = index
+                .files
+                .iter()
+                .find(|e| e.name == format!("{table}.json"))
+                .ok_or(MasterError::Format)?;
+            if entry.size != bytes.len() as u64 || entry.sha256 != digest(bytes) {
+                return Err(MasterError::Integrity);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}

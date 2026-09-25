@@ -55,6 +55,15 @@ pub fn router_at(
         .route("/servers", get(servers))
         .route("/regions", get(regions))
         .route("/master-data", get(master_status))
+        .route("/master-data/manifest", get(registry_current))
+        .route(
+            "/master-data/snapshots/{snapshot}/manifest",
+            get(registry_manifest),
+        )
+        .route(
+            "/master-data/snapshots/{snapshot}/tables/{table}/{hash}",
+            get(registry_table),
+        )
         .route("/master-data/tables/{table}", get(master_table))
         .route("/announcements", get(announcements))
         .route("/announcements/{id}", get(announcement))
@@ -331,4 +340,87 @@ async fn challenge_ranking(
         },
     )
     .await
+}
+
+async fn registry_response(
+    c: Arc<GameClient>,
+    snapshot: Option<String>,
+    table: Option<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    let root = c
+        .master_directory()
+        .ok_or(AppError::MasterUnavailable)?
+        .to_owned();
+    let scope = crate::master_registry::Scope {
+        region: c.region(),
+        environment: c.environment().into(),
+        platform: c.platform(),
+    };
+    let pinned = table.is_some();
+    let document = tokio::task::spawn_blocking(move || match table {
+        Some((table, hash)) => crate::master_registry::table(
+            &root,
+            snapshot
+                .as_deref()
+                .ok_or(crate::master::MasterError::Format)?,
+            &table,
+            &hash,
+        ),
+        None => crate::master_registry::manifest(&root, snapshot.as_deref(), scope),
+    })
+    .await
+    .map_err(|_| AppError::MasterUnavailable)?
+    .map_err(|e| match e {
+        crate::master::MasterError::NotFound => AppError::NotFound,
+        _ => AppError::MasterUnavailable,
+    })?;
+    let unchanged = headers
+        .get("if-none-match")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|item| {
+                item.trim().strip_prefix("W/").unwrap_or(item.trim()) == document.etag
+                    || item.trim() == "*"
+            })
+        });
+    Response::builder()
+        .status(if unchanged { 304 } else { 200 })
+        .header("content-type", "application/json")
+        .header("etag", document.etag)
+        .header("x-master-version", document.version)
+        .header(
+            "cache-control",
+            if pinned {
+                "private, max-age=31536000, immutable"
+            } else {
+                "private, no-cache"
+            },
+        )
+        .body(if unchanged {
+            axum::body::Body::empty()
+        } else {
+            axum::body::Body::from(document.bytes)
+        })
+        .map_err(|_| AppError::MasterUnavailable)
+}
+async fn registry_current(
+    State(c): State<Arc<GameClient>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    registry_response(c, None, None, headers).await
+}
+async fn registry_manifest(
+    State(c): State<Arc<GameClient>>,
+    Path(snapshot): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    registry_response(c, Some(snapshot), None, headers).await
+}
+async fn registry_table(
+    State(c): State<Arc<GameClient>>,
+    Path((snapshot, table, hash)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    registry_response(c, Some(snapshot), Some((table, hash)), headers).await
 }
