@@ -72,6 +72,15 @@ with tempfile.TemporaryDirectory() as tmp:
         refused = subprocess.run([str(exe), "asset-dispatch-adopt", str(state), key, str(uuid.uuid4())],
                                  cwd=root, env=env, capture_output=True, timeout=15)
         assert refused.returncode != 0
+        # Completed history can be compacted without discarding its permanent identity.
+        ledger = json.loads((state / "outbox.json").read_text())
+        ledger["entries"][key]["state"] = dict(state="completed", job_id=job_id,
+                                               catalog_sha256="b" * 64, publication_id=None)
+        (state / "outbox.json").write_text(json.dumps(ledger))
+        assert dispatch("asset-dispatch-archive", str(state), key, job_id)["state"]["state"] == "completed"
+        assert dispatch("asset-dispatch-status", str(state)) == {}
+        assert dispatch("asset-dispatch-entry", str(state), key)["state"]["job_id"] == job_id
+        assert dispatch("asset-dispatch-archive", str(state), key, job_id)["state"]["state"] == "completed"
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]

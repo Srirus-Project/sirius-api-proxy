@@ -130,8 +130,11 @@ lost or timed-out response does not prove the change was rolled back: query stat
 the identical adoption. Management requests do not accelerate observation/polling or race
 in-flight submissions. Automatic replay of uncertain POSTs remains intentionally disabled.
 
-History has a hard capacity and no automatic pruning; a full history refuses new identities while
-existing jobs continue reconciliation. Safe operator compaction still needs implementation.
+The working ledger has a hard capacity and no automatic pruning. Confirmed completions can be
+explicitly archived to free capacity while retaining permanent deduplication, as described below.
+Capacity exhaustion refuses new observations but leaves reconciliation and online management
+available. If the worker has stopped after a reconciliation persistence error, use offline
+maintenance before restarting it; an online command cannot revive a stopped worker.
 Changing the profile revision intentionally creates a new identity. The updater resolves profiles
 at execution time, so this revision is an operator-controlled re-export marker, not an immutable
 copy of its configuration. Coordinate profile changes with active work.
@@ -150,3 +153,36 @@ updater's optional `user_agent_prefix` filter. Bearer credentials remain indepen
 Omitting the field preserves the existing transport behavior. It identifies the client, not
 a secret; do not place credentials in it. Changing it does not change durable job identity
 or create a second submission of the same catalog.
+
+## Completed-history compaction
+
+Use `POST /entries/{key}/archive` under the existing authenticated asset-dispatch management
+prefix with `{"job_id":"EXPECTED_JOB_UUID"}`. Only `completed` entries with that exact job UUID
+can be archived. Pending, sending, submitted and failed entries remain in the working ledger,
+including ambiguous submissions that still need reconciliation. Successful/repeated identical
+requests return200 with `archived:true` and the complete entry. Invalid syntax returns400;
+unknown entries, wrong UUIDs and ineligible states return409; persistence failures return503.
+`GET /entries/{key}` reads an active or archived entry and reports `archived`; unknown keys
+return404. These routes use the same internal token, sole-owner queue, limits and timeout
+semantics as adoption. Listing `/entries` and its `total` cover working entries only.
+
+The archive is `STATE_DIRECTORY/completed/{dispatch_key}.json`. Its complete terminal receipt
+is written and synchronized before removal from the atomic working ledger. Unix also syncs the
+archive/root directories before removal. An interruption can leave both copies; retrying the
+same request reconciles them. Conflicting/corrupt archives fail closed. Re-observation checks
+the archived identity before capacity/admission, so the same catalog does not submit another job,
+including after restart. Completed archives do not occupy working capacity or load into the
+in-memory ledger. They continue to consume disk space; there is no automatic archive deletion.
+
+For maintenance while the worker is stopped (exclusive state ownership is required):
+
+```sh
+sirius-api-proxy asset-dispatch-archive STATE_DIRECTORY DISPATCH_KEY JOB_UUID
+sirius-api-proxy asset-dispatch-entry STATE_DIRECTORY DISPATCH_KEY
+```
+
+The first prints the archived entry and is idempotent. The second prints either the active or
+archived entry (null when absent). Existing `asset-dispatch-status` still prints the working
+ledger. Back up `completed/` together with `outbox.json`; deleting archived records destroys the
+corresponding deduplication evidence and can permit re-export on a later observation. This is
+receipt compaction, not a retry/reset mechanism or proof of remote asset retention.

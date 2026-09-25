@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -80,7 +80,7 @@ pub enum State {
         code: String,
     },
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub identity: Identity,
@@ -152,6 +152,102 @@ impl Outbox {
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.ledger.entries
     }
+    /// Read one archived completion without loading unbounded history into the working ledger.
+    pub fn archived(&self, key: &str) -> Result<Option<Entry>, Error> {
+        if !valid_key(key) {
+            return Err(Error::Invalid);
+        }
+        let directory = self.directory.join("completed");
+        match fs::symlink_metadata(&directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            _ => return Err(Error::Storage),
+        }
+        let path = directory.join(format!("{key}.json"));
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(m) if m.is_file() && !m.file_type().is_symlink() && m.len() <= 65536 => m,
+            _ => return Err(Error::Storage),
+        };
+        let mut bytes = Vec::new();
+        File::open(&path)
+            .map_err(|_| Error::Storage)?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Error::Storage)?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(Error::Storage);
+        }
+        let entry: Entry = serde_json::from_slice(&bytes).map_err(|_| Error::Storage)?;
+        if entry.identity.key().map_err(|_| Error::Storage)? != key
+            || !valid_state(&entry.state)
+            || !matches!(entry.state, State::Completed { .. })
+        {
+            return Err(Error::Storage);
+        }
+        Ok(Some(entry))
+    }
+    /// Archive only a confirmed completion; its permanent identity prevents replay after compaction.
+    /// The archive is durable before the working ledger forgets the entry. Retry is idempotent.
+    pub fn archive_completed(&mut self, key: &str, expected_job_id: &str) -> Result<Entry, Error> {
+        if !valid_key(key) || !uuid(expected_job_id) {
+            return Err(Error::Invalid);
+        }
+        let archived = self.archived(key)?;
+        let entry = self
+            .ledger
+            .entries
+            .get(key)
+            .cloned()
+            .or_else(|| archived.clone())
+            .ok_or(Error::Invalid)?;
+        if !matches!(&entry.state, State::Completed {job_id, ..} if job_id == expected_job_id) {
+            return Err(Error::Invalid);
+        }
+        if archived.as_ref().is_some_and(|old| old != &entry) {
+            return Err(Error::Storage);
+        }
+        let directory = self.directory.join("completed");
+        if archived.is_none() {
+            fs::create_dir_all(&directory).map_err(|_| Error::Storage)?;
+            let metadata = fs::symlink_metadata(&directory).map_err(|_| Error::Storage)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Error::Storage);
+            }
+            let bytes = serde_json::to_vec(&entry).map_err(|_| Error::Storage)?;
+            let mut file =
+                tempfile::NamedTempFile::new_in(&directory).map_err(|_| Error::Storage)?;
+            file.write_all(&bytes).map_err(|_| Error::Storage)?;
+            file.as_file().sync_all().map_err(|_| Error::Storage)?;
+            file.persist_noclobber(directory.join(format!("{key}.json")))
+                .map_err(|_| Error::Storage)?;
+        }
+        // Also synchronize an existing archive on retry after interrupted persistence.
+        File::open(directory.join(format!("{key}.json")))
+            .map_err(|_| Error::Storage)?
+            .sync_all()
+            .map_err(|_| Error::Storage)?;
+        #[cfg(unix)]
+        {
+            File::open(&directory)
+                .map_err(|_| Error::Storage)?
+                .sync_all()
+                .map_err(|_| Error::Storage)?;
+            File::open(&self.directory)
+                .map_err(|_| Error::Storage)?
+                .sync_all()
+                .map_err(|_| Error::Storage)?;
+        }
+        if self.ledger.entries.contains_key(key) {
+            let mut ledger = self.ledger.clone();
+            ledger.entries.remove(key);
+            if ledger.reconciliation_cursor.as_deref() == Some(key) {
+                ledger.reconciliation_cursor = None;
+            }
+            self.commit(ledger)?;
+        }
+        Ok(entry)
+    }
     /// Rotate across nonterminal work. Persist selection before any network side effect so
     /// restarting cannot repeatedly favor the same blocked prefix of the ledger.
     pub fn next_batch(&mut self, limit: usize) -> Result<Vec<(String, Entry)>, Error> {
@@ -188,6 +284,9 @@ impl Outbox {
     pub fn observe(&mut self, identity: Identity) -> Result<String, Error> {
         let key = identity.key()?;
         if self.ledger.entries.contains_key(&key) {
+            return Ok(key);
+        }
+        if self.archived(&key)?.is_some() {
             return Ok(key);
         }
         if self.ledger.entries.len() >= self.capacity {
@@ -340,4 +439,8 @@ fn valid_state(state: &State) -> bool {
                 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
         }
     }
+}
+
+fn valid_key(key: &str) -> bool {
+    key.len() == 71 && key.starts_with("sirius-") && digest(&key[7..])
 }

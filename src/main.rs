@@ -27,11 +27,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if matches!(
         args.first().map(String::as_str),
-        Some("asset-dispatch-status" | "asset-dispatch-adopt")
+        Some(
+            "asset-dispatch-status"
+                | "asset-dispatch-adopt"
+                | "asset-dispatch-archive"
+                | "asset-dispatch-entry"
+        )
     ) {
         let adopt = args[0] == "asset-dispatch-adopt";
-        if args.len() != if adopt { 4 } else { 2 } {
-            return Err("usage: sirius-api-proxy asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID".into());
+        let archive = args[0] == "asset-dispatch-archive";
+        let entry = args[0] == "asset-dispatch-entry";
+        if args.len()
+            != if adopt || archive {
+                4
+            } else if entry {
+                3
+            } else {
+                2
+            }
+        {
+            return Err("usage: sirius-api-proxy asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID | asset-dispatch-archive STATE_DIRECTORY DISPATCH_KEY JOB_UUID | asset-dispatch-entry STATE_DIRECTORY DISPATCH_KEY".into());
         }
         let directory = std::path::Path::new(&args[1]);
         if !directory.join("outbox.json").is_file() {
@@ -39,7 +54,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Exclusive ownership requires stopping the API worker before offline recovery.
         let mut outbox = sirius_api_proxy::asset_outbox::Outbox::open(directory, 100_000)?;
-        if adopt {
+        if archive {
+            println!(
+                "{}",
+                serde_json::to_string(&outbox.archive_completed(&args[2], &args[3])?)?
+            );
+        } else if entry {
+            let value = outbox
+                .entries()
+                .get(&args[2])
+                .cloned()
+                .or(outbox.archived(&args[2])?);
+            println!("{}", serde_json::to_string(&value)?);
+        } else if adopt {
             outbox.adopt(&args[2], &args[3])?;
             println!(
                 "{}",

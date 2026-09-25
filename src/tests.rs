@@ -4741,6 +4741,33 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     );
     assert_eq!(remote_state.lock().unwrap().1, 2);
     drop(restarted);
+    // Archiving a successful old catalog must suppress new POSTs after a fresh worker startup.
+    let mut outbox = crate::asset_outbox::Outbox::open(path.parent().unwrap(), 100).unwrap();
+    let (archived_key, archived_job) = outbox
+        .entries()
+        .iter()
+        .find_map(|(key, entry)| {
+            if let crate::asset_outbox::State::Completed { job_id, .. } = &entry.state {
+                Some((key.clone(), job_id.clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    outbox
+        .archive_completed(&archived_key, &archived_job)
+        .unwrap();
+    drop(outbox);
+    let mut restarted = Worker::new(&cfg, gc.clone()).unwrap();
+    let mut original = newer.clone();
+    original.resource_version = "r1".into();
+    original.platform_hash = "hash1".into();
+    restarted.observe(&original).unwrap();
+    restarted.reconcile().await.unwrap();
+    assert_eq!(remote_state.lock().unwrap().1, 2);
+    let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(value["entries"].get(&archived_key).is_none());
+    drop(restarted);
     cfg.environment = "review".into();
     assert!(Worker::new(&cfg, gc).is_err());
     remote.abort();
@@ -8981,4 +9008,147 @@ async fn master_git_socks_proxy_resolves_origin_at_proxy() {
         b"git.example.invalid"
     );
     std::env::remove_var(env);
+}
+
+fn archive_dispatch_identity(version: &str) -> crate::asset_outbox::Identity {
+    crate::asset_outbox::Identity {
+        destination_sha256: "a".repeat(64),
+        request: crate::asset_jobs::Request {
+            region: crate::region::Region::Jp,
+            profile: "full".into(),
+            operation: crate::asset_jobs::Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "release".into(),
+        platform: "iOS".into(),
+        resource_version: version.into(),
+        platform_hash: "hash".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    }
+}
+#[test]
+fn dispatch_archive_preserves_deduplication_capacity_and_recovers_interrupted_commit() {
+    use crate::asset_outbox::{Error, Outbox};
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Outbox::open(root.path(), 1).unwrap();
+    let identity = archive_dispatch_identity("v1");
+    let key = store.observe(identity.clone()).unwrap();
+    let job = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        store.archive_completed(&key, &job),
+        Err(Error::Invalid)
+    ));
+    store.begin_send(&key).unwrap();
+    assert!(store.archive_completed(&key, &job).is_err());
+    store.acknowledge(&key, &job).unwrap();
+    assert!(store.archive_completed(&key, &job).is_err());
+    store.next_batch(1).unwrap(); // Cursor points at the soon-to-be-archived entry.
+    store.complete(&key, &job, &"b".repeat(64), None).unwrap();
+    assert!(store
+        .archive_completed(&key, &uuid::Uuid::new_v4().to_string())
+        .is_err());
+    assert!(matches!(
+        store.observe(archive_dispatch_identity("v2")),
+        Err(Error::Full)
+    ));
+    let path = root.path().join("outbox.json");
+    let before = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        store.archive_completed(&key, &job),
+        Err(Error::Storage)
+    ));
+    assert!(store.entries().contains_key(&key));
+    assert!(store.archived(&key).unwrap().is_some());
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, before).unwrap();
+    drop(store);
+    let mut store = Outbox::open(root.path(), 1).unwrap();
+    let entry = store.archive_completed(&key, &job).unwrap();
+    assert!(store.entries().is_empty());
+    assert_eq!(store.archive_completed(&key, &job).unwrap(), entry);
+    let second = store.observe(archive_dispatch_identity("v2")).unwrap();
+    assert_eq!(store.observe(identity.clone()).unwrap(), key);
+    assert_eq!(store.entries().len(), 1);
+    assert_eq!(store.next_batch(1).unwrap()[0].0, second);
+    drop(store);
+    let mut store = Outbox::open(root.path(), 1).unwrap();
+    assert_eq!(store.observe(identity.clone()).unwrap(), key);
+    assert!(!store.entries().contains_key(&key));
+    let archive = root.path().join("completed").join(format!("{key}.json"));
+    std::fs::write(&archive, b"corrupt").unwrap();
+    assert!(matches!(store.observe(identity), Err(Error::Storage)));
+    assert!(store.archived("../../escape").is_err());
+    assert!(store.archive_completed(&second, &job).is_err());
+    store.fail(&second, "submission_ambiguous").unwrap();
+    assert!(store.archive_completed(&second, &job).is_err());
+}
+#[tokio::test]
+async fn dispatch_archive_admin_requires_auth_completion_and_survives_owner_restart() {
+    use crate::asset_outbox::Outbox;
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Outbox::open(root.path(), 2).unwrap();
+    let identity = archive_dispatch_identity("v1");
+    let key = store.observe(identity.clone()).unwrap();
+    let job = uuid::Uuid::new_v4().to_string();
+    store.begin_send(&key).unwrap();
+    store.acknowledge(&key, &job).unwrap();
+    store.complete(&key, &job, &"b".repeat(64), None).unwrap();
+    let pending = store.observe(archive_dispatch_identity("v2")).unwrap();
+    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let owner = tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            crate::asset_dispatch_admin::handle(command, &mut store);
+        }
+        store
+    });
+    let app = crate::asset_dispatch_admin::router(
+        control,
+        "/internal/v1/jp/asset-dispatch",
+        "admin".into(),
+    );
+    let base = "/internal/v1/jp/asset-dispatch/entries";
+    let post = |key: &str, token: &str, id: &str| {
+        Request::post(format!("{base}/{key}/archive"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(json!({"job_id":id}).to_string()))
+            .unwrap()
+    };
+    for (selected, token, id, status) in [
+        (&key, "public", job.as_str(), 401),
+        (&pending, "admin", job.as_str(), 409),
+        (&key, "admin", "bad", 400),
+        (&key, "admin", job.as_str(), 200),
+        (&key, "admin", job.as_str(), 200),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(post(selected, token, id))
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    let request = Request::get(format!("{base}/{key}"))
+        .header("authorization", "Bearer admin")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let value: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["archived"], true);
+    assert_eq!(value["entry"]["state"]["job_id"], job);
+    drop(app);
+    let store = owner.await.unwrap();
+    assert_eq!(store.entries().len(), 1);
+    drop(store);
+    let mut store = Outbox::open(root.path(), 2).unwrap();
+    assert_eq!(store.observe(identity).unwrap(), key);
+    assert_eq!(store.entries().len(), 1);
 }

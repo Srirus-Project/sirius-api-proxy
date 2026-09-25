@@ -21,6 +21,8 @@ pub(crate) struct Command {
 }
 enum Action {
     List(Page),
+    Detail { key: String },
+    Archive { key: String, job_id: String },
     Adopt { key: String, job_id: String },
 }
 #[derive(Default, Deserialize)]
@@ -63,6 +65,11 @@ pub fn router(control: Control, prefix: &str, token: String) -> Router {
         prefix,
         Router::new()
             .route("/entries", get(list))
+            .route("/entries/{key}", get(detail))
+            .route(
+                "/entries/{key}/archive",
+                post(archive).layer(axum::extract::DefaultBodyLimit::max(4096)),
+            )
             .route(
                 "/entries/{key}/adopt",
                 post(adopt).layer(axum::extract::DefaultBodyLimit::max(4096)),
@@ -102,6 +109,32 @@ async fn adopt(
         })
         .await
 }
+async fn detail(
+    State(control): State<Control>,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    if !valid_key(&key) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    control.call(Action::Detail { key }).await
+}
+async fn archive(
+    State(control): State<Control>,
+    Path(key): Path<String>,
+    Json(body): Json<Adoption>,
+) -> Result<Json<Value>, StatusCode> {
+    if !valid_key(&key)
+        || uuid::Uuid::parse_str(&body.job_id).map_or(true, |id| id.to_string() != body.job_id)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    control
+        .call(Action::Archive {
+            key,
+            job_id: body.job_id,
+        })
+        .await
+}
 pub(crate) fn handle(command: Command, outbox: &mut Outbox) {
     // Requests abandoned while waiting for network reconciliation must not mutate later.
     if command.reply.is_closed() {
@@ -127,6 +160,24 @@ pub(crate) fn handle(command: Command, outbox: &mut Outbox) {
                 json!({"status":"ready","total":outbox.entries().len(),"entries":entries,"next_after":next}),
             )
         }
+        Action::Detail { key } => {
+            if let Some(entry) = outbox.entries().get(&key) {
+                Ok(json!({"key":key,"archived":false,"entry":entry}))
+            } else {
+                match outbox.archived(&key) {
+                    Ok(Some(entry)) => Ok(json!({"key":key,"archived":true,"entry":entry})),
+                    Ok(None) => Err(StatusCode::NOT_FOUND),
+                    Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+                }
+            }
+        }
+        Action::Archive { key, job_id } => outbox
+            .archive_completed(&key, &job_id)
+            .map(|entry| json!({"key":key,"archived":true,"entry":entry}))
+            .map_err(|error| match error {
+                Error::Invalid => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            }),
         Action::Adopt { key, job_id } => {
             if !outbox.entries().contains_key(&key) {
                 Err(StatusCode::NOT_FOUND)
