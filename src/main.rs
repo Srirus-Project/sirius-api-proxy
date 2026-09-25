@@ -78,6 +78,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         let receipt = if push {
             let remote = sirius_api_proxy::master_git::Remote {
+                proxy_url_env: std::env::var_os("SIRIUS_MASTER_GIT_PROXY_URL")
+                    .map(|_| "SIRIUS_MASTER_GIT_PROXY_URL".into()),
                 url: args[2].clone(),
                 authorization_env: std::env::var_os("SIRIUS_MASTER_GIT_AUTHORIZATION")
                     .map(|_| "SIRIUS_MASTER_GIT_AUTHORIZATION".into()),

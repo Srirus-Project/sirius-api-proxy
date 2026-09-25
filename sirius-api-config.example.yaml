@@ -154,5 +154,6 @@ response_cache:
 #   remote:
 #     url: https://git.example.invalid/master-data.git
 #     authorization_env: SIRIUS_MASTER_GIT_AUTHORIZATION
+#     # proxy_url_env: SIRIUS_MASTER_GIT_PROXY_URL
 #     allow_http: false
 #     allow_file: false

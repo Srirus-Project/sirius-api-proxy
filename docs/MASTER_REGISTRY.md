@@ -157,7 +157,7 @@ Existing snapshot directories are not pruned.
 
 Producer reads and consumer synchronization operate over atomic local snapshots.
 Central registry persistence, general completion notifications and the remaining Git
-platform/proxy capabilities remain restoration work. Local manifest/file tests do not replace yhm01
+platform capabilities remain restoration work. Local manifest/file tests do not replace yhm01
 full candidate acceptance, source/artifact audits or the 1.2.0 release gates.
 
 ## Consumer update notifications
@@ -268,8 +268,7 @@ not a sandbox against a helper deliberately escaping its group. Non-Unix executi
 returns an explicit unsupported error until platform-specific process-tree cleanup is added.
 
 Local commits, explicit remote pushes, configured author/signing policy and optional service
-background publication are available below. Proxy configuration and Windows process-tree
-handling remain pending. Without master_git configured, no background Git commands run.
+background publication are available below. Windows process-tree handling remains pending. Without master_git configured, no background Git commands run.
 
 ### Local Master Git commits
 
@@ -310,7 +309,7 @@ By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and 
 The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
 repository redirects, injected config and trace destinations; terminal prompting is disabled.
 Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Explicit remote push and environment-referenced HTTP authorization are described below;
-configured proxies and Windows support still remain
+Windows support still remains
 before the full optional Git publication feature is complete.
 
 ### Explicit remote Git push
@@ -343,13 +342,13 @@ in REMOTE_URL. Git receives only the environment variable name through `--config
 secret value is not embedded in command arguments or stored in repository configuration. Use a
 dedicated Git publication credential scoped to the selected repository. Git must support `--config-env`
 for this authorization mechanism. No ambient credential helper, Git askpass, system/global Git
-configuration or HTTP proxy is used. Certificate verification stays enabled; redirects are
+configuration or HTTP proxy is used; an explicit proxy can be configured as described below. Certificate verification stays enabled; redirects are
 disabled. SSH/custom transport URLs, URL credentials/query/fragments and malformed headers
 are rejected. CLI network publication accepts HTTPS only.
 
 An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
 mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
-the CLI. Configurable proxy settings, Windows process containment and final production Git acceptance remain
+the CLI. Windows process containment and final production Git acceptance remain
 separate restoration requirements.
 
 ### Background Git publication
@@ -415,3 +414,24 @@ existing commit, including an older unsigned commit: enabling signing does not r
 rewrite or re-sign history. Verify signatures using a separately trusted public key/keyring
 (for SSH, supply `gpg.ssh.allowedSignersFile` to `git verify-commit`). A successful push receipt
 confirms the remote ref, not a remote hosting provider's signature-trust badge.
+
+### Independent Git proxy
+
+Service profiles can set `master_git.remote.proxy_url_env` to a dedicated environment-variable
+name containing the full proxy URL. For the explicit `master-git-push` CLI, set
+`SIRIUS_MASTER_GIT_PROXY_URL`. Omitting it forces direct Git transport; it does not inherit
+another service's proxy or ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY settings.
+
+Supported proxy schemes are `http`, `https`, and `socks5h` (proxy-side DNS). Git's installed
+libcurl must support the selected transport. Optional username/password belong in the environment
+value, not the YAML, origin URL or command-line arguments. The subprocess receives the variable
+name via Git config-env; no proxy secret is stored in repository config or returned in errors.
+Environment names starting with GIT_ or reserved ambient proxy names are rejected. File remotes
+cannot use a proxy. URLs with non-root paths, query/fragment, incomplete credentials or control
+characters fail validation.
+
+HTTPS origins use CONNECT through HTTP proxies. Proxy authentication is separate from origin
+Authorization; origin headers are not attached to CONNECT. Origin and HTTPS-proxy certificates
+remain verified. Proxy refusal/authentication/transport failures fail publication without direct
+fallback, preserving the pending local commit and installed Master. Ambient bypass lists are
+removed from the owned Git subprocess, so they cannot silently override this explicit routing.

@@ -81,6 +81,19 @@ pub async fn run_with_input(
                 command.env_remove(name);
             }
         }
+        // Explicit Git policy controls routing; ambient bypass lists must not bypass it.
+        for name in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            command.env_remove(name);
+        }
         command
             .current_dir(directory)
             .args(args)

@@ -8074,6 +8074,7 @@ async fn master_git_push_recovers_rejected_push_and_refuses_remote_ahead_before_
         .unwrap()
         .success());
     let remote = master_git::Remote {
+        proxy_url_env: None,
         url: url::Url::from_directory_path(&remote_path)
             .unwrap()
             .to_string(),
@@ -8198,6 +8199,7 @@ async fn master_git_http_auth_is_explicit_and_redirects_are_not_followed() {
     let token = format!("SIRIUS_GIT_TEST_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&token, "Authorization: Bearer git-fixture");
     let remote = master_git::Remote {
+        proxy_url_env: None,
         url: format!("{origin}/repository.git"),
         authorization_env: Some(token.clone()),
         allow_http: true,
@@ -8346,6 +8348,7 @@ async fn master_git_worker_periodically_retries_rejected_push_preserving_install
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
+            proxy_url_env: None,
             url: url::Url::from_directory_path(&remote).unwrap().to_string(),
             authorization_env: None,
             allow_file: true,
@@ -8398,6 +8401,7 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
+            proxy_url_env: None,
             url: "https://git.example/repo.git".into(),
             authorization_env: Some(name.clone()),
             allow_file: false,
@@ -8477,6 +8481,7 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
         state_directory: root.path().join("git"),
         interval_seconds: 10,
         remote: Some(crate::master_git::Remote {
+            proxy_url_env: None,
             url: format!("{origin}/repository.git"),
             authorization_env: None,
             allow_file: false,
@@ -8754,4 +8759,214 @@ async fn master_git_openpgp_policy_signs_and_verifies_with_isolated_keyring() {
         verified.status.success(),
         "OpenPGP commit signature verification failed"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_proxy_uses_connect_without_origin_authorization_or_direct_fallback() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        let mut requests = String::new();
+        for attempt in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            loop {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 16384);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push_str(&String::from_utf8(header).unwrap());
+            let response: &[u8] = if attempt == 0 {
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            socket.write_all(response).await.unwrap();
+        }
+        requests
+    });
+    let proxy_env = format!("SIRIUS_TEST_GIT_PROXY_{}", uuid::Uuid::new_v4().simple());
+    let auth_env = format!("SIRIUS_TEST_GIT_AUTH_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&proxy_env, format!("http://proxy-user:proxy-pass@{addr}"));
+    std::env::set_var(&auth_env, "Authorization: Bearer origin-only-fixture");
+    let (root, _, source, _) = registry_fixture();
+    let remote = crate::master_git::Remote {
+        url: "https://git.example.invalid/repository.git".into(),
+        authorization_env: Some(auth_env.clone()),
+        proxy_url_env: Some(proxy_env.clone()),
+        allow_http: false,
+        allow_file: false,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::master_git::publish(&source, &root.path().join("git"), registry_scope(), &remote),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    let request = tokio::time::timeout(Duration::from_secs(2), proxy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request.starts_with("CONNECT git.example.invalid:443 HTTP/1.1\r\n"));
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("proxy-authorization: basic chjvehktdxnlcjpwcm94es1wyxnz"));
+    assert!(
+        !request.contains("origin-only-fixture"),
+        "origin authorization must not be sent in CONNECT"
+    );
+    let error = result.err().unwrap().to_string();
+    assert!(!error.contains("proxy-pass") && !error.contains("origin-only-fixture"));
+    std::env::remove_var(proxy_env);
+    std::env::remove_var(auth_env);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_failed_http_proxy_never_falls_back_to_reachable_origin() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let hits = hits.clone();
+        move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let hits = proxy_hits.clone();
+        move |uri: axum::http::Uri| {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert!(uri.to_string().starts_with("http://127.0.0.1:"));
+                axum::http::StatusCode::BAD_GATEWAY
+            }
+        }
+    });
+    let (proxy, proxy_server) = peer_http_server(app).await;
+    let env = format!("SIRIUS_TEST_PROXY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, proxy);
+    let (root, _, source, _) = registry_fixture();
+    let remote = crate::master_git::Remote {
+        url: format!("{origin}/repo.git"),
+        authorization_env: None,
+        proxy_url_env: Some(env.clone()),
+        allow_http: true,
+        allow_file: false,
+    };
+    assert!(crate::master_git::publish(
+        &source,
+        &root.path().join("git"),
+        registry_scope(),
+        &remote
+    )
+    .await
+    .is_err());
+    assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    std::env::remove_var(env);
+    server.abort();
+    proxy_server.abort();
+}
+
+#[test]
+fn master_git_proxy_configuration_rejects_invalid_addresses_and_file_remote() {
+    let env = format!("SIRIUS_TEST_PROXY_CONFIG_{}", uuid::Uuid::new_v4().simple());
+    let mut remote = crate::master_git::Remote {
+        url: "https://git.example.invalid/repo.git".into(),
+        authorization_env: None,
+        proxy_url_env: Some(env.clone()),
+        allow_http: false,
+        allow_file: false,
+    };
+    for value in [
+        "http://localhost:1080",
+        "https://localhost:1080",
+        "socks5h://user:pass@localhost:1080",
+    ] {
+        std::env::set_var(&env, value);
+        assert!(remote.validate().is_ok());
+    }
+    for value in [
+        "",
+        "file:///tmp/proxy",
+        "socks5://localhost",
+        "http://localhost/path",
+        "http://localhost?token=x",
+        "http://localhost/#x",
+        "http://user@localhost",
+        "http://localhost\n",
+    ] {
+        std::env::set_var(&env, value);
+        assert!(remote.validate().is_err());
+    }
+    std::env::set_var(&env, "http://localhost:1080");
+    remote.url = "file:///tmp/mirror.git".into();
+    remote.allow_file = true;
+    assert!(remote.validate().is_err());
+    remote.url = "https://git.example.invalid/repo.git".into();
+    remote.proxy_url_env = Some("NO_PROXY".into());
+    assert!(remote.validate().is_err());
+    std::env::remove_var(env);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_socks_proxy_resolves_origin_at_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert_eq!(socket.read_u8().await.unwrap(), 5);
+        let n = socket.read_u8().await.unwrap();
+        let mut methods = vec![0; usize::from(n)];
+        socket.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&0));
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [5, 1, 0, 3]);
+        let size = socket.read_u8().await.unwrap();
+        let mut host = vec![0; usize::from(size)];
+        socket.read_exact(&mut host).await.unwrap();
+        assert_eq!(socket.read_u16().await.unwrap(), 443);
+        socket
+            .write_all(&[5, 2, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        host
+    });
+    let env = format!("SIRIUS_SOCKS_FIXTURE_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&env, format!("socks5h://{addr}"));
+    let (root, _, source, _) = registry_fixture();
+    let remote = crate::master_git::Remote {
+        url: "https://git.example.invalid/repo.git".into(),
+        proxy_url_env: Some(env.clone()),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: false,
+    };
+    assert!(tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::master_git::publish(&source, &root.path().join("git"), registry_scope(), &remote)
+    )
+    .await
+    .unwrap()
+    .is_err());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"git.example.invalid"
+    );
+    std::env::remove_var(env);
 }

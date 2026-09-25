@@ -491,6 +491,7 @@ async fn commit_internal(
 pub struct Remote {
     pub url: String,
     pub authorization_env: Option<String>,
+    pub proxy_url_env: Option<String>,
     #[serde(default)]
     pub allow_http: bool,
     #[serde(default)]
@@ -511,9 +512,37 @@ impl Remote {
                 || (self.allow_file && url.scheme() == "file"))
             || (url.scheme() != "file" && url.host_str().is_none())
             || (url.scheme() == "file"
-                && (url.to_file_path().is_err() || self.authorization_env.is_some()))
+                && (url.to_file_path().is_err()
+                    || self.authorization_env.is_some()
+                    || self.proxy_url_env.is_some()))
         {
             return Err(Error::RemoteConfig);
+        }
+        if let Some(name) = &self.proxy_url_env {
+            if name.is_empty()
+                || name.len() > 256
+                || name.starts_with("GIT_")
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+            {
+                return Err(Error::RemoteConfig);
+            }
+            let value = crate::config::secret(name).map_err(|_| Error::RemoteConfig)?;
+            let proxy = url::Url::parse(&value).map_err(|_| Error::RemoteConfig)?;
+            if value.len() > 4096
+                || value.chars().any(|c| c.is_control() || c.is_whitespace())
+                || value.contains('\\')
+                || !matches!(proxy.scheme(), "http" | "https" | "socks5h")
+                || proxy.host_str().is_none()
+                || !matches!(proxy.path(), "" | "/")
+                || proxy.query().is_some()
+                || proxy.fragment().is_some()
+                || proxy.password() == Some("")
+                || (proxy.username().is_empty() != proxy.password().is_none())
+            {
+                return Err(Error::RemoteConfig);
+            }
         }
         if let Some(name) = &self.authorization_env {
             if name.is_empty()
@@ -545,12 +574,16 @@ impl Remote {
             "protocol.https.allow=always",
             "http.followRedirects=false",
             "http.sslVerify=true",
+            "http.proxySSLVerify=true",
             "http.proxy=",
             "credential.helper=",
             "http.extraHeader=",
             "core.hooksPath=/dev/null",
         ] {
             args.extend(["-c".into(), option.into()]);
+        }
+        if let Some(name) = &self.proxy_url_env {
+            args.push(format!("--config-env=http.proxy={name}").into());
         }
         if self.allow_http {
             args.extend(["-c".into(), "protocol.http.allow=always".into()]);
