@@ -267,9 +267,9 @@ child; cancellation uses Tokio's kill-on-drop/reaping behavior. Process-group co
 not a sandbox against a helper deliberately escaping its group. Non-Unix execution currently
 returns an explicit unsupported error until platform-specific process-tree cleanup is added.
 
-Local snapshot commits are available through the command below. Remote-ahead detection,
-signing/proxy/credential configuration, push acknowledgement/recovery, background integration
-and Windows process-tree handling remain pending. No Git network commands run automatically.
+Local commits and explicit remote pushes are available through the commands below. Signing,
+configurable author/proxy policies, service configuration/background integration and Windows
+process-tree handling remain pending. No Git network commands run automatically.
 
 ### Local Master Git commits
 
@@ -282,7 +282,7 @@ SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-commit ./master-git-st
 
 `master_directory` selects the source and the profile supplies region/environment/platform.
 The command does not create a game client, resolve game/CDN credentials, contact the game,
-start the HTTP service or push to a remote. It prints `commit`, `content_sha256` and `changed`.
+start the HTTP service or push to a remote. It prints `commit`, `content_sha256`, `changed` and `remote_verified` (false for local-only commits).
 This receipt acknowledges only a local Git reference update.
 
 The destination must be a new/empty directory or an existing matching Sirius Git state
@@ -309,6 +309,46 @@ budget after local preparation; synchronous local reads can exceed that preparat
 Commits currently use the fixed local identity `Sirius Master Publisher <sirius-master@localhost>`
 and are unsigned. Ambient `GIT_*` variables are removed before process execution to prevent
 repository redirects, injected config and trace destinations; terminal prompting is disabled.
-Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Remote
-push, configured identities/signing, credentials/proxies, background scheduling and Windows
-support are still required before the full optional Git publication feature is complete.
+Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Explicit remote push and environment-referenced HTTP authorization are described below;
+configured identities/signing/proxies, background scheduling and Windows support still remain
+before the full optional Git publication feature is complete.
+
+### Explicit remote Git push
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-push ./master-git-state https://git.example/master-data.git
+```
+
+The command uses the same verified snapshot, scoped state lock and `master-data` branch. It
+checks the remote branch before creating a new local commit. An absent remote branch can be
+created; a remote equal to or behind the local branch can be advanced. A remote ahead of or
+diverged from local history fails verification before adding a local commit. A new empty
+local store will not overwrite an existing remote branch; retain/recover the original managed
+state and reconcile deliberately. The command never force-pushes, merges or resets either
+branch to conceal divergence. The force marker used when fetching only refreshes a private
+local inspection ref; it is never part of a push refspec.
+
+A rejected/lost push leaves the local commit available. Repeating the command with unchanged
+source data reuses that commit and retries the push. After Git reports success, a separate
+remote-ref query must confirm exactly the submitted commit before `remote_verified: true`
+is returned. `changed` refers to creation of a local commit, not whether network work occurred.
+Remote races, errors and timeouts produce an error, never a false publication receipt. The
+source Master CURRENT pointer is independent and is never rolled back by Git failures. All
+Git work, including checks, commit creation, push and acknowledgement, shares the existing
+120-second budget after local preparation.
+
+For HTTP authorization, set `SIRIUS_MASTER_GIT_AUTHORIZATION` externally to a complete single
+header value such as `Authorization: Bearer …` or `Authorization: Basic …`. Do not put credentials
+in REMOTE_URL. Git receives only the environment variable name through `--config-env`; the
+secret value is not embedded in command arguments or stored in repository configuration. Use a
+dedicated Git publication credential scoped to the selected repository. Git must support `--config-env`
+for this authorization mechanism. No ambient credential helper, Git askpass, system/global Git
+configuration or HTTP proxy is used. Certificate verification stays enabled; redirects are
+disabled. SSH/custom transport URLs, URL credentials/query/fragments and malformed headers
+are rejected. CLI network publication accepts HTTPS only.
+
+An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
+mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
+the CLI. Service background scheduling, deployment-wide credential checks, configurable proxy/
+signing/author settings, Windows process containment and final production Git acceptance remain
+separate restoration requirements.

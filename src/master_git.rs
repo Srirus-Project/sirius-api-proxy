@@ -14,6 +14,10 @@ use std::{
 pub enum Error {
     #[error("invalid or unowned Master Git repository")]
     Ownership,
+    #[error("invalid Master Git remote configuration")]
+    RemoteConfig,
+    #[error("Master Git remote history is incompatible or could not be verified")]
+    RemoteChanged,
     #[error("Master Git repository is already owned")]
     Locked,
     #[error("Master Git snapshot verification or storage failed")]
@@ -26,6 +30,7 @@ pub struct Receipt {
     pub commit: String,
     pub content_sha256: String,
     pub changed: bool,
+    pub remote_verified: bool,
 }
 struct Prepared {
     _owner: fs::File,
@@ -174,6 +179,23 @@ async fn command(
 }
 /// Publish a local bare Git commit only; a receipt is not a remote push acknowledgement.
 pub async fn commit(source: &Path, destination: &Path, scope: Scope) -> Result<Receipt, Error> {
+    commit_internal(source, destination, scope, None).await
+}
+pub async fn publish(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    remote: &Remote,
+) -> Result<Receipt, Error> {
+    remote.validate()?;
+    commit_internal(source, destination, scope, Some(remote)).await
+}
+async fn commit_internal(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    remote: Option<&Remote>,
+) -> Result<Receipt, Error> {
     if !cfg!(unix) {
         return Err(Error::Git);
     }
@@ -223,6 +245,9 @@ pub async fn commit(source: &Path, destination: &Path, scope: Scope) -> Result<R
     } else {
         Some(oid(refs)?)
     };
+    if let Some(remote) = remote {
+        check_remote(&prepared, remote, parent.as_deref(), deadline).await?;
+    }
     let mut tree_input = String::new();
     for names in prepared.names.chunks(64) {
         let mut args = vec![
@@ -262,11 +287,18 @@ pub async fn commit(source: &Path, destination: &Path, scope: Scope) -> Result<R
         )
         .await?)?;
         if old_tree == tree {
-            return Ok(Receipt {
-                commit: parent.clone(),
-                content_sha256: prepared.manifest.content_sha256,
-                changed: false,
-            });
+            return finish(
+                &prepared,
+                remote,
+                Receipt {
+                    commit: parent.clone(),
+                    content_sha256: prepared.manifest.content_sha256.clone(),
+                    changed: false,
+                    remote_verified: false,
+                },
+                deadline,
+            )
+            .await;
         }
     }
     let mut args = vec![
@@ -296,9 +328,215 @@ pub async fn commit(source: &Path, destination: &Path, scope: Scope) -> Result<R
         deadline,
     )
     .await?;
-    Ok(Receipt {
-        commit,
-        content_sha256: prepared.manifest.content_sha256,
-        changed: true,
-    })
+    finish(
+        &prepared,
+        remote,
+        Receipt {
+            commit,
+            content_sha256: prepared.manifest.content_sha256.clone(),
+            changed: true,
+            remote_verified: false,
+        },
+        deadline,
+    )
+    .await
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Remote {
+    pub url: String,
+    pub authorization_env: Option<String>,
+    #[serde(default)]
+    pub allow_http: bool,
+    #[serde(default)]
+    pub allow_file: bool,
+}
+impl Remote {
+    pub fn validate(&self) -> Result<(), Error> {
+        let url = url::Url::parse(&self.url).map_err(|_| Error::RemoteConfig)?;
+        if self.url.len() > 2048
+            || self.url.bytes().any(|b| b.is_ascii_whitespace())
+            || self.url.contains('\\')
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !(url.scheme() == "https"
+                || (self.allow_http && url.scheme() == "http")
+                || (self.allow_file && url.scheme() == "file"))
+            || (url.scheme() != "file" && url.host_str().is_none())
+            || (url.scheme() == "file"
+                && (url.to_file_path().is_err() || self.authorization_env.is_some()))
+        {
+            return Err(Error::RemoteConfig);
+        }
+        if let Some(name) = &self.authorization_env {
+            if name.is_empty()
+                || name.len() > 256
+                || name.starts_with("GIT_")
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(Error::RemoteConfig);
+            }
+            let value = crate::config::secret(name).map_err(|_| Error::RemoteConfig)?;
+            if value.len() > 8192
+                || !value.bytes().all(|b| (32..=126).contains(&b))
+                || value
+                    .strip_prefix("Authorization: Basic ")
+                    .or_else(|| value.strip_prefix("Authorization: Bearer "))
+                    .is_none_or(|token| {
+                        token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace())
+                    })
+            {
+                return Err(Error::RemoteConfig);
+            }
+        }
+        Ok(())
+    }
+    fn options(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        for option in [
+            "protocol.allow=never",
+            "protocol.https.allow=always",
+            "http.followRedirects=false",
+            "http.sslVerify=true",
+            "http.proxy=",
+            "credential.helper=",
+            "http.extraHeader=",
+            "core.hooksPath=/dev/null",
+        ] {
+            args.extend(["-c".into(), option.into()]);
+        }
+        if self.allow_http {
+            args.extend(["-c".into(), "protocol.http.allow=always".into()]);
+        }
+        if self.allow_file {
+            args.extend(["-c".into(), "protocol.file.allow=always".into()]);
+        }
+        if let Some(name) = &self.authorization_env {
+            args.push(format!("--config-env=http.{}.extraHeader={name}", self.url).into());
+        }
+        args
+    }
+}
+async fn network(
+    prepared: &Prepared,
+    remote: &Remote,
+    args: Vec<OsString>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, Error> {
+    let mut options = remote.options();
+    options.extend(args);
+    command(prepared, options, &[], deadline).await
+}
+async fn remote_head(
+    prepared: &Prepared,
+    remote: &Remote,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>, Error> {
+    let bytes = network(
+        prepared,
+        remote,
+        vec![
+            "ls-remote".into(),
+            "--refs".into(),
+            remote.url.clone().into(),
+            "refs/heads/master-data".into(),
+        ],
+        deadline,
+    )
+    .await?;
+    let text = String::from_utf8(bytes).map_err(|_| Error::Git)?;
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() != 1 {
+        return Err(Error::Git);
+    }
+    let (hash, reference) = lines[0].split_once('\t').ok_or(Error::Git)?;
+    if reference != "refs/heads/master-data" {
+        return Err(Error::Git);
+    }
+    Ok(Some(oid(hash.as_bytes().to_vec())?))
+}
+async fn check_remote(
+    prepared: &Prepared,
+    remote: &Remote,
+    parent: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    let Some(head) = remote_head(prepared, remote, deadline).await? else {
+        return Ok(());
+    };
+    let parent = parent.ok_or(Error::RemoteChanged)?;
+    if head == parent {
+        return Ok(());
+    }
+    network(
+        prepared,
+        remote,
+        vec![
+            "fetch".into(),
+            "--no-tags".into(),
+            "--no-write-fetch-head".into(),
+            remote.url.clone().into(),
+            "+refs/heads/master-data:refs/sirius/remote-check".into(),
+        ],
+        deadline,
+    )
+    .await?;
+    let fetched = oid(command(
+        prepared,
+        vec!["rev-parse".into(), "refs/sirius/remote-check".into()],
+        &[],
+        deadline,
+    )
+    .await?)?;
+    if fetched != head {
+        return Err(Error::RemoteChanged);
+    }
+    command(
+        prepared,
+        vec![
+            "merge-base".into(),
+            "--is-ancestor".into(),
+            head.into(),
+            parent.into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await
+    .map_err(|_| Error::RemoteChanged)?;
+    Ok(())
+}
+async fn finish(
+    prepared: &Prepared,
+    remote: Option<&Remote>,
+    mut receipt: Receipt,
+    deadline: tokio::time::Instant,
+) -> Result<Receipt, Error> {
+    if let Some(remote) = remote {
+        network(
+            prepared,
+            remote,
+            vec![
+                "push".into(),
+                "--porcelain".into(),
+                remote.url.clone().into(),
+                format!("{}:refs/heads/master-data", receipt.commit).into(),
+            ],
+            deadline,
+        )
+        .await?;
+        if remote_head(prepared, remote, deadline).await?.as_deref()
+            != Some(receipt.commit.as_str())
+        {
+            return Err(Error::RemoteChanged);
+        }
+        receipt.remote_verified = true;
+    }
+    Ok(receipt)
 }

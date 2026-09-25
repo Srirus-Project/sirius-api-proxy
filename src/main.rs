@@ -50,9 +50,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if args.first().is_some_and(|arg| arg == "master-git-commit") {
-        if args.len() != 2 {
-            return Err("usage: sirius-api-proxy master-git-commit GIT_STATE_DIRECTORY".into());
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "master-git-commit" | "master-git-push"))
+    {
+        let push = args[0] == "master-git-push";
+        if args.len() != if push { 3 } else { 2 } {
+            return Err("usage: sirius-api-proxy master-git-commit GIT_STATE_DIRECTORY | master-git-push GIT_STATE_DIRECTORY REMOTE_URL".into());
         }
         let path =
             std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
@@ -67,9 +71,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             environment: config.environment.clone(),
             platform: config.platform(),
         };
-        let receipt =
+        let receipt = if push {
+            let remote = sirius_api_proxy::master_git::Remote {
+                url: args[2].clone(),
+                authorization_env: std::env::var_os("SIRIUS_MASTER_GIT_AUTHORIZATION")
+                    .map(|_| "SIRIUS_MASTER_GIT_AUTHORIZATION".into()),
+                allow_http: false,
+                allow_file: args[2].starts_with("file://"),
+            };
+            sirius_api_proxy::master_git::publish(
+                source,
+                std::path::Path::new(&args[1]),
+                scope,
+                &remote,
+            )
+            .await?
+        } else {
             sirius_api_proxy::master_git::commit(source, std::path::Path::new(&args[1]), scope)
-                .await?;
+                .await?
+        };
         println!("{}", serde_json::to_string(&receipt)?);
         return Ok(());
     }

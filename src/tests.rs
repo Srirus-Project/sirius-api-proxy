@@ -8056,3 +8056,180 @@ async fn master_git_refuses_unowned_locked_and_linked_destinations() {
         Err(master_git::Error::Ownership)
     ));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_push_recovers_rejected_push_and_refuses_remote_ahead_before_commit() {
+    use crate::{master, master_git};
+    use std::os::unix::fs::PermissionsExt;
+    let (_source_root, input, source, _) = registry_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let remote_path = root.path().join("remote.git");
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&remote_path)
+        .status()
+        .unwrap()
+        .success());
+    let remote = master_git::Remote {
+        url: url::Url::from_directory_path(&remote_path)
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let hook = remote_path.join("hooks/pre-receive");
+    std::fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        master_git::publish(&source, &state, registry_scope(), &remote)
+            .await
+            .is_err()
+    );
+    let git = |repo: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let local_repo = state.join("repository.git");
+    let pending = git(&local_repo, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(hook).unwrap();
+    let published = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!published.changed && published.remote_verified);
+    assert_eq!(published.commit, pending);
+    assert_eq!(git(&local_repo, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        git(&remote_path, &["rev-parse", "refs/heads/master-data"]),
+        pending
+    );
+    let tree = git(
+        &remote_path,
+        &["rev-parse", "refs/heads/master-data^{tree}"],
+    );
+    let ahead = git(
+        &remote_path,
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@localhost",
+            "commit-tree",
+            &tree,
+            "-p",
+            &pending,
+            "-m",
+            "remote manual commit",
+        ],
+    );
+    git(
+        &remote_path,
+        &["update-ref", "refs/heads/master-data", &ahead, &pending],
+    );
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "after-remote-change".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    assert!(matches!(
+        master_git::publish(&source, &state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    assert_eq!(git(&local_repo, &["rev-parse", "HEAD"]), pending);
+    assert_eq!(
+        git(&remote_path, &["rev-parse", "refs/heads/master-data"]),
+        ahead
+    );
+    // A compatible behind remote can be advanced to an existing local commit.
+    git(
+        &remote_path,
+        &["update-ref", "refs/heads/master-data", &pending, &ahead],
+    );
+    let local = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    let result = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!result.changed && result.remote_verified);
+    assert_eq!(result.commit, local.commit);
+    assert_eq!(
+        git(&remote_path, &["rev-parse", "refs/heads/master-data"]),
+        local.commit
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_http_auth_is_explicit_and_redirects_are_not_followed() {
+    use crate::master_git;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let hits = hits.clone();
+        move |headers: axum::http::HeaderMap| {
+            let hits = hits.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer git-fixture");
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::http::Response::builder()
+                    .status(302)
+                    .header("location", "http://127.0.0.1:1/must-not-follow")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let (_root, _, source, _) = registry_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let token = format!("SIRIUS_GIT_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "Authorization: Bearer git-fixture");
+    let remote = master_git::Remote {
+        url: format!("{origin}/repository.git"),
+        authorization_env: Some(token.clone()),
+        allow_http: true,
+        allow_file: false,
+    };
+    assert!(master_git::publish(
+        &source,
+        &state.path().join("state"),
+        registry_scope(),
+        &remote
+    )
+    .await
+    .is_err());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let mut invalid = remote.clone();
+    invalid.allow_http = false;
+    assert!(invalid.validate().is_err());
+    for url in [
+        "https://user:password@example.invalid/repo",
+        "ssh://example.invalid/repo",
+        "https://example.invalid/repo?token=x",
+        "file:///tmp/repo",
+    ] {
+        invalid.url = url.into();
+        assert!(invalid.validate().is_err());
+    }
+    for value in [
+        "Bearer missing-header-name",
+        "Authorization: Bearer x\nInjected: value",
+        "Authorization: Bearer ",
+    ] {
+        std::env::set_var(&token, value);
+        assert!(remote.validate().is_err());
+    }
+    server.abort();
+}
