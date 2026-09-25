@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-async fn authorize(
+pub(crate) async fn authorize(
     State(token): State<Arc<str>>,
     request: Request,
     next: Next,

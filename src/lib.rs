@@ -36,3 +36,5 @@ pub mod asset_jobs;
 pub mod asset_outbox;
 
 pub mod asset_dispatch;
+
+pub mod peer;

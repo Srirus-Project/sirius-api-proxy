@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        peer_token_env: None,
         asset_dispatch: None,
         logging: None,
         region: crate::region::Region::Jp,
@@ -4959,4 +4960,215 @@ async fn stale_cache_has_a_hard_expiry_and_failure_does_not_extend_it() {
         3
     );
     assert_eq!(f.received.lock().unwrap().len(), 4);
+}
+
+fn peer_request(identity: crate::peer::Identity, operation: Value) -> Value {
+    json!({"request_id":uuid::Uuid::new_v4().to_string(),"identity":identity,"operation":operation})
+}
+async fn peer_send(app: axum::Router, token: &str, payload: Value) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/internal/v1/peer/query")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&payload).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn peer_queries_execute_local_rpc_and_return_typed_game_failure() {
+    let mut failure = Reply::version();
+    failure
+        .trailers
+        .insert("grpc-status", "14".parse().unwrap());
+    failure
+        .trailers
+        .insert("grpc-message", "SECRET_MUST_NOT_ESCAPE".parse().unwrap());
+    let f = fixture(vec![Reply::version(), failure]).await;
+    let c = client(&f, config());
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    let response = peer_send(app.clone(), "peer", request.clone()).await;
+    assert_eq!(response.status(), 200);
+    let reply = body(response).await;
+    assert_eq!(reply["request_id"], request["request_id"]);
+    assert_eq!(reply["identity"], request["identity"]);
+    assert_eq!(reply["outcome"]["data"]["version"], "master-fixture");
+    let response = body(peer_send(app, "peer", request).await).await;
+    assert_eq!(
+        response["outcome"],
+        json!({"status":"failure","kind":{"type":"game","grpc_status":14}})
+    );
+    assert!(!response.to_string().contains("SECRET"));
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (route, headers, _) in seen.iter() {
+        assert_eq!(route, VERSION);
+        assert!(headers.get("authorization").is_none());
+    }
+}
+#[tokio::test]
+async fn peer_auth_identity_allowlist_and_limits_reject_before_game_calls() {
+    let f = fixture(vec![]).await;
+    let c = client(&f, config());
+    let app = api::router(c.clone(), "api".into(), "internal".into()).merge(crate::peer::router(
+        c.clone(),
+        "/internal/v1/peer",
+        "peer".into(),
+    ));
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    for token in ["", "api", "internal"] {
+        assert_eq!(
+            peer_send(app.clone(), token, request.clone())
+                .await
+                .status(),
+            401
+        );
+    }
+    let admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/v1/protocol/reload")
+                .header("authorization", "Bearer peer")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), 401);
+    for (key, value) in [
+        ("region", json!("tw")),
+        ("region", json!("cn")),
+        ("environment", json!("review")),
+        ("platform", json!("Android")),
+        ("client_version", json!("9.0.0")),
+        ("protocol_sha256", json!("0".repeat(64))),
+        ("contract_version", json!(2)),
+    ] {
+        let mut invalid = request.clone();
+        invalid["identity"][key] = value;
+        let response = body(peer_send(app.clone(), "peer", invalid).await).await;
+        assert_eq!(response["outcome"]["kind"]["type"], "identity_mismatch");
+    }
+    for operation in [
+        json!({"type":"whoami"}),
+        json!({"type":"player_data"}),
+        json!({"type":"rpc","path":VERSION}),
+        json!({"type":"version","credentials":"SECRET"}),
+        json!({"type":"event_ranking","event_id":1,"ranks":[1,1]}),
+        json!({"type":"profile","profile_id":0}),
+        json!({"type":"event_deck","event_id":1,"player_id":"../bad"}),
+        json!({"type":"announcements","tab":3}),
+    ] {
+        let invalid = peer_request(c.peer_identity().unwrap(), operation);
+        assert!(peer_send(app.clone(), "peer", invalid)
+            .await
+            .status()
+            .is_client_error());
+    }
+    let unsupported = peer_request(c.peer_identity().unwrap(), json!({"type":"servers"}));
+    assert_eq!(
+        body(peer_send(app.clone(), "peer", unsupported).await).await["outcome"]["kind"]["type"],
+        "unsupported_operation"
+    );
+    let mut oversized = request.clone();
+    oversized["operation"]["padding"] = json!("X".repeat(17000));
+    assert_eq!(peer_send(app, "peer", oversized).await.status(), 413);
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn peer_rejects_stale_protocol_after_reload_before_dispatch() {
+    let directory = copy_protocol_bundle();
+    let mut cfg = config();
+    cfg.protocol_directory = directory.path().into();
+    let f = fixture(vec![]).await;
+    let c = client(&f, cfg);
+    let old = c.peer_identity().unwrap();
+    edit_version_proto(
+        directory.path(),
+        "string version = 1;",
+        "string version = 1;\n  string extra = 2;",
+    );
+    c.reload_protocol().await.unwrap();
+    // This calls the dispatch guard directly: a router's earlier identity check
+    // alone is insufficient if a reload activates while admission is queued.
+    assert!(matches!(
+        c.call_peer(VERSION, json!({}), &old.protocol_sha256).await,
+        Err(AppError::PeerIdentityMismatch)
+    ));
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn peer_deployment_is_opt_in_and_has_independent_region_credentials() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let mut cfg = regional_config(Region::Jp);
+    let absent = DeploymentConfig::Single(Box::new(cfg.clone()))
+        .prepare()
+        .unwrap()
+        .router;
+    let request = peer_request(
+        GameClient::new(cfg.clone())
+            .unwrap()
+            .peer_identity()
+            .unwrap(),
+        json!({"type":"version"}),
+    );
+    assert_eq!(
+        peer_send(absent, "peer", request.clone()).await.status(),
+        404
+    );
+    let name = format!("SIRIUS_TEST_PEER_{}", uuid::Uuid::new_v4().simple());
+    cfg.peer_token_env = Some(name.clone());
+    for token in ["public-jp", "internal-jp", "fixture-cdn-secret", " "] {
+        std::env::set_var(&name, token);
+        assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
+            .prepare()
+            .is_err());
+    }
+    std::env::set_var(&name, "dedicated-peer");
+    let app = DeploymentConfig::Single(Box::new(cfg.clone()))
+        .prepare()
+        .unwrap()
+        .router;
+    assert_eq!(peer_send(app, "internal-jp", request).await.status(), 401);
+    let mut tw = regional_config(Region::Tw);
+    tw.peer_token_env = Some(name);
+    let multi = crate::deployment::MultiConfig {
+        logging: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: None,
+        access_log: None,
+        regions: BTreeMap::from([("jp".into(), cfg), ("tw".into(), tw)]),
+    };
+    assert!(DeploymentConfig::Multi(Box::new(multi)).prepare().is_err());
+}
+
+#[tokio::test]
+async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
+    use crate::region::Region;
+    let f = fixture(vec![]).await;
+    let c = client(&f, regional_config(Region::Tw));
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "tw-peer".into());
+    for region in [Region::En, Region::Kr] {
+        let mut identity = c.peer_identity().unwrap();
+        assert_eq!(region.family(), identity.region.family());
+        identity.region = region;
+        let request = peer_request(identity, json!({"type":"version"}));
+        let reply = body(peer_send(app.clone(), "tw-peer", request).await).await;
+        assert_eq!(reply["outcome"]["kind"]["type"], "identity_mismatch");
+    }
+    let request = peer_request(
+        c.peer_identity().unwrap(),
+        json!({"type":"profile","profile_id":1}),
+    );
+    let reply = body(peer_send(app, "tw-peer", request).await).await;
+    assert_eq!(reply["outcome"]["kind"]["type"], "unsupported_operation");
+    assert!(f.received.lock().unwrap().is_empty());
 }

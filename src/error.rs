@@ -7,6 +7,8 @@ use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("peer protocol identity changed before dispatch")]
+    PeerIdentityMismatch,
     #[error("operation is not supported by the verified protocol for this region")]
     UnsupportedRegionOperation,
     #[error("proto bundle compilation or compatibility validation failed")]
@@ -39,6 +41,7 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self {
+            Self::PeerIdentityMismatch => StatusCode::CONFLICT,
             Self::UnsupportedRegionOperation => StatusCode::NOT_IMPLEMENTED,
             Self::InvalidRequest => StatusCode::BAD_REQUEST,
             Self::ProtocolDefinition => StatusCode::UNPROCESSABLE_ENTITY,

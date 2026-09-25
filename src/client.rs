@@ -295,8 +295,27 @@ impl GameClient {
             .map_err(|_| AppError::AccountUnavailable)? = candidate;
         self.account_status()
     }
+    pub fn peer_identity(&self) -> Result<crate::peer::Identity, AppError> {
+        Ok(crate::peer::Identity {
+            contract_version: 1,
+            region: self.region(),
+            environment: self.environment().into(),
+            platform: self.platform(),
+            client_version: self.config.client_version.clone(),
+            protocol_sha256: self.protocol_status()?.sha256,
+        })
+    }
+    pub(crate) async fn call_peer(
+        self: &Arc<Self>,
+        route: &str,
+        input: Value,
+        expected_protocol: &str,
+    ) -> Result<Value, AppError> {
+        self.call_selected(route, input, None, None, Some(expected_protocol))
+            .await
+    }
     pub async fn call(self: &Arc<Self>, route: &str, input: Value) -> Result<Value, AppError> {
-        self.call_selected(route, input, None, None).await
+        self.call_selected(route, input, None, None, None).await
     }
     pub async fn call_account(
         self: &Arc<Self>,
@@ -306,7 +325,8 @@ impl GameClient {
         if !matches!(route, WHOAMI | PLAYER_DATA) {
             return Err(AppError::InvalidRequest);
         }
-        self.call_selected(route, json!({}), Some(name), None).await
+        self.call_selected(route, json!({}), Some(name), None, None)
+            .await
     }
     fn call_selected<'a>(
         self: &'a Arc<Self>,
@@ -314,6 +334,7 @@ impl GameClient {
         input: Value,
         name: Option<&'a str>,
         refresh_key: Option<String>,
+        expected_protocol: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, AppError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -332,6 +353,12 @@ impl GameClient {
                 let _protocol_call = tokio::time::timeout_at(deadline, self.protocol_calls.read())
                     .await
                     .map_err(|_| AppError::Timeout)?;
+                if expected_protocol.is_some_and(|expected| {
+                    self.protocol_status()
+                        .map_or(true, |status| status.sha256 != expected)
+                }) {
+                    return Err(AppError::PeerIdentityMismatch);
+                }
                 let lease = if authenticated(route) {
                     Some(
                         self.accounts
@@ -389,6 +416,7 @@ impl GameClient {
                                                     input,
                                                     account_name.as_deref(),
                                                     Some(key),
+                                                    None,
                                                 )
                                                 .await;
                                         });

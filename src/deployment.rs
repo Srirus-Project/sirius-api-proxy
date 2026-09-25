@@ -138,13 +138,47 @@ impl DeploymentConfig {
             )
             .into());
         }
+        let peer_tokens = configs
+            .iter()
+            .map(|c| {
+                c.peer_token_env
+                    .as_ref()
+                    .map(|name| secret(name))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, token) in peer_tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_ref().map(|t| (i, t)))
+        {
+            if token.bytes().any(|b| b.is_ascii_whitespace())
+                || tokens
+                    .iter()
+                    .any(|(public, internal)| token == public || token == internal)
+                || peer_tokens
+                    .iter()
+                    .enumerate()
+                    .any(|(i, other)| i != index && other.as_ref() == Some(token))
+                || configs.iter().any(|c| {
+                    c.cdn_credential_env
+                        .values()
+                        .chain(c.player_credential_env.iter())
+                        .chain(c.accounts.iter().filter_map(|a| a.credential_env.as_ref()))
+                        .any(|name| std::env::var(name).is_ok_and(|value| value == *token))
+                })
+            {
+                return Err(AppError::Config("peer tokens must be region-scoped and distinct from API/internal/game/CDN credentials").into());
+            }
+        }
         for c in &configs {
             if let Some(dispatch) = &c.asset_dispatch {
                 for target in &dispatch.targets {
                     let token = secret(&target.token_env)?;
-                    if tokens
-                        .iter()
-                        .any(|(public, internal)| token == *public || token == *internal)
+                    if peer_tokens.iter().flatten().any(|peer| peer == &token)
+                        || tokens
+                            .iter()
+                            .any(|(public, internal)| token == *public || token == *internal)
                         || configs.iter().any(|config| {
                             config
                                 .cdn_credential_env
@@ -160,7 +194,9 @@ impl DeploymentConfig {
         let mut router = api::health_router();
         let mut updaters = Vec::new();
         let mut asset_dispatchers = Vec::new();
-        for (c, (public, internal)) in configs.into_iter().zip(tokens) {
+        for ((c, (public, internal)), peer_token) in
+            configs.into_iter().zip(tokens).zip(peer_tokens)
+        {
             let client = GameClient::new(c.clone())?;
             if c.asset_dispatch.is_some() {
                 asset_dispatchers.push(crate::asset_dispatch::Worker::new(c, client.clone())?);
@@ -176,6 +212,13 @@ impl DeploymentConfig {
             } else {
                 ("/api/v1".into(), "/internal/v1".into())
             };
+            if let Some(token) = peer_token {
+                router = router.merge(crate::peer::router(
+                    client.clone(),
+                    &format!("{internal_prefix}/peer"),
+                    token,
+                ));
+            }
             router = router.merge(api::router_at(
                 client,
                 public,

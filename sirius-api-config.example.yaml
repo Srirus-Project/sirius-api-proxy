@@ -11,6 +11,8 @@ session_lock: true
 protocol_directory: ./protocol/sirius/1.0.3
 api_token_env: SIRIUS_API_TOKEN
 internal_token_env: SIRIUS_INTERNAL_TOKEN
+# Optional dedicated read-only node credential; see docs/PEER_QUERIES.md.
+# peer_token_env: SIRIUS_JP_PEER_TOKEN
 # Optional existing game account; both references must be set together.
 # player_id_env: SIRIUS_PLAYER_ID
 # player_credential_env: SIRIUS_PLAYER_CREDENTIAL
