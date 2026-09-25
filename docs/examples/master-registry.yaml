@@ -44,3 +44,12 @@ backend:
 #   internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
 #   local_interval_seconds: 300
 #   staging_directory: ./registry-master # PostgreSQL only
+
+# Optional outbound update hints to consumers that pull from this registry:
+# notify:
+#   interval_seconds: 30
+#   request_timeout_ms: 5000
+#   targets:
+#     - name: replica-a
+#       origin: https://replica-a.example.invalid
+#       token_env: SIRIUS_REPLICA_A_INTERNAL_TOKEN

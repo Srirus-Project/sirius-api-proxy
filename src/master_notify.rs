@@ -148,18 +148,25 @@ pub struct TargetConfig {
 }
 impl Config {
     pub fn validate(&self, config: &crate::config::Config) -> Result<(), crate::error::AppError> {
-        let bad = || crate::error::AppError::Config("invalid Master notification configuration");
         if config.region != crate::region::Region::Jp
             || config
                 .master_directory
                 .as_ref()
                 .is_none_or(|p| p.as_os_str().is_empty())
+        {
+            return Err(bad_config());
+        }
+        self.validate_policy(&scope(config))
+    }
+    /// Checks independent of the service assembly that owns the published state.
+    pub(crate) fn validate_policy(&self, scope: &Scope) -> Result<(), crate::error::AppError> {
+        if scope.region != crate::region::Region::Jp
             || self.targets.is_empty()
             || self.targets.len() > 16
             || !(10..=3600).contains(&self.interval_seconds)
             || !(100..=30_000).contains(&self.request_timeout_ms)
         {
-            return Err(bad());
+            return Err(bad_config());
         }
         let mut names = std::collections::BTreeSet::new();
         for target in &self.targets {
@@ -177,20 +184,23 @@ impl Config {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_')
             {
-                return Err(bad());
+                return Err(bad_config());
             }
             Target::new(
                 &target.origin,
                 "validation",
-                scope(config),
+                scope.clone(),
                 target.regional_paths,
                 target.allow_http,
                 self.request_timeout_ms,
             )
-            .map_err(|_| bad())?;
+            .map_err(|_| bad_config())?;
         }
         Ok(())
     }
+}
+fn bad_config() -> crate::error::AppError {
+    crate::error::AppError::Config("invalid Master notification configuration")
 }
 fn scope(config: &crate::config::Config) -> Scope {
     Scope {
@@ -221,8 +231,63 @@ pub(crate) fn validate_tokens(
     Ok(())
 }
 
+/// Configured consumers for one scope. Holds no publication state of its own:
+/// callers supply the committed content hash they actually serve.
+pub(crate) struct Targets(Vec<(String, Target)>);
+impl Targets {
+    pub(crate) fn new(policy: &Config, scope: Scope) -> Result<Self, crate::error::AppError> {
+        policy.validate_policy(&scope)?;
+        let mut targets = Vec::new();
+        for target in &policy.targets {
+            targets.push((
+                target.name.clone(),
+                Target::new(
+                    &target.origin,
+                    &crate::config::secret(&target.token_env)?,
+                    scope.clone(),
+                    target.regional_paths,
+                    target.allow_http,
+                    policy.request_timeout_ms,
+                )
+                .map_err(|_| {
+                    crate::error::AppError::Config(
+                        "invalid Master notification destination or token",
+                    )
+                })?,
+            ));
+        }
+        Ok(Self(targets))
+    }
+    /// Try every target even if another target fails. Successful targets deduplicate.
+    pub(crate) async fn deliver(&mut self, hash: &str) -> Result<usize, Error> {
+        let mut delivered = 0;
+        let mut failed = false;
+        for (name, target) in &mut self.0 {
+            match target.deliver(hash).await {
+                Ok(sent) => delivered += usize::from(sent),
+                Err(_) => {
+                    failed = true;
+                    tracing::warn!(target_name = %name, "Master notification was not accepted");
+                }
+            }
+        }
+        if failed {
+            Err(Error::Delivery)
+        } else {
+            Ok(delivered)
+        }
+    }
+    /// Names and acknowledged content only; origins and credentials stay private.
+    pub(crate) fn status(&self) -> Vec<serde_json::Value> {
+        self.0
+            .iter()
+            .map(|(name, target)| serde_json::json!({"name":name,"accepted_content_sha256":target.accepted}))
+            .collect()
+    }
+}
+
 pub struct Worker {
-    targets: Vec<(String, Target)>,
+    targets: Targets,
     directory: std::path::PathBuf,
     scope: Scope,
     interval: Duration,
@@ -241,27 +306,8 @@ impl Worker {
             .ok_or(crate::error::AppError::Config(
                 "Master notifications are not configured",
             ))?;
-        let mut targets = Vec::new();
-        for target in &policy.targets {
-            targets.push((
-                target.name.clone(),
-                Target::new(
-                    &target.origin,
-                    &crate::config::secret(&target.token_env)?,
-                    scope(config),
-                    target.regional_paths,
-                    target.allow_http,
-                    policy.request_timeout_ms,
-                )
-                .map_err(|_| {
-                    crate::error::AppError::Config(
-                        "invalid Master notification destination or token",
-                    )
-                })?,
-            ));
-        }
         Ok(Self {
-            targets,
+            targets: Targets::new(policy, scope(config))?,
             directory: config
                 .master_directory
                 .clone()
@@ -272,7 +318,6 @@ impl Worker {
         })
     }
     /// Reconcile the durable committed pointer; never modify publication state.
-    /// Try every target even if another target fails. Successful targets deduplicate.
     pub async fn reconcile(&mut self) -> Result<usize, Error> {
         let directory = self.directory.clone();
         let scope = self.scope.clone();
@@ -285,22 +330,7 @@ impl Worker {
         })
         .await
         .map_err(|_| Error::Delivery)??;
-        let mut delivered = 0;
-        let mut failed = false;
-        for (name, target) in &mut self.targets {
-            match target.deliver(&hash).await {
-                Ok(sent) => delivered += usize::from(sent),
-                Err(_) => {
-                    failed = true;
-                    tracing::warn!(target_name = %name, "Master notification was not accepted");
-                }
-            }
-        }
-        if failed {
-            Err(Error::Delivery)
-        } else {
-            Ok(delivered)
-        }
+        self.targets.deliver(&hash).await
     }
     pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         loop {

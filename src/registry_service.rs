@@ -27,6 +27,8 @@ pub struct Config {
     pub regional_paths: bool,
     pub backend: Backend,
     pub owner: Option<crate::registry_owner::Config>,
+    /// Outbound update hints to consumers after the served state changes.
+    pub notify: Option<crate::master_notify::Config>,
     pub tls: Option<crate::server::TlsConfig>,
     pub logging: Option<crate::application_log::Config>,
     pub access_log: Option<crate::access_log::Config>,
@@ -156,10 +158,47 @@ impl Config {
         } else {
             None
         };
+        let notify_status = Arc::new(tokio::sync::RwLock::new(
+            json!({"status":"pending","content_sha256":null,"targets":[]}),
+        ));
+        let targets = if let Some(policy) = &self.notify {
+            policy.validate_policy(&self.scope)?;
+            // Outgoing credentials must not be able to authenticate to this service,
+            // its upstream source or its database.
+            let mut protected = vec![token.clone()];
+            protected.extend(internal_token.clone());
+            if let Some(owner) = &self.owner {
+                if let Some(source) = &owner.source {
+                    protected.push(crate::config::secret(&source.token_env)?);
+                }
+            }
+            if let Backend::Postgres { connection } = &self.backend {
+                protected.push(crate::config::secret(&connection.password_env)?);
+            }
+            for target in &policy.targets {
+                if protected.contains(&crate::config::secret(&target.token_env)?) {
+                    return Err(invalid());
+                }
+            }
+            Some((
+                crate::master_notify::Targets::new(policy, self.scope.clone())
+                    .map_err(|_| invalid())?,
+                std::time::Duration::from_secs(policy.interval_seconds),
+            ))
+        } else {
+            None
+        };
         let state = Arc::new(Service {
             scope: self.scope.clone(),
             backend,
             owner: owner.clone(),
+            notify_status: self.notify.as_ref().map(|_| notify_status.clone()),
+        });
+        let notifier = targets.map(|(targets, interval)| Notifier {
+            targets,
+            interval,
+            service: state.clone(),
+            status: notify_status,
         });
         let routes = Router::new()
             .route("/manifest", get(current))
@@ -185,6 +224,7 @@ impl Config {
                 .route("/master-data/updater", get(owner_status))
                 .route("/master-data/refresh", post(owner_refresh))
                 .route("/master-data/publish", post(owner_publish))
+                .route("/master-data/notifications", get(notification_status))
                 .route(
                     "/master-data/sync",
                     post(owner_hint).layer(axum::extract::DefaultBodyLimit::max(4096)),
@@ -213,6 +253,7 @@ impl Config {
             tls,
             router,
             owner,
+            notifier,
         })
     }
 }
@@ -224,6 +265,7 @@ pub struct Prepared {
     pub tls: Option<crate::server::LoadedTls>,
     pub router: Router,
     pub owner: Option<Arc<crate::registry_owner::Worker>>,
+    pub notifier: Option<Notifier>,
 }
 enum Source {
     Files(PathBuf),
@@ -233,6 +275,7 @@ struct Service {
     scope: registry::Scope,
     backend: Source,
     owner: Option<Arc<crate::registry_owner::Worker>>,
+    notify_status: Option<Arc<tokio::sync::RwLock<Value>>>,
 }
 enum Selection {
     Current,
@@ -504,4 +547,76 @@ async fn owner_publish(
         axum::http::StatusCode::ACCEPTED,
         Json(json!({"status":"accepted"})),
     ))
+}
+
+async fn notification_status(State(s): State<Arc<Service>>) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        s.notify_status
+            .as_ref()
+            .ok_or(AppError::NotFound)?
+            .read()
+            .await
+            .clone(),
+    ))
+}
+
+/// Announces the content this process currently serves: CURRENT for files, the
+/// committed database state for PostgreSQL. A staged snapshot whose database
+/// publication failed is therefore never announced. Hints only wake consumers,
+/// which still fetch and verify the manifest themselves.
+pub struct Notifier {
+    targets: crate::master_notify::Targets,
+    interval: std::time::Duration,
+    service: Arc<Service>,
+    status: Arc<tokio::sync::RwLock<Value>>,
+}
+impl Notifier {
+    async fn served_hash(&self) -> Result<String, AppError> {
+        let document = self.service.document(Selection::Current, None).await?;
+        let manifest: registry::PublishedManifest =
+            serde_json::from_slice(&document.bytes).map_err(|_| AppError::MasterUnavailable)?;
+        Ok(manifest.content_sha256)
+    }
+    /// Deliver the served hash to every target that has not accepted it.
+    pub async fn reconcile(&mut self) -> Result<usize, &'static str> {
+        let hash = match self.served_hash().await {
+            Ok(hash) => hash,
+            Err(_) => {
+                *self.status.write().await = json!({"status":"unavailable","error_code":"served_state_unavailable","content_sha256":null,"targets":self.targets.status()});
+                return Err("served_state_unavailable");
+            }
+        };
+        let result = self.targets.deliver(&hash).await;
+        let status = if result.is_ok() { "ready" } else { "retrying" };
+        *self.status.write().await = json!({"status":status,"content_sha256":hash,"checked_at":chrono::Utc::now(),"targets":self.targets.status()});
+        result.map_err(|_| "delivery_incomplete")
+    }
+    pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let owner = self.service.owner.clone();
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {biased;
+                _ = shutdown.changed() => break,
+                result = self.reconcile() => {
+                    if let Err(code) = result {
+                        tracing::warn!(error_code = code, "Registry notification incomplete; retrying on next interval");
+                    }
+                }
+            }
+            tokio::select! {biased;
+                _ = shutdown.changed() => break,
+                _ = async {
+                    match &owner {
+                        Some(owner) => owner.publication_notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+                _ = tokio::time::sleep(self.interval) => {},
+            }
+        }
+        let mut status = self.status.write().await;
+        status["status"] = json!("stopped");
+    }
 }

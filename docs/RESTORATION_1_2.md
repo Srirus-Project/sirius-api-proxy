@@ -167,3 +167,11 @@ File CURRENT is already authoritative, so local validation does not fabricate an
 PostgreSQL publication uses existing transactional content identity. Local work can proceed during a
 source outage and is serialized with source refresh. Original registry source audit also confirms
 outbound subscriber fan-out; standalone notification integration remains an explicit outstanding item.
+
+Added standalone registry outbound notifications. The existing hint transport was separated from the
+game-service assembly and now announces the state the registry actually serves: file CURRENT or the
+committed PostgreSQL document, so a failed database publication never announces its staged snapshot.
+Startup, successful owner work and interval retries reconcile each target independently with
+per-target deduplication; status is internal-token protected and redacted, and shutdown cancels
+delivery. Outgoing tokens are separated from read/internal/source/database credentials. Tests include
+a real consumer woken by local publication and an actual PostgreSQL failure/recovery case.

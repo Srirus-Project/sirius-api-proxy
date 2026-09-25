@@ -12,6 +12,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let prepared = config.prepare()?;
         let listener = tokio::net::TcpListener::bind(prepared.listen).await?;
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let notifier = prepared
+            .notifier
+            .map(|notifier| tokio::spawn(notifier.run(receiver.clone())));
         let worker = prepared
             .owner
             .map(|owner| tokio::spawn(owner.run(receiver)));
@@ -34,8 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await;
         let _ = shutdown.send(true);
-        if let Some(worker) = worker {
-            worker.await?;
+        for task in worker.into_iter().chain(notifier) {
+            task.await?;
         }
         result?;
         return Ok(());

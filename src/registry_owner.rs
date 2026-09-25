@@ -21,6 +21,7 @@ pub struct Worker {
     database: Option<db::Config>,
     interval: Duration,
     wake: Notify,
+    published: Notify,
     pending: std::sync::atomic::AtomicU8,
     status: RwLock<Value>,
 }
@@ -63,6 +64,7 @@ impl Worker {
             database,
             interval: Duration::from_secs(interval),
             wake: Notify::new(),
+            published: Notify::new(),
             pending: std::sync::atomic::AtomicU8::new(0),
             status: RwLock::new(json!({"status":"pending","last_success":null})),
         }))
@@ -89,6 +91,11 @@ impl Worker {
         }
         self.refresh();
         Ok(())
+    }
+    /// Wakes the outbound notifier after a successful reconciliation. The notifier
+    /// still reads the served backend, so a wake never announces unpublished content.
+    pub(crate) async fn publication_notified(&self) {
+        self.published.notified().await;
     }
     pub async fn status(&self) -> Value {
         self.status.read().await.clone()
@@ -137,6 +144,7 @@ impl Worker {
                         Ok(receipt)=>{
                             last_success=json!({"completed_at":chrono::Utc::now(),"receipt":receipt});
                             *self.status.write().await=json!({"status":"ready","last_success":last_success});
+                            self.published.notify_one();
                         },
                         Err(code)=>{
                             *self.status.write().await=json!({"status":"failed","error_code":code,"last_success":last_success});

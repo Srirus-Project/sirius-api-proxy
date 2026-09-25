@@ -57,10 +57,10 @@ not pretend that file installation chronology and database publication chronolog
 ## Remaining registry work
 
 The service can serve files or database state written externally or by the optional publication worker
-below. Standalone outbound subscriber notifications remain separate restoration work; the original
-registry notifies subscribers after publication, while the existing proxy notification worker is still
-coupled to its game-service assembly. No Sekai-specific music metadata or app-identity overrides are
-introduced. Final candidate and packaged cross-platform acceptance are still required for 1.2.0.
+below, and can notify consumers after the served state changes (see
+[outbound consumer notifications](#outbound-consumer-notifications)). No Sekai-specific music metadata
+or app-identity overrides are introduced. Final candidate and packaged cross-platform acceptance are
+still required for 1.2.0.
 
 
 ## Verified snapshot bundles
@@ -171,3 +171,45 @@ from the caller. A 202 acknowledges process-local queued work; inspect status fo
 local-publish and source-refresh requests are coalesced separately: local publication runs first, followed
 by the requested source reconciliation. Periodic source reconciliation may subsequently install newer
 source content. Failed local verification retains last success and never publishes corrupted tables.
+
+
+## Outbound consumer notifications
+
+The original registry notifies subscribers after publishing. Configure `notify` to send the existing
+bounded `{scope, content_sha256}` update hint to other registries or proxies that pull from this one:
+
+```yaml
+notify:
+  interval_seconds: 30        # 10–3600 retry/reconciliation interval
+  request_timeout_ms: 5000    # 100–30000
+  targets:                    # 1–16, unique names
+    - name: replica-a
+      origin: https://replica-a.example.invalid
+      token_env: SIRIUS_REPLICA_A_INTERNAL_TOKEN # the consumer's internal token
+      regional_paths: false
+```
+
+The announced hash is always the state this process serves: CURRENT for files and the committed
+current document for PostgreSQL. A snapshot staged locally whose database publication failed is
+therefore never announced. The notifier runs at startup, after each successful owner reconciliation
+or local publication, and at the retry interval. Every target is attempted independently; a target
+that accepted a hash is not sent it again, while failed targets retry. Without an `owner` the
+notifier still announces externally written state on its interval. Notification never modifies
+publication state.
+
+Hints only wake a consumer; it still fetches and verifies the manifest from its configured source.
+Acceptance (202 `{"status":"accepted"}`) is not synchronization success, and delivery is not
+exactly-once: acknowledgement state is process-local, so a restart may resend the current hint.
+Consumers must keep periodic polling. Transport uses verified HTTPS, no ambient proxy, no redirects
+or hidden retries, and bounded replies; `allow_http` is an explicit testing opt-in.
+
+Notification tokens must differ from the registry read token, internal token, source token and
+database password. With an owner, `GET /internal/v1[/jp]/master-data/notifications` (internal token)
+reports `pending`, `ready`, `retrying`, `unavailable` or `stopped`, the served content hash and each
+target's name and accepted hash, without origins, credentials or paths. Shutdown cancels an
+in-flight delivery.
+
+Tests cover a real consumer woken by a local publication with 86400 s consumer polling and 3600 s
+notifier retry, partial failure retry without resending, missing served state, stalled delivery
+shutdown, credential separation and policy bounds; an optional PostgreSQL test proves a staged
+snapshot is not announced while database publication fails and is announced after recovery.

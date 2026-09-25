@@ -10105,6 +10105,7 @@ fn standalone_registry_config(directory: std::path::PathBuf) -> crate::registry_
         regional_paths: false,
         backend: crate::registry_service::Backend::Files { directory },
         owner: None,
+        notify: None,
         tls: None,
         logging: None,
         access_log: None,
@@ -11221,4 +11222,378 @@ async fn registry_local_publication_database_without_source_deduplicates() {
     );
     shutdown.send(true).unwrap();
     task.await.unwrap();
+}
+
+/// Records accepted update hints; `fail` rejects deliveries without recording them.
+fn registry_hint_recorder(
+    fail: Arc<std::sync::atomic::AtomicBool>,
+) -> (axum::Router, Arc<Mutex<Vec<String>>>) {
+    let hints = Arc::new(Mutex::new(Vec::new()));
+    let seen = hints.clone();
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let seen = seen.clone();
+        let fail = fail.clone();
+        async move {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down");
+            }
+            let hint: crate::master_sync::UpdateHint = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push(hint.content_sha256);
+            (
+                axum::http::StatusCode::ACCEPTED,
+                "{\"status\":\"accepted\"}",
+            )
+        }
+    });
+    (app, hints)
+}
+fn try_served_hash(directory: &std::path::Path) -> Option<String> {
+    let document = crate::master_registry::manifest(directory, None, registry_scope()).ok()?;
+    let value: Value = serde_json::from_slice(&document.bytes).ok()?;
+    value["content_sha256"].as_str().map(str::to_owned)
+}
+fn served_hash(directory: &std::path::Path) -> String {
+    try_served_hash(directory).unwrap()
+}
+async fn wait_served_hash(directory: &std::path::Path, hash: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while try_served_hash(directory).as_deref() != Some(hash) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn registry_notifications_wake_real_consumer_after_local_publication() {
+    use axum::body::Body;
+    let (_root, input, source, _) = registry_fixture();
+    // Bind first: the consumer pulls from the registry and the registry notifies it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry_origin = format!("http://{}", listener.local_addr().unwrap());
+    let consumer_root = tempfile::tempdir().unwrap();
+    let mut consumer_cfg = master_sync_config(registry_origin, consumer_root.path().join("master"));
+    consumer_cfg.master_sync.as_mut().unwrap().interval_seconds = 86400;
+    let consumer = GameClient::new(consumer_cfg.clone()).unwrap();
+    let (consumer_origin, consumer_server) = peer_http_server(api::router(
+        consumer.clone(),
+        "consumer-read".into(),
+        "consumer-admin".into(),
+    ))
+    .await;
+    let mut cfg = registry_owner_config("http://127.0.0.1:1".into(), source.clone());
+    std::env::set_var(&cfg.token_env, "owner-read");
+    cfg.owner.as_mut().unwrap().source = None;
+    cfg.notify = Some(notification_policy(consumer_origin.clone()));
+    let prepared = cfg.prepare().unwrap();
+    let app = prepared.router.clone();
+    let registry_server =
+        tokio::spawn(async move { axum::serve(listener, prepared.router).await.unwrap() });
+    let owner = prepared.owner.unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let syncer = crate::master_sync::Syncer::new(&consumer_cfg, consumer.clone()).unwrap();
+    let tasks = [
+        tokio::spawn(owner.clone().run(receiver.clone())),
+        tokio::spawn(prepared.notifier.unwrap().run(receiver.clone())),
+        tokio::spawn(syncer.run(receiver)),
+    ];
+    let status = |token: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::get("/internal/v1/master-data/notifications")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            (code, bytes)
+        }
+    };
+    let wait_for = move |hash: String| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, bytes) = status("registry-admin").await;
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                if value["status"] == "ready" && value["content_sha256"] == hash.as_str() {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let first = wait_for(served_hash(&source)).await;
+    assert_eq!(first["targets"][0]["name"], "consumer");
+    wait_served_hash(
+        consumer_cfg.master_directory.as_ref().unwrap(),
+        first["content_sha256"].as_str().unwrap(),
+    )
+    .await;
+    for token in ["owner-read", "consumer-admin", "wrong"] {
+        assert_eq!(status(token).await.0, 401);
+    }
+    let text = String::from_utf8(status("registry-admin").await.1.to_vec()).unwrap();
+    assert!(
+        !text.contains("consumer-admin")
+            && !text.contains(&consumer_origin)
+            && !text.contains(&source.to_string_lossy().to_string())
+    );
+    // Neither the consumer's poll nor the notifier's retry interval can explain delivery.
+    let (mut next, decoder, _) = master_fixture();
+    next.version = "registry-notified".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let published = app
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/master-data/publish")
+                .header("authorization", "Bearer registry-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 202);
+    let hash = served_hash(&source);
+    wait_for(hash.clone()).await;
+    wait_served_hash(consumer_cfg.master_directory.as_ref().unwrap(), &hash).await;
+    stop.send(true).unwrap();
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let (_, bytes) = status("registry-admin").await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["status"],
+        "stopped"
+    );
+    registry_server.abort();
+    consumer_server.abort();
+}
+
+#[tokio::test]
+async fn registry_notifications_retry_only_failed_targets_and_require_served_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_root, _input, source, _) = registry_fixture();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let failing = Arc::new(AtomicBool::new(true));
+    let (app, accepted) = registry_hint_recorder(healthy);
+    let (healthy_origin, healthy_server) = peer_http_server(app).await;
+    let (app, retried) = registry_hint_recorder(failing.clone());
+    let (failing_origin, failing_server) = peer_http_server(app).await;
+    let mut policy = notification_policy(healthy_origin);
+    let mut second = notification_policy(failing_origin).targets.remove(0);
+    second.name = "failing".into();
+    policy.targets.push(second);
+    // Without an owner the registry still announces externally written state.
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.notify = Some(policy);
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let mut notifier = cfg.prepare().unwrap().notifier.unwrap();
+    assert_eq!(notifier.reconcile().await, Err("delivery_incomplete"));
+    failing.store(false, Ordering::SeqCst);
+    assert_eq!(notifier.reconcile().await, Ok(1));
+    assert_eq!(notifier.reconcile().await, Ok(0));
+    let hash = served_hash(&source);
+    assert_eq!(*accepted.lock().unwrap(), vec![hash.clone()]);
+    assert_eq!(*retried.lock().unwrap(), vec![hash]);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    // Missing served state is reported and transmits nothing.
+    let empty = tempfile::tempdir().unwrap();
+    let mut cfg = standalone_registry_config(empty.path().join("master"));
+    // Never contacted: the notifier must stop before any delivery.
+    cfg.notify = Some(notification_policy("http://127.0.0.1:1".into()));
+    let mut unavailable = cfg.prepare().unwrap().notifier.unwrap();
+    assert_eq!(
+        unavailable.reconcile().await,
+        Err("served_state_unavailable")
+    );
+    assert_eq!(retried.lock().unwrap().len(), 1);
+    healthy_server.abort();
+    failing_server.abort();
+}
+
+#[tokio::test]
+async fn registry_notification_shutdown_cancels_stalled_delivery() {
+    let (_root, _input, source, _) = registry_fixture();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let signal = entered.clone();
+    let app = axum::Router::new().fallback(move || {
+        let signal = signal.clone();
+        async move {
+            signal.notify_one();
+            std::future::pending::<&'static str>().await
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let mut policy = notification_policy(origin);
+    policy.request_timeout_ms = 30_000;
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.notify = Some(policy);
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let notifier = cfg.prepare().unwrap().notifier.unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(notifier.run(receiver));
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    server.abort();
+}
+
+#[test]
+fn registry_notification_credentials_are_separate_and_policy_is_bounded() {
+    let (_root, _input, source, _) = registry_fixture();
+    let mut cfg = registry_owner_config("https://owner.example.invalid".into(), source);
+    cfg.owner.as_mut().unwrap().source = None;
+    cfg.notify = Some(notification_policy(
+        "https://consumer.example.invalid".into(),
+    ));
+    assert!(cfg.prepare().unwrap().notifier.is_some());
+    let target_env = cfg.notify.as_ref().unwrap().targets[0].token_env.clone();
+    for reused in ["registry-read", "registry-admin"] {
+        std::env::set_var(&target_env, reused);
+        assert!(cfg.prepare().is_err(), "{reused} must be rejected");
+    }
+    let mut with_source = registry_owner_config(
+        "https://owner.example.invalid".into(),
+        std::path::PathBuf::from("unused"),
+    );
+    with_source.notify = cfg.notify.clone();
+    std::env::set_var(&target_env, "owner-read");
+    assert!(with_source.prepare().is_err());
+    std::env::set_var(&target_env, "consumer-admin");
+    for change in [
+        |p: &mut crate::master_notify::Config| p.interval_seconds = 9,
+        |p: &mut crate::master_notify::Config| p.request_timeout_ms = 30_001,
+        |p: &mut crate::master_notify::Config| p.targets.clear(),
+        |p: &mut crate::master_notify::Config| {
+            p.targets[0].origin = "ftp://consumer.example.invalid".into()
+        },
+        |p: &mut crate::master_notify::Config| {
+            let copy = p.targets[0].clone();
+            p.targets.push(copy)
+        },
+    ] {
+        let mut bad = cfg.clone();
+        change(bad.notify.as_mut().unwrap());
+        assert!(bad.prepare().is_err());
+    }
+    let parsed: Result<crate::registry_service::Config, _> = yaml_serde::from_str(
+        "listen: 127.0.0.1:0\ntoken_env: X\nscope: {region: jp, environment: production, platform: android}\nbackend: {kind: files, directory: m}\nnotify: {targets: [], unknown: 1}\n",
+    );
+    assert!(parsed.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn registry_notifications_never_announce_unpublished_database_content() {
+    use std::sync::atomic::AtomicBool;
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::registry_service as service;
+    use sqlx::Connection;
+    let (_root, input, source, _) = registry_fixture();
+    let mut upstream = standalone_registry_config(source.clone());
+    upstream.scope.environment = format!("notify-{}", uuid::Uuid::new_v4().simple());
+    let (origin, server) = peer_http_server(upstream.prepare().unwrap().router).await;
+    let (app, hints) = registry_hint_recorder(Arc::new(AtomicBool::new(false)));
+    let (consumer, consumer_server) = peer_http_server(app).await;
+    let local = tempfile::tempdir().unwrap();
+    let output = local.path().join("master");
+    let mut cfg = registry_owner_config(origin, output.clone());
+    cfg.scope = upstream.scope.clone();
+    let mut database = master_database_config();
+    database.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.backend = service::Backend::Postgres {
+        connection: database.clone(),
+    };
+    cfg.owner.as_mut().unwrap().staging_directory = Some(output.clone());
+    cfg.notify = Some(notification_policy(consumer));
+    let prepared = cfg.prepare().unwrap();
+    let worker = prepared.owner.unwrap();
+    let mut notifier = prepared.notifier.unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.clone().run(receiver));
+    let first = registry_owner_wait(&worker, "ready").await;
+    let old = first["last_success"]["receipt"]["database"]["content_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(notifier.reconcile().await, Ok(1));
+    let mut conn = sqlx::PgConnection::connect_with(&database.options().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.sirius_master_documents ADD CONSTRAINT sirius_notify_fixture_reject CHECK (name <> 'MasterFixture.json') NOT VALID").execute(&mut conn).await.unwrap();
+    let (mut next, decoder, _) = master_fixture();
+    next.version = format!("notify-next-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&next).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    worker.refresh();
+    let failed = registry_owner_wait(&worker, "failed").await;
+    assert_eq!(failed["error_code"], "database_publish_failed");
+    let staged: Value = serde_json::from_slice(
+        &crate::master_registry::manifest(&output, None, cfg.scope.clone())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let staged = staged["content_sha256"].as_str().unwrap().to_owned();
+    assert_ne!(staged, old);
+    // The staged snapshot is verified locally but not served, so it is not announced.
+    assert_eq!(notifier.reconcile().await, Ok(0));
+    assert_eq!(*hints.lock().unwrap(), vec![old.clone()]);
+    sqlx::query(
+        "ALTER TABLE public.sirius_master_documents DROP CONSTRAINT sirius_notify_fixture_reject",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    worker.refresh();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = worker.status().await;
+            if status["status"] == "ready"
+                && status["last_success"]["receipt"]["database"]["content_sha256"]
+                    == staged.as_str()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(notifier.reconcile().await, Ok(1));
+    assert_eq!(*hints.lock().unwrap(), vec![old, staged]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+    server.abort();
+    consumer_server.abort();
 }
