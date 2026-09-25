@@ -310,7 +310,7 @@ Commits currently use the fixed local identity `Sirius Master Publisher <sirius-
 and are unsigned. Ambient `GIT_*` variables are removed before process execution to prevent
 repository redirects, injected config and trace destinations; terminal prompting is disabled.
 Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Explicit remote push and environment-referenced HTTP authorization are described below;
-configured identities/signing/proxies, background scheduling and Windows support still remain
+configured identities/signing/proxies and Windows support still remain
 before the full optional Git publication feature is complete.
 
 ### Explicit remote Git push
@@ -349,6 +349,29 @@ are rejected. CLI network publication accepts HTTPS only.
 
 An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
 mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
-the CLI. Service background scheduling, deployment-wide credential checks, configurable proxy/
-signing/author settings, Windows process containment and final production Git acceptance remain
+the CLI. Configurable proxy/signing/author settings, Windows process containment and final production Git acceptance remain
 separate restoration requirements.
+
+### Background Git publication
+
+JP profiles may enable `master_git` with a separate `state_directory` and optional `remote`.
+`master_directory` is required. Omit `remote` for local commits only; omit `master_git` to
+leave the feature disabled. See the commented single-profile example configuration.
+
+The worker reconciles CURRENT at startup, after successful in-process Master installations,
+and every `interval_seconds` (default 300; range 10–86400). Polling also discovers CLI imports
+and retries failed publication. Git and consumer notifications use independent wake signals.
+Intermediate installations may coalesce into the latest snapshot. Keep the managed state
+across restarts: Git refs are durable, while displayed last-success status is rebuilt at startup.
+
+`GET /internal/v1/master-data/git` (or `/internal/v1/{region}/master-data/git`) requires the
+internal bearer. It reports pending/running/ready/failed/stopped/disabled, the last successful
+receipt and a static error code; it does not expose paths, remote URLs or credentials. Failure
+never rolls back installed Master data. Shutdown cancels active network work and releases the
+state lock; the next startup reconciles an ambiguous previous push against remote refs.
+
+Service remote configuration uses `url`, optional `authorization_env`, and explicit `allow_file`
+or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must be a dedicated
+Git credential: deployment preparation rejects reuse of other service credentials, including
+underlying Bearer tokens and decoded Basic passwords. No remote is contacted at preparation;
+the configured background worker performs publication after service startup.

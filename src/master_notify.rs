@@ -203,35 +203,7 @@ fn scope(config: &crate::config::Config) -> Scope {
 pub(crate) fn validate_tokens(
     configs: &[&crate::config::Config],
 ) -> Result<(), crate::error::AppError> {
-    let mut protected = Vec::new();
-    for c in configs {
-        let mut names: Vec<&String> = vec![&c.api_token_env, &c.internal_token_env];
-        names.extend(c.peer_token_env.iter());
-        names.extend(c.player_credential_env.iter());
-        names.extend(c.cdn_credential_env.values());
-        names.extend(c.accounts.iter().filter_map(|a| a.credential_env.as_ref()));
-        names.extend(c.master_sync.iter().map(|s| &s.token_env));
-        names.extend(
-            c.asset_dispatch
-                .iter()
-                .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
-        );
-        names.extend(
-            c.node_routing
-                .iter()
-                .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
-        );
-        names.extend(c.upstream.proxy_authorization_env.iter());
-        if let Some(update) = &c.master_update {
-            names.extend([
-                &update.username_env,
-                &update.key_hex_env,
-                &update.iv_hex_env,
-            ]);
-            names.extend(update.network.proxy_authorization_env.iter());
-        }
-        protected.extend(names.into_iter().filter_map(|n| std::env::var(n).ok()));
-    }
+    let protected = protected_tokens(configs);
     let mut outgoing = Vec::new();
     for c in configs {
         for target in c.master_notify.iter().flat_map(|n| &n.targets) {
@@ -350,4 +322,37 @@ impl Worker {
             }
         }
     }
+}
+
+pub(crate) fn protected_tokens(configs: &[&crate::config::Config]) -> Vec<String> {
+    let mut protected = Vec::new();
+    for c in configs {
+        let mut names: Vec<&String> = vec![&c.api_token_env, &c.internal_token_env];
+        names.extend(c.peer_token_env.iter());
+        names.extend(c.player_credential_env.iter());
+        names.extend(c.cdn_credential_env.values());
+        names.extend(c.accounts.iter().filter_map(|a| a.credential_env.as_ref()));
+        names.extend(c.master_sync.iter().map(|s| &s.token_env));
+        names.extend(
+            c.asset_dispatch
+                .iter()
+                .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
+        );
+        names.extend(
+            c.node_routing
+                .iter()
+                .flat_map(|d| d.targets.iter().map(|t| &t.token_env)),
+        );
+        names.extend(c.upstream.proxy_authorization_env.iter());
+        if let Some(update) = &c.master_update {
+            names.extend([
+                &update.username_env,
+                &update.key_hex_env,
+                &update.iv_hex_env,
+            ]);
+            names.extend(update.network.proxy_authorization_env.iter());
+        }
+        protected.extend(names.into_iter().filter_map(|n| std::env::var(n).ok()));
+    }
+    protected
 }

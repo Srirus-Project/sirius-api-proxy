@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub master_git: Option<crate::master_git_worker::Config>,
+    #[serde(default)]
     pub master_notify: Option<crate::master_notify::Config>,
     #[serde(default)]
     pub master_sync: Option<crate::master_sync::Config>,
@@ -205,6 +207,9 @@ impl Config {
         if let Some(log) = &self.access_log {
             log.validate()
                 .map_err(|_| AppError::Config("invalid access log configuration"))?;
+        }
+        if let Some(git) = &self.master_git {
+            git.validate(self)?;
         }
         if let Some(notify) = &self.master_notify {
             notify.validate(self)?;

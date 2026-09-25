@@ -98,6 +98,7 @@ pub fn router_at(
         .route("/accounts/{name}/identity", get(named_account))
         .route("/accounts/{name}/player-data", get(named_player_data))
         .route("/master-data/updater", get(master_update_status))
+        .route("/master-data/git", get(master_git_status))
         .route(
             "/master-data/sync",
             post(master_sync_hint).layer(axum::extract::DefaultBodyLimit::max(4096)),
@@ -528,4 +529,8 @@ async fn registry_by_hash(
         _ => AppError::MasterUnavailable,
     })?;
     registry_document(document, headers, false)
+}
+
+async fn master_git_status(State(c): State<Arc<GameClient>>) -> Json<Value> {
+    Json(c.master_git_status().await)
 }

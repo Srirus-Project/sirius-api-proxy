@@ -54,3 +54,5 @@ pub mod asset_dispatch_admin;
 pub mod git_process;
 
 pub mod master_git;
+
+pub mod master_git_worker;

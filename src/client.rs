@@ -45,6 +45,7 @@ pub struct Observation {
     pub resource_version: Option<String>,
 }
 struct State {
+    master_git: Value,
     master_update: Value,
     observation: Observation,
     snapshot: Option<ResourceSnapshot>,
@@ -55,6 +56,7 @@ struct State {
 
 pub struct GameClient {
     master_sync_wake: tokio::sync::Notify,
+    master_git_wake: tokio::sync::Notify,
     master_publication_wake: tokio::sync::Notify,
     node_routing: Option<crate::node_routing::Router>,
     config: Config,
@@ -113,6 +115,7 @@ impl GameClient {
             .filter_map(|(root, name)| secret(name).ok().map(|s| (root.clone(), s)))
             .collect::<BTreeMap<_, _>>();
         let state = State {
+            master_git: json!({"status": if config.master_git.is_some() {"pending"} else {"disabled"}}),
             master_update: json!({"status": if config.master_update.is_some() || config.master_sync.is_some() {"pending"} else {"disabled"}}),
             observation: Observation::default(),
             snapshot: None,
@@ -131,6 +134,7 @@ impl GameClient {
         Ok(Arc::new(Self {
             master_sync_wake: tokio::sync::Notify::new(),
             master_publication_wake: tokio::sync::Notify::new(),
+            master_git_wake: tokio::sync::Notify::new(),
             node_routing,
             config,
             http,
@@ -243,6 +247,15 @@ impl GameClient {
     pub async fn master_update_status(&self) -> Value {
         self.state.lock().await.master_update.clone()
     }
+    pub async fn master_git_status(&self) -> Value {
+        self.state.lock().await.master_git.clone()
+    }
+    pub(crate) async fn record_master_git(&self, value: Value) {
+        self.state.lock().await.master_git = value;
+    }
+    pub(crate) async fn master_git_notified(&self) {
+        self.master_git_wake.notified().await;
+    }
     pub(crate) async fn master_publication_notified(&self) {
         self.master_publication_wake.notified().await;
     }
@@ -251,6 +264,7 @@ impl GameClient {
         self.state.lock().await.master_update = value;
         if published {
             self.master_publication_wake.notify_one();
+            self.master_git_wake.notify_one();
         }
     }
     pub(crate) async fn refresh_master_target(

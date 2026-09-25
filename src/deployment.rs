@@ -33,6 +33,7 @@ pub struct Prepared {
     pub listen: SocketAddr,
     pub router: Router,
     pub updaters: Vec<Arc<MasterUpdater>>,
+    pub git_publishers: Vec<crate::master_git_worker::Worker>,
     pub notifiers: Vec<crate::master_notify::Worker>,
     pub syncers: Vec<Arc<crate::master_sync::Syncer>>,
     pub asset_dispatchers: Vec<crate::asset_dispatch::Worker>,
@@ -264,6 +265,8 @@ impl DeploymentConfig {
             }
         }
         crate::master_notify::validate_tokens(&configs)?;
+        crate::master_git_worker::validate_tokens(&configs)?;
+        let mut git_publishers = Vec::new();
         let mut notifiers = Vec::new();
         let mut router = api::health_router();
         let mut updaters = Vec::new();
@@ -278,6 +281,9 @@ impl DeploymentConfig {
             } else {
                 None
             };
+            if c.master_git.is_some() {
+                git_publishers.push(crate::master_git_worker::Worker::new(c, client.clone())?);
+            }
             if c.master_notify.is_some() {
                 notifiers.push(crate::master_notify::Worker::new(c, client.clone())?);
             }
@@ -332,6 +338,7 @@ impl DeploymentConfig {
             updaters,
             syncers,
             notifiers,
+            git_publishers,
             asset_dispatchers,
         })
     }

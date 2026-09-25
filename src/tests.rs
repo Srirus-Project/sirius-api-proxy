@@ -29,6 +29,7 @@ fn config() -> Config {
     let key = format!("SIRIUS_TEST_CDN_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(&key, "fixture-cdn-secret");
     Config {
+        master_git: None,
         master_notify: None,
         master_sync: None,
         node_routing: None,
@@ -8231,5 +8232,273 @@ async fn master_git_http_auth_is_explicit_and_redirects_are_not_followed() {
         std::env::set_var(&token, value);
         assert!(remote.validate().is_err());
     }
+    server.abort();
+}
+
+#[cfg(unix)]
+async fn wait_git_status(game: &GameClient, status: &str, different: Option<&str>) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let value = game.master_git_status().await;
+            if value["status"] == status
+                && different.is_none_or(|old| {
+                    value["last_success"]["commit"]
+                        .as_str()
+                        .is_some_and(|c| c != old)
+                })
+            {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_worker_publishes_on_start_and_update_with_independent_notification() {
+    let (root, input, source, _) = registry_fixture();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.listen = Some("127.0.0.1:0".parse().unwrap());
+    cfg.master_directory = Some(source.clone());
+    cfg.master_git = Some(crate::master_git_worker::Config {
+        state_directory: root.path().join("git"),
+        interval_seconds: 86400,
+        remote: None,
+    });
+    let prepared = crate::deployment::DeploymentConfig::Single(Box::new(cfg.clone()))
+        .prepare()
+        .unwrap();
+    assert_eq!(prepared.git_publishers.len(), 1);
+    let game = GameClient::new(cfg.clone()).unwrap();
+    let worker = crate::master_git_worker::Worker::new(&cfg, game.clone()).unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(receiver));
+    let first = wait_git_status(&game, "ready", None).await;
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "worker-update".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    game.record_master_update(json!({"status":"ready","result":{"action":"updated"}}))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), game.master_publication_notified())
+        .await
+        .unwrap();
+    let updated = wait_git_status(&game, "ready", first["last_success"]["commit"].as_str()).await;
+    assert_ne!(
+        first["last_success"]["content_sha256"],
+        updated["last_success"]["content_sha256"]
+    );
+    let router = api::router(game.clone(), "read".into(), "admin".into());
+    for (token, expected) in [(None, 401), (Some("read"), 401), (Some("admin"), 200)] {
+        let mut req = Request::builder().uri("/internal/v1/master-data/git");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+        if expected == 200 {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(!body.contains(root.path().to_str().unwrap()));
+            assert!(!body.contains("authorization"));
+        }
+    }
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(game.master_git_status().await["status"], "stopped");
+    assert_eq!(
+        GameClient::new(config()).unwrap().master_git_status().await["status"],
+        "disabled"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_worker_periodically_retries_rejected_push_preserving_installed_master() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, input, source, _) = registry_fixture();
+    let remote = root.path().join("remote.git");
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&remote)
+        .status()
+        .unwrap()
+        .success());
+    let mut cfg = config();
+    cfg.master_directory = Some(source.clone());
+    cfg.master_git = Some(crate::master_git_worker::Config {
+        state_directory: root.path().join("git"),
+        interval_seconds: 10,
+        remote: Some(crate::master_git::Remote {
+            url: url::Url::from_directory_path(&remote).unwrap().to_string(),
+            authorization_env: None,
+            allow_file: true,
+            allow_http: false,
+        }),
+    });
+    let game = GameClient::new(cfg.clone()).unwrap();
+    let worker = crate::master_git_worker::Worker::new(&cfg, game.clone()).unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(receiver));
+    let first = wait_git_status(&game, "ready", None).await;
+    assert_eq!(first["last_success"]["remote_verified"], true);
+    let hook = remote.join("hooks/pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "retry-worker".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    crate::master::import_directory(&input, &source, &decoder).unwrap();
+    let current = std::fs::read(source.join("CURRENT")).unwrap();
+    game.record_master_update(json!({"status":"ready","result":{"action":"updated"}}))
+        .await;
+    let failed = wait_git_status(&game, "failed", None).await;
+    assert_eq!(failed["last_success"], first["last_success"]);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), current);
+    std::fs::remove_file(hook).unwrap();
+    // No wake notification: actual interval retry must recover the existing local commit.
+    let recovered = wait_git_status(&game, "ready", first["last_success"]["commit"].as_str()).await;
+    assert_eq!(recovered["last_success"]["changed"], false);
+    assert_eq!(recovered["last_success"]["remote_verified"], true);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), current);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() {
+    use base64::Engine;
+    let (root, _, source, _) = registry_fixture();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    let name = format!("SIRIUS_GIT_WORKER_{}", uuid::Uuid::new_v4().simple());
+    cfg.master_directory = Some(source);
+    cfg.master_git = Some(crate::master_git_worker::Config {
+        state_directory: root.path().join("git"),
+        interval_seconds: 10,
+        remote: Some(crate::master_git::Remote {
+            url: "https://git.example/repo.git".into(),
+            authorization_env: Some(name.clone()),
+            allow_file: false,
+            allow_http: false,
+        }),
+    });
+    for value in [
+        "Authorization: Bearer public-jp".to_owned(),
+        format!(
+            "Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:internal-jp")
+        ),
+        "Authorization: Basic malformed".to_owned(),
+    ] {
+        std::env::set_var(&name, value);
+        assert!(crate::master_git_worker::validate_tokens(&[&cfg]).is_err());
+    }
+    std::env::set_var(&name, "Authorization: Bearer independent-git-fixture");
+    assert!(crate::master_git_worker::validate_tokens(&[&cfg]).is_ok());
+    assert!(cfg.validate().is_ok());
+    let mut other = regional_config(crate::region::Region::En);
+    let other_name = format!("SIRIUS_GIT_OTHER_{}", uuid::Uuid::new_v4().simple());
+    other.master_git = cfg.master_git.clone();
+    other
+        .master_git
+        .as_mut()
+        .unwrap()
+        .remote
+        .as_mut()
+        .unwrap()
+        .authorization_env = Some(other_name.clone());
+    std::env::set_var(
+        &other_name,
+        format!(
+            "Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:independent-git-fixture")
+        ),
+    );
+    assert!(crate::master_git_worker::validate_tokens(&[&cfg, &other]).is_err());
+    other.master_git = None;
+    std::env::set_var(&name, "Authorization: Bearer internal-en");
+    assert!(crate::master_git_worker::validate_tokens(&[&cfg, &other]).is_err());
+    std::env::set_var(&name, "Authorization: Bearer independent-git-fixture");
+    std::env::remove_var(other_name);
+    cfg.master_git.as_mut().unwrap().interval_seconds = 86401;
+    assert!(cfg.validate().is_err());
+    cfg.master_git.as_mut().unwrap().interval_seconds = 9;
+    assert!(cfg.validate().is_err());
+    cfg.master_git.as_mut().unwrap().interval_seconds = 10;
+    cfg.master_directory = None;
+    assert!(cfg.validate().is_err());
+    std::env::remove_var(name);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().fallback({
+        let entered = entered.clone();
+        move || {
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let (root, _, source, _) = registry_fixture();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let mut cfg = config();
+    cfg.master_directory = Some(source.clone());
+    cfg.master_git = Some(crate::master_git_worker::Config {
+        state_directory: root.path().join("git"),
+        interval_seconds: 10,
+        remote: Some(crate::master_git::Remote {
+            url: format!("{origin}/repository.git"),
+            authorization_env: None,
+            allow_file: false,
+            allow_http: true,
+        }),
+    });
+    let game = GameClient::new(cfg.clone()).unwrap();
+    let worker = crate::master_git_worker::Worker::new(&cfg, game.clone()).unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(receiver));
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(game.master_git_status().await["status"], "stopped");
+    assert_eq!(game.master_git_status().await["last_success"], Value::Null);
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    // Cancellation must also release the managed-state lock for restart recovery.
+    assert!(
+        crate::master_git::commit(&source, &root.path().join("git"), registry_scope())
+            .await
+            .is_ok()
+    );
     server.abort();
 }

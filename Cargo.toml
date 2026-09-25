@@ -10,6 +10,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+base64 = "0.22"
 tracing-appender = "0.2"
 ipnet = "2"
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }

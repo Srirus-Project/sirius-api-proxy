@@ -25,7 +25,7 @@ pub enum Error {
     #[error("Master Git publication failed")]
     Git,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Receipt {
     pub commit: String,
     pub content_sha256: String,

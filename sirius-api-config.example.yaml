@@ -136,3 +136,14 @@ response_cache:
 #       token_env: SIRIUS_MASTER_REPLICA_NOTIFY_TOKEN
 #       regional_paths: true
 #       allow_http: false
+
+# Optional JP Master Git publication (Unix; requires master_directory).
+# Separate managed state, never a source checkout. No remote means local commits only.
+# master_git:
+#   state_directory: ./data/master-git
+#   interval_seconds: 300
+#   remote:
+#     url: https://git.example.invalid/master-data.git
+#     authorization_env: SIRIUS_MASTER_GIT_AUTHORIZATION
+#     allow_http: false
+#     allow_file: false
