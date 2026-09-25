@@ -5172,3 +5172,393 @@ async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
     assert_eq!(reply["outcome"]["kind"]["type"], "unsupported_operation");
     assert!(f.received.lock().unwrap().is_empty());
 }
+
+async fn peer_http_server(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, task)
+}
+fn outgoing_peer_request() -> crate::peer::Request {
+    serde_json::from_value(peer_request(
+        GameClient::new(config()).unwrap().peer_identity().unwrap(),
+        json!({"type":"version"}),
+    ))
+    .unwrap()
+}
+#[tokio::test]
+async fn peer_transport_reaches_real_local_executor_with_exact_scope() {
+    use crate::{
+        peer_transport::{Client, Error, Policy},
+        region::Region,
+    };
+    let f = fixture(vec![Reply::version()]).await;
+    let game = client(&f, config());
+    let request: crate::peer::Request = serde_json::from_value(peer_request(
+        game.peer_identity().unwrap(),
+        json!({"type":"version"}),
+    ))
+    .unwrap();
+    let app = crate::peer::router(game, "/internal/v1/jp/peer", "fixture-peer-only".into());
+    let (url, server) = peer_http_server(app).await;
+    let transport = Client::new(
+        &url,
+        "fixture-peer-only",
+        Region::Jp,
+        true,
+        true,
+        Policy::default(),
+    )
+    .unwrap();
+    let response = transport
+        .call(
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.request_id, request.request_id);
+    assert!(
+        matches!(response.outcome, crate::peer::Outcome::Success { data } if data["version"] == "master-fixture")
+    );
+    let wrong = Client::new(
+        &url,
+        "wrong-peer",
+        Region::Jp,
+        true,
+        true,
+        Policy::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        wrong
+            .call(
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(2)
+            )
+            .await,
+        Err(Error::Status(401))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert!(f.received.lock().unwrap()[0]
+        .1
+        .get("authorization")
+        .is_none());
+    let mut other = outgoing_peer_request();
+    other.identity.region = Region::Tw;
+    assert!(matches!(
+        transport
+            .call(&other, tokio::time::Instant::now() + Duration::from_secs(2))
+            .await,
+        Err(Error::Config)
+    ));
+    server.abort();
+}
+#[tokio::test]
+async fn peer_transport_rejects_unbound_malformed_and_oversized_replies_without_retry() {
+    use crate::{
+        peer_transport::{Client, Error, Policy},
+        region::Region,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for case in 0..11 {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let app = axum::Router::new().route("/internal/v1/peer/query", axum::routing::post(move |headers: HeaderMap, axum::Json(request): axum::Json<Value>| {
+            let counter = counter.clone(); async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(headers["authorization"], "Bearer fixture-peer-only");
+                assert_eq!(headers["content-type"], "application/json");
+                let mut reply = json!({"request_id":request["request_id"],"identity":request["identity"],"outcome":{"status":"success","data":{"largeId":"9223372036854775807"}}});
+                let mut mime = "application/json";
+                match case {
+                    0 => {},
+                    1 => reply["request_id"] = json!(uuid::Uuid::new_v4().to_string()),
+                    2 => reply["identity"]["region"] = json!("en"),
+                    3 => reply["identity"]["protocol_sha256"] = json!("0".repeat(64)),
+                    4 => reply["outcome"] = json!({"status":"failure","kind":{"type":"timeout","extra":"SECRET"}}),
+                    5 => reply["outcome"] = json!({"status":"failure","kind":{"type":"game","grpc_status":0}}),
+                    6 => reply["outcome"]["data"] = Value::Null,
+                    7 => reply["unknown"] = json!("SECRET"),
+                    8 => mime = "text/html",
+                    9 | 10 => reply["outcome"]["data"]["padding"] = json!("X".repeat(2048)),
+                    _ => unreachable!(),
+                }
+                let bytes = serde_json::to_vec(&reply).unwrap();
+                let body = if case == 10 {
+                    axum::body::Body::from_stream(stream::iter(bytes.chunks(512).map(|b| Ok::<_, Infallible>(Bytes::copy_from_slice(b))).collect::<Vec<_>>()))
+                } else { axum::body::Body::from(bytes) };
+                axum::response::Response::builder().header("content-type", mime).body(body).unwrap()
+            }
+        }));
+        let (url, server) = peer_http_server(app).await;
+        let policy = Policy {
+            max_response_bytes: 1024,
+            ..Default::default()
+        };
+        let transport =
+            Client::new(&url, "fixture-peer-only", Region::Jp, false, true, policy).unwrap();
+        let result = transport
+            .call(
+                &outgoing_peer_request(),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await;
+        if case == 0 {
+            assert!(
+                matches!(result.unwrap().outcome, crate::peer::Outcome::Success { data } if data["largeId"] == "9223372036854775807")
+            );
+        } else {
+            assert!(matches!(result, Err(Error::Protocol)), "case {case}");
+        }
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+}
+#[tokio::test]
+async fn peer_transport_redirect_deadline_and_connection_failures_are_distinct() {
+    use crate::{
+        peer_transport::{Client, Error, Policy},
+        region::Region,
+    };
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect = format!("http://{}/leak", destination.local_addr().unwrap());
+    let (url, server) = peer_http_server(axum::Router::new().route(
+        "/internal/v1/peer/query",
+        axum::routing::post(move || {
+            let redirect = redirect.clone();
+            async move {
+                axum::response::Response::builder()
+                    .status(307)
+                    .header("location", redirect)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }),
+    ))
+    .await;
+    let transport = Client::new(
+        &url,
+        "fixture-peer-only",
+        Region::Jp,
+        false,
+        true,
+        Policy::default(),
+    )
+    .unwrap();
+    let request = outgoing_peer_request();
+    assert!(matches!(
+        transport
+            .call(
+                &request,
+                tokio::time::Instant::now() + Duration::from_secs(2)
+            )
+            .await,
+        Err(Error::Status(307))
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), destination.accept())
+            .await
+            .is_err()
+    );
+    server.abort();
+    for (stalled_body, request_ms, deadline_ms) in [
+        (false, 100, 1000),
+        (true, 100, 1000),
+        (false, 2000, 30),
+        (true, 2000, 30),
+    ] {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let app = axum::Router::new().route(
+            "/internal/v1/peer/query",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    if !stalled_body {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    let chunks =
+                        stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"{")) })
+                            .chain(stream::once(async {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                Ok::<_, Infallible>(Bytes::from_static(b"}"))
+                            }));
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }),
+        );
+        let (url, server) = peer_http_server(app).await;
+        let policy = Policy {
+            connect_timeout_ms: 100,
+            request_timeout_ms: request_ms,
+            ..Default::default()
+        };
+        let transport =
+            Client::new(&url, "fixture-peer-only", Region::Jp, false, true, policy).unwrap();
+        let start = tokio::time::Instant::now();
+        let error = transport
+            .call(&request, start + Duration::from_millis(deadline_ms))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Timeout));
+        assert!(!error.definitely_not_sent());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let error = transport
+            .call(
+                &request,
+                tokio::time::Instant::now() - Duration::from_millis(1),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSent));
+        assert!(error.definitely_not_sent());
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let transport = Client::new(
+        &url,
+        "fixture-peer-only",
+        Region::Jp,
+        false,
+        true,
+        Policy::default(),
+    )
+    .unwrap();
+    let error = transport
+        .call(
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Connect));
+    assert!(error.definitely_not_sent());
+}
+#[test]
+fn peer_transport_configuration_rejects_unscoped_credentials_and_bounds() {
+    use crate::{
+        peer_transport::{Client, Policy},
+        region::Region,
+    };
+    for origin in [
+        "http://example.invalid",
+        "https://user:SECRET@example.invalid",
+        "https://example.invalid/path",
+        "https://example.invalid?q=SECRET",
+        "https://example.invalid/#fragment",
+        "https://example.invalid\\other",
+        " https://example.invalid",
+    ] {
+        assert!(Client::new(origin, "token", Region::Jp, false, false, Policy::default()).is_err());
+    }
+    for token in ["", "with space", "bad\r\nvalue"] {
+        assert!(Client::new(
+            "https://example.invalid",
+            token,
+            Region::Jp,
+            false,
+            false,
+            Policy::default()
+        )
+        .is_err());
+    }
+    assert!(Client::new(
+        "https://example.invalid",
+        "token",
+        Region::Cn,
+        false,
+        false,
+        Policy::default()
+    )
+    .is_err());
+    assert!(Policy {
+        max_response_bytes: usize::MAX,
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+    assert!(Policy {
+        connect_timeout_ms: 20_001,
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+}
+
+#[tokio::test]
+async fn peer_transport_tls_rejection_and_mid_body_disconnect_preserve_delivery_uncertainty() {
+    use crate::{
+        peer_transport::{Client, Error, Policy},
+        region::Region,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (url, rejected) = untrusted_tls_fixture().await;
+    let transport = Client::new(
+        &url,
+        "fixture-peer-only",
+        Region::Jp,
+        false,
+        false,
+        Policy::default(),
+    )
+    .unwrap();
+    let request = outgoing_peer_request();
+    let error = transport
+        .call(
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Connect));
+    assert!(tokio::time::timeout(Duration::from_secs(2), rejected)
+        .await
+        .unwrap()
+        .unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(stream.read_u8().await.unwrap());
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let transport = Client::new(
+        &url,
+        "fixture-peer-only",
+        Region::Jp,
+        false,
+        true,
+        Policy::default(),
+    )
+    .unwrap();
+    let error = transport
+        .call(
+            &request,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Transport));
+    assert!(!error.definitely_not_sent());
+    assert!(!error.to_string().contains("fixture-peer-only"));
+    server.await.unwrap();
+}

@@ -123,24 +123,24 @@ pub enum Outcome {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Failure {
-    IdentityMismatch,
-    UnsupportedOperation,
-    AccountUnavailable,
-    Timeout,
-    Transport,
-    Protocol,
+    IdentityMismatch {},
+    UnsupportedOperation {},
+    AccountUnavailable {},
+    Timeout {},
+    Transport {},
+    Protocol {},
     Game { grpc_status: u16 },
 }
 impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
         match error {
-            AppError::UnsupportedRegionOperation => Self::UnsupportedOperation,
-            AppError::AccountUnavailable => Self::AccountUnavailable,
-            AppError::Timeout => Self::Timeout,
-            AppError::Transport | AppError::Proxy => Self::Transport,
+            AppError::UnsupportedRegionOperation => Self::UnsupportedOperation {},
+            AppError::AccountUnavailable => Self::AccountUnavailable {},
+            AppError::Timeout => Self::Timeout {},
+            AppError::Transport | AppError::Proxy => Self::Transport {},
             AppError::Grpc(grpc_status) => Self::Game { grpc_status },
-            AppError::PeerIdentityMismatch => Self::IdentityMismatch,
-            _ => Self::Protocol,
+            AppError::PeerIdentityMismatch => Self::IdentityMismatch {},
+            _ => Self::Protocol {},
         }
     }
 }
@@ -170,7 +170,7 @@ async fn query(
     let identity = client.peer_identity()?;
     let outcome = if identity != request.identity {
         Outcome::Failure {
-            kind: Failure::IdentityMismatch,
+            kind: Failure::IdentityMismatch {},
         }
     } else {
         match client

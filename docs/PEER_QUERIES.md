@@ -79,3 +79,32 @@ priorities, total-deadline failover, passive health, remote-only deployment and 
 integration remain required restoration work. The full yhm01 acceptance and 1.2.0 release gates
 remain pending. Local tests exercise real gRPC execution, errors without diagnostic leakage,
 credential separation, request limits, Global identity/capability boundaries and protocol reload.
+
+## Outbound transport foundation
+
+`peer_transport::Client` executes one request against one configured origin. It builds only the
+single-region or selected-region peer path, never a caller-supplied path. HTTPS and certificate
+validation are mandatory unless the constructor explicitly permits HTTP for a private network.
+The token is attached only to that origin; redirects, ambient proxies and HTTP-library retries
+are disabled. A successful HTTP status alone is insufficient: JSON content type, response UUID,
+all identity fields, tagged outcome and body size are checked. Unknown response fields, malformed
+outcomes and impossible failure gRPC statuses are rejected. Protobuf JSON int64 strings remain
+strings.
+
+The transport policy defaults to a 5-second connect timeout, 20-second request timeout and
+16 MiB response bound. Timeouts are bounded to 100..300000 ms, connection timeout cannot exceed
+request timeout, and response bounds are 1 KiB..128 MiB. Every call also takes an absolute
+caller deadline that bounds headers and streamed bodies, so subsequent targets cannot receive
+a fresh overall timeout budget. Both declared and chunked response sizes are enforced.
+
+`Config`, `NotSent` (already expired) and `Connect` errors prove this transport did not submit
+the request. `Timeout`, `Transport`, `Protocol` and HTTP status errors do **not** prove that;
+an executing node may have completed the game query before its response was lost. Typed game
+outcomes are returned separately. Dropping a call does not promise remote cancellation.
+No replay or fallback occurs in the transport itself. Node routing will own that decision.
+
+Tests cover a real HTTP peer executing local gRPC, single/multi-region path selection, token
+scope, exact response identity, unknown fields, int64 strings, fixed/chunked oversized bodies,
+redirect refusal, untrusted TLS, header/body stalls under both timeout budgets and connection
+versus mid-body failures. This module is wired into the library; outbound service configuration
+and public-route node selection remain pending. No unused YAML routing knobs are advertised.

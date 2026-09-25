@@ -38,3 +38,5 @@ pub mod asset_outbox;
 pub mod asset_dispatch;
 
 pub mod peer;
+
+pub mod peer_transport;
