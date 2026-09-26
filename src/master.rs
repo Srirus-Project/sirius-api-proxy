@@ -1,5 +1,5 @@
 //! Validated Master files and immutable JSON snapshots. No database models.
-use crate::rijndael::Rijndael256;
+use crate::{region::Region, rijndael::Rijndael256};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,6 +59,22 @@ pub struct MasterDocument {
 
 /// Pin CURRENT once, so concurrent imports cannot mix two versions in one read.
 pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocument, MasterError> {
+    read_current_checked(directory, table, None)
+}
+/// Like [`read_current`], but the installed snapshot must belong to `region` (a receipt
+/// without a region is a legacy JP snapshot). Cross-region directories are rejected.
+pub fn read_current_in(
+    directory: &Path,
+    table: Option<&str>,
+    region: Region,
+) -> Result<MasterDocument, MasterError> {
+    read_current_checked(directory, table, Some(region))
+}
+fn read_current_checked(
+    directory: &Path,
+    table: Option<&str>,
+    expected: Option<Region>,
+) -> Result<MasterDocument, MasterError> {
     let pointer = read_bounded(&directory.join("CURRENT"), 128)?;
     let snapshot = std::str::from_utf8(&pointer).map_err(|_| MasterError::Format)?;
     if !snapshot.starts_with("master-") || !safe_component(snapshot) {
@@ -69,6 +85,13 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         &directory.join("MasterManifest.json"),
         MAX_MANIFEST,
     )?)?;
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&read_bounded(&directory.join("receipt.json"), 4096)?)
+            .map_err(|_| MasterError::Format)?;
+    let region = recorded_region(&receipt)?;
+    if expected.is_some_and(|expected| expected != region) {
+        return Err(MasterError::Format);
+    }
     let bytes = if let Some(table) = table {
         if !safe_component(table)
             || !manifest
@@ -82,9 +105,6 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         crate::master_registry::verify_indexed(&directory, &manifest, table, &bytes)?;
         bytes
     } else {
-        let receipt: serde_json::Value =
-            serde_json::from_slice(&read_bounded(&directory.join("receipt.json"), 4096)?)
-                .map_err(|_| MasterError::Format)?;
         let source = receipt
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -95,7 +115,7 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         }
         let mut status = serde_json::json!({
             "version":manifest.version, "snapshot":snapshot,
-            "source":source,
+            "source":source, "region":region,
             "tables":manifest.files.iter().map(|f|f.name.trim_end_matches(".bin")).collect::<Vec<_>>()
         });
         if let Some(resource) = recorded_resource_version(&receipt)? {
@@ -128,6 +148,9 @@ pub struct ImportReceipt {
     pub tables: usize,
     pub json_bytes: u64,
     pub source: &'static str,
+    /// Region whose game/owner produced this snapshot. Receipts written before 1.2.1 have no
+    /// region; they are legacy JP snapshots (the only region with Master storage then).
+    pub region: Region,
     /// Asset (resource) version observed in the same game VERSION response that produced
     /// `version`, or carried from the owner manifest. Absent for legacy snapshots and imports
     /// without an explicit value; never synthesized.
@@ -143,6 +166,16 @@ pub(crate) fn recorded_resource_version(
         None => Ok(None),
         Some(serde_json::Value::String(value)) if safe_version(value) => Ok(Some(value.clone())),
         Some(_) => Err(MasterError::Format),
+    }
+}
+/// The region recorded in a snapshot receipt; absent means a legacy JP snapshot.
+pub(crate) fn recorded_region(receipt: &serde_json::Value) -> Result<Region, MasterError> {
+    match receipt.get("region") {
+        None => Ok(Region::Jp),
+        Some(value) => serde_json::from_value::<Region>(value.clone())
+            .ok()
+            .filter(|region| region.master_supported())
+            .ok_or(MasterError::Format),
     }
 }
 pub fn key_from_hex(value: &str) -> Result<[u8; 32], MasterError> {
@@ -296,13 +329,27 @@ pub fn import_directory(
 ) -> Result<ImportReceipt, MasterError> {
     import_directory_with_resource_version(input, output, decoder, None)
 }
-/// Local import with an operator-supplied asset version (there is no game observation).
+/// Local JP import with an operator-supplied asset version (there is no game observation).
 pub fn import_directory_with_resource_version(
     input: &Path,
     output: &Path,
     decoder: &MasterDecoder,
     resource_version: Option<&str>,
 ) -> Result<ImportReceipt, MasterError> {
+    import_directory_for_region(input, output, decoder, resource_version, Region::Jp)
+}
+/// Local import recorded for an explicit region. The output directory must not already hold
+/// another region's snapshots.
+pub fn import_directory_for_region(
+    input: &Path,
+    output: &Path,
+    decoder: &MasterDecoder,
+    resource_version: Option<&str>,
+    region: Region,
+) -> Result<ImportReceipt, MasterError> {
+    if !region.master_supported() {
+        return Err(MasterError::Format);
+    }
     let _lock = WriterLock::acquire(output)?;
     prepare_directory(
         input,
@@ -310,6 +357,7 @@ pub fn import_directory_with_resource_version(
         decoder,
         "local-import",
         resource_version.map(str::to_owned),
+        region,
     )?
     .publish(output)
 }
@@ -325,10 +373,12 @@ pub(crate) fn prepare_directory(
     decoder: &MasterDecoder,
     source: &'static str,
     resource_version: Option<String>,
+    region: Region,
 ) -> Result<PreparedImport, MasterError> {
-    if resource_version
-        .as_deref()
-        .is_some_and(|v| !safe_version(v))
+    if !region.master_supported()
+        || resource_version
+            .as_deref()
+            .is_some_and(|v| !safe_version(v))
     {
         return Err(MasterError::Format);
     }
@@ -375,6 +425,7 @@ pub(crate) fn prepare_directory(
         tables: manifest.files.len(),
         json_bytes: total,
         source,
+        region,
         resource_version,
     };
     write_synced(
@@ -388,10 +439,17 @@ pub(crate) fn prepare_directory(
 impl PreparedImport {
     pub(crate) fn publish(self, output: &Path) -> Result<ImportReceipt, MasterError> {
         let snapshot = &self.receipt.snapshot;
+        let previous_snapshot = crate::master_registry::predecessor(output)?;
+        // One directory holds one region's history: never chain onto another region.
+        if let Some(previous) = &previous_snapshot {
+            if crate::master_registry::snapshot_region(output, previous)? != self.receipt.region {
+                return Err(MasterError::Format);
+            }
+        }
         let publication = crate::master_registry::Publication {
             schema_version: 1,
             snapshot: snapshot.clone(),
-            previous_snapshot: crate::master_registry::predecessor(output)?,
+            previous_snapshot,
             published_at: chrono::Utc::now(),
         };
         write_synced(
@@ -453,6 +511,7 @@ pub(crate) fn prepare_registry(
         tables: manifest.files.len(),
         json_bytes: total,
         source: "registry",
+        region: manifest.scope.region,
         resource_version: manifest.resource_version.clone(),
     };
     write_synced(

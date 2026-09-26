@@ -31,8 +31,9 @@ with `registry-serve`, using the same manifest contract as Master consumers.
 
 Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. Use one instance per region. JP retains its existing functionality; Global
-currently supports verified server discovery/version queries and region-aware asset transport,
-not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
+currently supports verified server discovery/version queries, region-aware asset transport and
+the Master data pipeline (download, registry, sync, Git and database publication), not
+completed SDK login or end-to-end Global asset validation. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start

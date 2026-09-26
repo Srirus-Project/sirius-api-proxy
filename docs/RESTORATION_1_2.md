@@ -228,3 +228,16 @@ exposed in manifests outside content identity and carried by owner-to-consumer s
 layout output is unchanged. Covered by real-Git tests (tree listing, byte-exact indentation,
 token-preservation property, dedup, table removal, missing provenance, branch/remote), updater
 and sync provenance tests; Linux and Windows CI.
+
+Post-1.2.0 (1.2.1, unreleased): Master data for TW/EN/KR (CN still reserved). The Global Master
+CDN layout, encryption and unauthenticated access were verified live on 2026-09-26 with the
+user's approval. The JP-only gates in configuration, updater, registry, sync, notification,
+standalone registry, Git and database workers were lifted for Global. Anonymous CDN access is an
+explicit `cdn_authorization: none`, and JP keeps its Basic credential. Snapshot receipts record
+their region (legacy = JP), and every read and publication path rejects cross-region
+directories. Covered by tests with a local mock game (Global VERSION with `resourceVersion`) and
+a mock unauthenticated CDN for each Global region. The tests cover installation, receipts and
+status, proxy and standalone registry routes, `indented_root` Git with `version.json` (local and
+remote), same-region sync, cross-region rejection, notifications, CDN-authorization validation,
+region-recording imports and legacy receipts, and a four-region `master_update` + `master_git`
+publisher deployment. Linux and Windows CI.

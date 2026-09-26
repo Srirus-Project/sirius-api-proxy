@@ -7,10 +7,10 @@ one protocol family and cannot switch regions or account identity.
 
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
-| `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy and verified download/export pipeline |
-| `tw` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery and anonymous version query |
+| `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy, verified download/export pipeline and Master data |
+| `tw` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
+| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
+| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 `global` is not a region. TW, EN and KR have distinct API roots and Master versions. EN and KR
@@ -36,7 +36,70 @@ Global player/profile/ranking/announcement/account operations return HTTP 501 wi
 a request. The Global bundle deliberately includes only the two verified RPCs and their
 necessary types. JP authentication, account registration and Master decryption are not assumed
 to work on Global; no SDK registration/login implementation is included in this release.
-Global automatic Master storage is rejected until that pipeline is verified.
+Global Master data is supported as described below; nothing else about Global accounts is.
+
+## Master data
+
+The Master pipeline (`master_directory`, `master_update`, `master-import`, the plaintext
+registry, `master_sync`, `master_notify`, `master_git` and `master_database`, plus the standalone
+`registry-serve`) works for `jp`, `tw`, `en` and `kr`. `cn` is rejected everywhere. Global
+clients fetch Master data the same way as JP: `{CdnRoot}/master/{version}/MasterManifest.json`
+and `{CdnRoot}/master/{version}/{name}.bin`, with the same manifest shape, encryption and
+compression (the same `SIRIUS_MASTER_KEY_HEX`/`SIRIUS_MASTER_IV_HEX` values). `version` is field 1
+of the Global VersionResponse. Its field 2 `resourceVersion` is recorded as the snapshot's asset
+version. JP takes that value from the `x-asset-version` header instead.
+
+`default_cdn_root` must be one URL from the region's server-list `cdn_root` (the `|`-separated
+list holds alternate lines). The shipped examples use the first line of each region:
+
+| Region | Master CDN root (first server-list line) |
+| --- | --- |
+| `tw` | `https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10` |
+| `en` | `https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0` |
+| `kr` | `https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52` |
+
+### CDN authorization
+
+`master_update.cdn_authorization` selects how Master downloads authenticate:
+
+- `basic` (default): HTTP Basic with `username_env` and the credential that `cdn_credential_env`
+  references for the effective CDN root. JP always uses this, and a JP profile must reference a
+  credential for its `default_cdn_root`.
+- `none`: no Authorization header is sent. This is accepted only for `tw`, `en` and `kr`, only
+  without `username_env`, and only when `cdn_credential_env` has **no** entry for
+  `default_cdn_root`. Downloads use exactly the configured root. If the game announces a
+  different CDN root, the update fails and the installed snapshot is kept.
+
+The Global Master CDNs were verified to serve Master data without authentication. No Global CDN
+credential is verified or shipped; do not reuse the JP credential. A Global profile may omit
+`cdn_credential_env` entries (`cdn_credential_env: {}`). Global resource snapshots then stay
+unavailable, as they already were.
+
+```yaml
+region: en
+master_directory: ./data/en/master
+master_update:
+  cdn_authorization: none
+  key_hex_env: SIRIUS_MASTER_KEY_HEX
+  iv_hex_env: SIRIUS_MASTER_IV_HEX
+  interval_seconds: 300
+default_cdn_root: https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0
+cdn_credential_env: {}
+```
+
+### Region identity
+
+Snapshot receipts record `region`. Receipts without one (every snapshot written before 1.2.1)
+are JP snapshots, so existing JP directories, content hashes and Git trees are unchanged. A
+directory holds one region's history: reads, registry routes, history, Git and database
+publication, sync and new installations all refuse a snapshot recorded for another region.
+`master-import IN OUT --region tw|en|kr` records a Global import; without `--region` it records
+JP as before. Content identity, update hints and notifications carry the scope's region.
+Regional routes use `/api/v1/{region}/master-data/...` and `/internal/v1/{region}/...`. Git
+commit messages are `Sirius Master <region> <version>`. In a multi-region deployment, each
+region needs its own `master_directory`, `master_git.state_directory`, Git remote and Git token.
+See [the multi-region publisher example](examples/master-publisher.yaml) and
+[Master snapshot publication](MASTER_REGISTRY.md).
 
 ## Asset updater
 

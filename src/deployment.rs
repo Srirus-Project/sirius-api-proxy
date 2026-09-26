@@ -23,6 +23,13 @@ pub struct MultiConfig {
     pub regions: BTreeMap<String, Config>,
 }
 
+fn distinct<T: PartialEq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .all(|(i, v)| !values[..i].contains(v))
+}
+
 pub enum DeploymentConfig {
     Single(Box<Config>),
     Multi(Box<MultiConfig>),
@@ -100,6 +107,22 @@ impl DeploymentConfig {
                         ));
                     }
                     c.validate()?;
+                }
+                // Each region owns its Master state: snapshot directories, Git state
+                // directories and Git remotes are never shared between regions.
+                let mut directories = Vec::new();
+                let mut remotes = Vec::new();
+                for c in m.regions.values() {
+                    directories.extend(c.master_directory.iter());
+                    if let Some(git) = &c.master_git {
+                        directories.push(&git.state_directory);
+                        remotes.extend(git.remote.as_ref().map(|r| r.url.trim_end_matches('/')));
+                    }
+                }
+                if !distinct(&directories) || !distinct(&remotes) {
+                    return Err(AppError::Config(
+                        "Master directories, Git state directories and Git remotes must be distinct per region",
+                    ));
                 }
                 Ok(())
             }

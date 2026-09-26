@@ -407,8 +407,14 @@ fn prepare(
             return Err(Error::Snapshot);
         }
         let table = file.name.strip_suffix(".json").ok_or(Error::Snapshot)?;
-        let document = master_registry::table(source, &manifest.snapshot, table, &file.sha256)
-            .map_err(|_| Error::Snapshot)?;
+        let document = master_registry::table(
+            source,
+            manifest.scope.region,
+            &manifest.snapshot,
+            table,
+            &file.sha256,
+        )
+        .map_err(|_| Error::Snapshot)?;
         if document.bytes.len() as u64 != file.size {
             return Err(Error::Snapshot);
         }

@@ -20,6 +20,10 @@ master_update:
     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION
 ```
 
+`cdn_authorization` (default `basic`) is independent of the network policy. `basic` requires
+`username_env` and a credential for the CDN root. `none` sends no Authorization header and is
+limited to TW/EN/KR (see [region support](REGIONS.md#cdn-authorization)).
+
 The defaults retain one request attempt and the original connection/request/update timeouts.
 Connection and request timeouts allow 100–300000 ms. Request timeout includes the response body.
 The whole-update deadline allows 1–3600 seconds and includes waiting for another update's lock,
@@ -45,8 +49,8 @@ OS proxy discovery are disabled; deployments previously relying on those variabl
 reference the desired URL variable. A configured proxy has no automatic direct fallback. Standard
 proxy and origin TLS verification and the no-redirect policy remain enabled. HTTPS origins use
 CONNECT; HTTP forward requests expose their origin headers to the proxy. The production CDN
-policy still requires approved HTTPS roots and scoped Basic credentials, separate from game
-session and API/internal bearer credentials. An HTTP 407 response is terminal; a rejected CONNECT
+policy still requires approved HTTPS roots and, with `basic`, scoped Basic credentials, separate
+from game session and API/internal bearer credentials. An HTTP 407 response is terminal; a rejected CONNECT
 may appear as a transport failure and retry within the configured bound.
 
 This configuration also applies to the one-shot `master-update` command and each region's own

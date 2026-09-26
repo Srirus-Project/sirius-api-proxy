@@ -18,7 +18,7 @@ fn interval() -> u64 {
 }
 impl Config {
     pub fn validate(&self, game: &GameConfig) -> Result<(), AppError> {
-        if game.region != crate::region::Region::Jp
+        if !game.region.master_supported()
             || game
                 .master_directory
                 .as_ref()

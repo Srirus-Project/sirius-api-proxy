@@ -16,7 +16,8 @@ pub(crate) struct MasterTarget {
     /// Asset version from the same VERSION response as `version`, when the game reported one.
     pub resource_version: Option<String>,
     pub root: String,
-    pub password: String,
+    /// `None` only for an explicitly anonymous (Global) Master CDN: no Authorization header.
+    pub password: Option<String>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -139,9 +140,11 @@ impl Network {
 pub struct MasterUpdater {
     game: Arc<GameClient>,
     http: reqwest::Client,
-    username: String,
+    /// `None` for anonymous CDN access (`cdn_authorization: none`).
+    username: Option<String>,
     decoder: Arc<MasterDecoder>,
     output: PathBuf,
+    region: crate::region::Region,
     interval: Duration,
     lock: Mutex<()>,
     deadline: Duration,
@@ -157,10 +160,25 @@ impl MasterUpdater {
     pub fn new(config: &Config, game: Arc<GameClient>) -> Result<Arc<Self>, UpdateError> {
         let update = config.master_update.as_ref().ok_or(UpdateError::Config)?;
         let output = config.master_directory.clone().ok_or(UpdateError::Config)?;
-        let username = secret(&update.username_env).map_err(|_| UpdateError::Config)?;
-        if username.contains(':') {
-            return Err(UpdateError::Config);
-        }
+        let username = match update.cdn_authorization {
+            crate::config::CdnAuthorization::Basic => {
+                let name = update.username_env.as_ref().ok_or(UpdateError::Config)?;
+                let username = secret(name).map_err(|_| UpdateError::Config)?;
+                if username.contains(':') {
+                    return Err(UpdateError::Config);
+                }
+                Some(username)
+            }
+            crate::config::CdnAuthorization::None => {
+                if update.username_env.is_some()
+                    || !config.region.master_supported()
+                    || config.region.family() != "global"
+                {
+                    return Err(UpdateError::Config);
+                }
+                None
+            }
+        };
         let key =
             master::key_from_hex(&secret(&update.key_hex_env).map_err(|_| UpdateError::Config)?)?;
         let iv =
@@ -172,6 +190,7 @@ impl MasterUpdater {
             username,
             decoder: Arc::new(MasterDecoder::new(&key, iv)),
             output,
+            region: config.region,
             interval: Duration::from_secs(update.interval_seconds),
             lock: Mutex::new(()),
             deadline: Duration::from_secs(update.network.update_timeout_seconds),
@@ -201,13 +220,15 @@ impl MasterUpdater {
         limit: u64,
     ) -> Result<Vec<u8>, UpdateError> {
         let url = format!("{}/master/{}/{}", target.root, target.version, name);
-        let mut response = self
-            .http
-            .get(url)
-            .basic_auth(&self.username, Some(&target.password))
-            .send()
-            .await
-            .map_err(|_| UpdateError::Download)?;
+        let request = match (&self.username, &target.password) {
+            (Some(username), Some(password)) => {
+                self.http.get(url).basic_auth(username, Some(password))
+            }
+            (None, None) => self.http.get(url),
+            // Never mix an authenticated target with an anonymous updater or vice versa.
+            _ => return Err(UpdateError::Target),
+        };
+        let mut response = request.send().await.map_err(|_| UpdateError::Download)?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(UpdateError::Http(response.status().as_u16()));
         }
@@ -258,8 +279,9 @@ impl MasterUpdater {
         let output = self.output.clone();
         let version = target.version.clone();
         let resource_version = target.resource_version.clone();
+        let region = self.region;
         let current = tokio::task::spawn_blocking(move || -> Option<Value> {
-            let current = master::read_current(&output, None).ok()?;
+            let current = master::read_current_in(&output, None, region).ok()?;
             if current.version != version {
                 return None;
             }
@@ -272,7 +294,8 @@ impl MasterUpdater {
             }
             // A missing/truncated table triggers a full repair instead of an unchanged result.
             for table in status["tables"].as_array()? {
-                let document = master::read_current(&output, Some(table.as_str()?)).ok()?;
+                let document =
+                    master::read_current_in(&output, Some(table.as_str()?), region).ok()?;
                 if document.version != version
                     || serde_json::from_slice::<Value>(&document.bytes).is_err()
                 {
@@ -312,6 +335,7 @@ impl MasterUpdater {
         let decoder = self.decoder.clone();
         let output = self.output.clone();
         let resource_version = target.resource_version.clone();
+        let region = self.region;
         let prepared = tokio::task::spawn_blocking(move || {
             // Keep encrypted tempdir owned by this task even if the caller times out.
             master::prepare_directory(
@@ -320,6 +344,7 @@ impl MasterUpdater {
                 &decoder,
                 "remote",
                 resource_version,
+                region,
             )
         })
         .await

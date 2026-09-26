@@ -185,8 +185,9 @@ async fn master_document(c: Arc<GameClient>, table: Option<String>) -> Result<Re
         .master_directory()
         .ok_or(AppError::MasterUnavailable)?
         .to_path_buf();
+    let region = c.region();
     let document = tokio::task::spawn_blocking(move || {
-        crate::master::read_current(&directory, table.as_deref())
+        crate::master::read_current_in(&directory, table.as_deref(), region)
     })
     .await
     .map_err(|_| AppError::MasterUnavailable)?
@@ -213,6 +214,7 @@ async fn regions(State(c): State<Arc<GameClient>>) -> Json<Value> {
     use crate::region::Region;
     let regions=[Region::Jp,Region::Tw,Region::En,Region::Kr,Region::Cn].map(|region| json!({
         "region":region,"area_id":region.area_id(),"protocol_family":region.family(),"reserved":region==Region::Cn,
+        "master_data":region.master_supported(),
         "capability":if region==Region::Cn {"reserved"} else if region==Region::Jp {"jp_proxy"} else {"discovery_and_version"}
     }));
     Json(json!({"selected":c.region(),"regions":regions}))
@@ -423,6 +425,7 @@ async fn registry_response(
     let document = tokio::task::spawn_blocking(move || match table {
         Some((table, hash)) => crate::master_registry::table(
             &root,
+            scope.region,
             snapshot
                 .as_deref()
                 .ok_or(crate::master::MasterError::Format)?,
@@ -696,6 +699,7 @@ async fn registry_bundle(
         .ok_or(AppError::MasterUnavailable)?
         .to_owned();
     let scope = database_scope(&c);
+    let region = scope.region;
     let source = root.clone();
     let document = tokio::task::spawn_blocking(move || match hash {
         Some(hash) => crate::master_registry::manifest_by_hash(&source, scope, &hash),
@@ -723,7 +727,7 @@ async fn registry_bundle(
                         .name
                         .strip_suffix(".json")
                         .ok_or(crate::master::MasterError::Format)?;
-                    crate::master_registry::table(&root, &snapshot, name, &file.sha256)
+                    crate::master_registry::table(&root, region, &snapshot, name, &file.sha256)
                 })
                 .await
                 .map_err(|_| AppError::MasterUnavailable)?

@@ -183,7 +183,7 @@ fn verified_snapshot(source: &Path, scope: Scope, id: Option<&str>) -> Result<Sn
     let mut tables = Vec::new();
     for file in &manifest.files {
         let name = file.name.strip_suffix(".json").ok_or(Error::Snapshot)?;
-        let data = registry::table(source, &manifest.snapshot, name, &file.sha256)
+        let data = registry::table(source, scope.region, &manifest.snapshot, name, &file.sha256)
             .map_err(|_| Error::Snapshot)?;
         if data.bytes.len() as u64 != file.size {
             return Err(Error::Snapshot);
@@ -546,7 +546,7 @@ impl Reader {
         hash: Option<&str>,
         table: Option<&str>,
     ) -> Result<registry::Document, Error> {
-        if scope.region != crate::region::Region::Jp
+        if !scope.region.master_supported()
             || hash.is_some_and(|h| !registry::hash_valid(h))
             || table.is_some_and(|t| hash.is_none() || !crate::master::safe_component(t))
         {
@@ -622,7 +622,7 @@ impl Reader {
         limit: usize,
         before: Option<i64>,
     ) -> Result<HistoryPage, Error> {
-        if scope.region != crate::region::Region::Jp
+        if !scope.region.master_supported()
             || !(1..=200).contains(&limit)
             || before.is_some_and(|n| n <= 0)
         {

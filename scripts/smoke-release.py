@@ -120,7 +120,10 @@ with tempfile.TemporaryDirectory() as tmp:
                 proc.kill()
                 proc.wait()
     if m["name"] == "sirius-api-proxy":
-        global_config = json.loads((root / "docs/examples/en.yaml").read_text().split("\n", 1)[1])
+        # The example is JSON plus full-line YAML comments (optional blocks stay commented out).
+        example = (root / "docs/examples/en.yaml").read_text().splitlines()
+        global_config = json.loads("\n".join(l for l in example if not l.lstrip().startswith("#")))
+        assert "master_update" not in global_config and "cdn.example.invalid" not in global_config["default_cdn_root"]
         global_config.update(listen=f"127.0.0.1:{port}", api_token_env="SIRIUS_API_TOKEN", internal_token_env="SIRIUS_INTERNAL_TOKEN")
         (root / "sirius-api-config.yaml").write_text(json.dumps(global_config))
         proc = subprocess.Popen([str(exe)], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

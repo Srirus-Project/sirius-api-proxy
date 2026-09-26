@@ -125,10 +125,28 @@ pub fn default_protocol_directory() -> std::path::PathBuf {
 pub struct MasterUpdateConfig {
     #[serde(default)]
     pub network: crate::master_update::Network,
-    pub username_env: String,
+    /// `basic` (default) sends HTTP Basic with `username_env` and the credential referenced for
+    /// the effective CDN root. `none` sends no Authorization header; it is accepted only for
+    /// TW/EN/KR and only when `cdn_credential_env` has no reference for `default_cdn_root`.
+    #[serde(default)]
+    pub cdn_authorization: CdnAuthorization,
+    /// Required for `basic`; must be absent for `none`.
+    #[serde(default)]
+    pub username_env: Option<String>,
     pub key_hex_env: String,
     pub iv_hex_env: String,
     pub interval_seconds: u64,
+}
+
+/// How the Master updater authenticates to the Master CDN.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnAuthorization {
+    /// HTTP Basic with a configured credential reference (required for JP).
+    #[default]
+    Basic,
+    /// No Authorization header. Global Master CDNs were verified not to require one.
+    None,
 }
 
 pub(crate) fn secret(name: &str) -> Result<String, AppError> {
@@ -253,11 +271,11 @@ impl Config {
                 "cn is reserved; no verified endpoint or protocol is available",
             ));
         }
-        if self.region != crate::region::Region::Jp
+        if !self.region.master_supported()
             && (self.master_update.is_some() || self.master_directory.is_some())
         {
             return Err(AppError::Config(
-                "automatic Master storage is currently verified only for jp",
+                "automatic Master storage is not available for this region",
             ));
         }
         if let Some(update) = &self.master_update {
@@ -270,15 +288,34 @@ impl Config {
                 .as_ref()
                 .is_none_or(|p| p.as_os_str().is_empty())
                 || !(60..=86400).contains(&update.interval_seconds)
-                || [
-                    &update.username_env,
-                    &update.key_hex_env,
-                    &update.iv_hex_env,
-                ]
-                .iter()
-                .any(|s| s.is_empty())
+                || [&update.key_hex_env, &update.iv_hex_env]
+                    .iter()
+                    .any(|s| s.is_empty())
             {
                 return Err(AppError::Config("Master updater requires a directory, secret references and a 60..86400 second interval"));
+            }
+            match update.cdn_authorization {
+                CdnAuthorization::Basic => {
+                    if update.username_env.as_ref().is_none_or(|s| s.is_empty())
+                        || !self.cdn_credential_env.contains_key(&self.default_cdn_root)
+                    {
+                        return Err(AppError::Config(
+                            "Master CDN Basic authorization requires a username and a credential reference for the default CDN",
+                        ));
+                    }
+                }
+                CdnAuthorization::None => {
+                    // JP Master requires its credential; anonymous access is verified only for
+                    // Global. A configured credential for the same root would be ambiguous.
+                    if self.region.family() != "global"
+                        || update.username_env.is_some()
+                        || self.cdn_credential_env.contains_key(&self.default_cdn_root)
+                    {
+                        return Err(AppError::Config(
+                            "anonymous Master CDN access is only for TW/EN/KR without a credential for the default CDN",
+                        ));
+                    }
+                }
             }
         }
         for value in std::iter::once(&self.endpoint)
@@ -319,7 +356,11 @@ impl Config {
                 "both account environment references are required",
             ));
         }
-        if !self.cdn_credential_env.contains_key(&self.default_cdn_root) {
+        // JP CDN access always needs its credential. Global credential references are optional:
+        // no Global CDN credential is verified, and anonymous Master access is explicit above.
+        if self.region == crate::region::Region::Jp
+            && !self.cdn_credential_env.contains_key(&self.default_cdn_root)
+        {
             return Err(AppError::Config(
                 "default CDN must have a credential reference",
             ));

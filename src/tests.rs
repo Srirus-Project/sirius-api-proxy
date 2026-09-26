@@ -917,10 +917,13 @@ fn cdn_reply(bytes: Vec<u8>) -> Reply {
     reply
 }
 fn remote_master_config(cdn: &Fixture, directory: &std::path::Path) -> Config {
+    remote_master_config_at(&cdn.url, directory)
+}
+fn remote_master_config_at(root: &str, directory: &std::path::Path) -> Config {
     let mut cfg = config();
     let reference = cfg.cdn_credential_env.values().next().unwrap().clone();
-    cfg.default_cdn_root = cdn.url.clone();
-    cfg.cdn_credential_env = BTreeMap::from([(cdn.url.clone(), reference)]);
+    cfg.default_cdn_root = root.into();
+    cfg.cdn_credential_env = BTreeMap::from([(root.into(), reference)]);
     cfg.master_directory = Some(directory.into());
     let name = format!("SIRIUS_UPDATE_{}", uuid::Uuid::new_v4().simple());
     std::env::set_var(format!("{name}_USER"), "fixture-user");
@@ -934,7 +937,8 @@ fn remote_master_config(cdn: &Fixture, directory: &std::path::Path) -> Config {
     );
     cfg.master_update = Some(crate::config::MasterUpdateConfig {
         network: Default::default(),
-        username_env: format!("{name}_USER"),
+        cdn_authorization: Default::default(),
+        username_env: Some(format!("{name}_USER")),
         key_hex_env: format!("{name}_KEY"),
         iv_hex_env: format!("{name}_IV"),
         interval_seconds: 60,
@@ -1182,7 +1186,8 @@ fn updater_configuration_requires_output_and_bounded_interval() {
     let mut cfg = config();
     cfg.master_update = Some(crate::config::MasterUpdateConfig {
         network: Default::default(),
-        username_env: "U".into(),
+        cdn_authorization: Default::default(),
+        username_env: Some("U".into()),
         key_hex_env: "K".into(),
         iv_hex_env: "I".into(),
         interval_seconds: 300,
@@ -2133,6 +2138,9 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         .await;
         assert_eq!(status, 200);
         assert_eq!(body["selected"], n);
+        for entry in body["regions"].as_array().unwrap() {
+            assert_eq!(entry["master_data"], entry["region"] != "cn");
+        }
         let (status, body) = request(
             &app,
             &format!("/internal/v1/{n}/protocol"),
@@ -6106,6 +6114,7 @@ fn master_registry_indexes_raw_json_and_pins_old_snapshots_across_current_change
     assert_eq!(
         registry::table(
             &output,
+            crate::region::Region::Jp,
             &first.snapshot,
             "MasterFixture",
             &published.files[0].sha256
@@ -6144,7 +6153,14 @@ fn master_registry_corruption_and_legacy_snapshots_have_explicit_integrity_behav
         master::read_current(&output, Some("MasterFixture")),
         Err(master::MasterError::Integrity)
     ));
-    assert!(registry::table(&output, &receipt.snapshot, "MasterFixture", hash).is_err());
+    assert!(registry::table(
+        &output,
+        crate::region::Region::Jp,
+        &receipt.snapshot,
+        "MasterFixture",
+        hash
+    )
+    .is_err());
     std::fs::write(
         path.join("MasterFixture.json"),
         include_bytes!("../tests/fixtures/master-synthetic.json"),
@@ -6162,7 +6178,14 @@ fn master_registry_corruption_and_legacy_snapshots_have_explicit_integrity_behav
     .unwrap();
     assert_eq!(first.content_sha256, legacy.content_sha256);
     assert!(!path.join("tables.json").exists());
-    assert!(registry::table(&output, &receipt.snapshot, "MasterFixture", hash).is_ok());
+    assert!(registry::table(
+        &output,
+        crate::region::Region::Jp,
+        &receipt.snapshot,
+        "MasterFixture",
+        hash
+    )
+    .is_ok());
     std::fs::write(path.join("MasterFixture.json"), b"invalid JSON").unwrap();
     assert!(registry::manifest(&output, None, registry_scope()).is_err());
 }
@@ -6184,12 +6207,20 @@ fn master_registry_rejects_symbolic_links_and_unlisted_files() {
     std::os::unix::fs::symlink(&outside, snapshot.join("MasterFixture.json")).unwrap();
     assert!(registry::table(
         &output,
+        crate::region::Region::Jp,
         &receipt.snapshot,
         "MasterFixture",
         &manifest.files[0].sha256
     )
     .is_err());
-    assert!(registry::table(&output, &receipt.snapshot, "receipt", &"0".repeat(64)).is_err());
+    assert!(registry::table(
+        &output,
+        crate::region::Region::Jp,
+        &receipt.snapshot,
+        "receipt",
+        &"0".repeat(64)
+    )
+    .is_err());
     assert!(registry::manifest(&output, Some("../outside"), registry_scope()).is_err());
     std::os::unix::fs::symlink(&snapshot, output.join("master-link")).unwrap();
     assert!(registry::manifest(&output, Some("master-link"), registry_scope()).is_err());
@@ -6535,11 +6566,10 @@ async fn master_sync_configuration_enforces_scope_policy_and_worker_assembly() {
     let mut missing = cfg.clone();
     missing.master_directory = None;
     assert!(missing.validate().is_err());
-    for region in [Region::Tw, Region::En, Region::Kr, Region::Cn] {
-        let mut wrong = cfg.clone();
-        wrong.region = region;
-        assert!(wrong.validate().is_err());
-    }
+    // CN is reserved; Global sync is covered by global_master_pipeline_* tests.
+    let mut wrong = cfg.clone();
+    wrong.region = Region::Cn;
+    assert!(wrong.validate().is_err());
     for token in ["internal-jp", "fixture-cdn-secret"] {
         std::env::set_var(&base.token_env, token);
         assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
@@ -7402,11 +7432,17 @@ fn master_notification_configuration_and_deployment_separate_credentials() {
         .targets
         .push(base.targets[0].clone());
     assert!(bad.validate().is_err());
-    for region in [Region::Tw, Region::En, Region::Kr, Region::Cn] {
-        let mut bad = cfg.clone();
-        bad.region = region;
-        assert!(bad.validate().is_err());
-    }
+    let mut bad = cfg.clone();
+    bad.region = Region::Cn;
+    assert!(bad.validate().is_err());
+    let mut scope = crate::master_registry::Scope {
+        region: Region::Tw,
+        environment: "release".into(),
+        platform: crate::region::Platform::Android,
+    };
+    assert!(base.validate_policy(&scope).is_ok());
+    scope.region = Region::Cn;
+    assert!(base.validate_policy(&scope).is_err());
     for value in ["public-jp", "internal-jp", "fixture-cdn-secret"] {
         std::env::set_var(&base.targets[0].token_env, value);
         assert!(DeploymentConfig::Single(Box::new(cfg.clone()))
@@ -9609,8 +9645,16 @@ fn master_database_worker_config_and_credentials_are_scoped() {
     let mut missing = cfg.clone();
     missing.master_directory = None;
     assert!(missing.validate().is_err());
+    // Database publication is scope-keyed and region-agnostic; CN stays reserved.
     let mut global = cfg.clone();
     global.region = crate::region::Region::En;
+    assert!(global
+        .master_database
+        .as_ref()
+        .unwrap()
+        .validate(&global)
+        .is_ok());
+    global.region = crate::region::Region::Cn;
     assert!(global
         .master_database
         .as_ref()
@@ -10437,15 +10481,41 @@ async fn standalone_registry_files_auth_integrity_scope_and_real_consumer() {
         503
     );
     server.abort();
+    let mut bad = cfg.clone();
+    bad.scope.region = crate::region::Region::Cn;
+    assert!(bad.prepare().is_err());
+    // A Global registry is valid, but never serves this JP directory under its own scope.
     for region in [
         crate::region::Region::Tw,
         crate::region::Region::En,
         crate::region::Region::Kr,
-        crate::region::Region::Cn,
     ] {
-        let mut bad = cfg.clone();
-        bad.scope.region = region;
-        assert!(bad.prepare().is_err());
+        let mut other = cfg.clone();
+        other.scope.region = region;
+        other.regional_paths = true;
+        let app = other.prepare().unwrap().router;
+        for (p, status) in [
+            (
+                format!("/api/v1/{}/master-data/manifest", region.name()),
+                503,
+            ),
+            ("/api/v1/jp/master-data/manifest".to_string(), 404),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        Request::get(&p)
+                            .header("authorization", "Bearer owner-read")
+                            .body(Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                status,
+                "{p}"
+            );
+        }
     }
     let mut regional = cfg.clone();
     regional.regional_paths = true;
@@ -10654,6 +10724,7 @@ async fn master_bundle_pins_verifies_limits_admission_and_cleans_cancellation() 
                 crate::master::import_directory(&input, &root, &decoder).unwrap();
                 registry::table(
                     &root,
+                    crate::region::Region::Jp,
                     &id,
                     file.name.strip_suffix(".json").unwrap(),
                     &file.sha256,
@@ -11839,9 +11910,45 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         ("kr", include_str!("../docs/examples/kr.yaml")),
     ] {
         match DeploymentConfig::parse(source).unwrap() {
-            DeploymentConfig::Single(c) => assert_eq!(c.region.name(), region),
+            DeploymentConfig::Single(c) => {
+                assert_eq!(c.region.name(), region);
+                assert!(c.master_update.is_none() && c.cdn_credential_env.is_empty());
+                assert!(!c.default_cdn_root.contains("example.invalid"));
+            }
             DeploymentConfig::Multi(_) => panic!("{region} example must be single-region"),
         }
+        // The documented optional Master blocks validate once uncommented.
+        let uncommented = source
+            .lines()
+            .map(
+                |line| match line.find("# \"").or_else(|| line.find("#   \"")) {
+                    Some(at) if line[..at].trim().is_empty() => line.replacen("# ", "", 1),
+                    _ => line.into(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let repository = if region == "tw" {
+            "HK"
+        } else {
+            &region.to_uppercase()
+        };
+        std::env::set_var(
+            format!("SIRIUS_MASTER_GIT_{repository}_AUTHORIZATION"),
+            format!("Authorization: Bearer git-{}", repository.to_lowercase()),
+        );
+        let DeploymentConfig::Single(c) = DeploymentConfig::parse(&uncommented).unwrap() else {
+            panic!("{region} example must be single-region");
+        };
+        let update = c.master_update.as_ref().unwrap();
+        assert_eq!(
+            update.cdn_authorization,
+            crate::config::CdnAuthorization::None
+        );
+        assert_eq!(
+            c.master_git.as_ref().unwrap().layout,
+            crate::master_git::Layout::IndentedRoot
+        );
     }
     let single = include_str!("../sirius-api-config.example.yaml");
     for block in ["master_database:", "client_auth:"] {
@@ -12953,4 +13060,709 @@ async fn master_sync_propagates_owner_asset_version_without_redownloading_tables
         "{\n  \"dataVersion\": \"fixture-v1\",\n  \"assetVersion\": \"owner-asset-7\"\n}\n"
     );
     server.abort();
+}
+
+/// Verified public server-list CDN roots (first line) and API origins per Global region.
+const GLOBAL_SERVICES: [(crate::region::Region, &str, &str); 3] = [
+    (
+        crate::region::Region::Tw,
+        "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com",
+        "https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10",
+    ),
+    (
+        crate::region::Region::En,
+        "https://l14-prod-va-all-gs-sirius.bilibiligame.net",
+        "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0",
+    ),
+    (
+        crate::region::Region::Kr,
+        "https://l14-prod-kr-all-gs-sirius.bilibiligame.net",
+        "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52",
+    ),
+];
+/// Global VersionResponse: #1 master version, #2 resource (asset) version in the body.
+fn global_version_reply(version: &str, resource: &str) -> Reply {
+    let mut body = Vec::new();
+    for (tag, value) in [(0x0a, version), (0x12, resource)] {
+        body.push(tag);
+        body.push(value.len() as u8);
+        body.extend_from_slice(value.as_bytes());
+    }
+    let mut reply = Reply::version();
+    reply.bytes = framed(body);
+    reply
+}
+fn master_key_env() -> (String, String) {
+    let name = format!("SIRIUS_GLOBAL_MASTER_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(
+        format!("{name}_KEY"),
+        (0..32).map(|i| format!("{i:02x}")).collect::<String>(),
+    );
+    std::env::set_var(
+        format!("{name}_IV"),
+        (32..64).map(|i| format!("{i:02x}")).collect::<String>(),
+    );
+    (format!("{name}_KEY"), format!("{name}_IV"))
+}
+/// Anonymous Global Master updater against a local mock CDN root.
+fn global_master_config(
+    region: crate::region::Region,
+    cdn_root: &str,
+    directory: &std::path::Path,
+) -> Config {
+    let mut cfg = regional_config(region);
+    cfg.default_cdn_root = cdn_root.into();
+    cfg.cdn_credential_env = BTreeMap::new();
+    cfg.master_directory = Some(directory.into());
+    let (key_hex_env, iv_hex_env) = master_key_env();
+    cfg.master_update = Some(crate::config::MasterUpdateConfig {
+        network: Default::default(),
+        cdn_authorization: crate::config::CdnAuthorization::None,
+        username_env: None,
+        key_hex_env,
+        iv_hex_env,
+        interval_seconds: 60,
+    });
+    cfg
+}
+fn global_scope(region: crate::region::Region) -> crate::master_registry::Scope {
+    crate::master_registry::Scope {
+        region,
+        environment: "release".into(),
+        platform: crate::region::Platform::Android,
+    }
+}
+async fn get_json(app: &axum::Router, path: &str, token: &str) -> (u16, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region() {
+    use crate::{master, master_git, master_registry as registry, master_sync, region::Region};
+    for (index, region) in [Region::Tw, Region::En, Region::Kr].into_iter().enumerate() {
+        let n = region.name();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("master");
+        // Mock game (Global VERSION with body resourceVersion) and mock CDN without auth.
+        let cdn = cdn_fixture(vec![
+            cdn_reply(remote_master_manifest()),
+            cdn_reply(master_fixture().2.to_vec()),
+        ])
+        .await;
+        let game = fixture(vec![
+            global_version_reply("master-fixture", "1.0.0.104"),
+            global_version_reply("master-fixture", "1.0.0.104"),
+            global_version_reply("master-fixture", "1.0.0.104"),
+        ])
+        .await;
+        let cfg = global_master_config(region, &cdn.url, &directory);
+        let c = client(&game, cfg.clone());
+        let updater = crate::master_update::MasterUpdater::new(&cfg, c.clone()).unwrap();
+        let result = updater.update_once().await.unwrap();
+        assert_eq!(result["action"], "updated", "{n}");
+        assert_eq!(result["receipt"]["region"], n);
+        assert_eq!(result["receipt"]["resource_version"], "1.0.0.104");
+        assert_eq!(result["receipt"]["source"], "remote");
+        assert_eq!(updater.update_once().await.unwrap()["action"], "unchanged");
+        {
+            let seen = cdn.received.lock().unwrap();
+            assert_eq!(
+                seen.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                [
+                    "/master/master-fixture/MasterManifest.json",
+                    "/master/master-fixture/MasterFixture.bin"
+                ]
+            );
+            assert!(seen
+                .iter()
+                .all(|(_, headers, _)| !headers.contains_key("authorization")));
+        }
+        assert_eq!(game.received.lock().unwrap()[0].1["x-platform"], "android");
+        // Receipt and status carry the region; another region's view of the directory fails.
+        let snapshot = std::fs::read_to_string(directory.join("CURRENT")).unwrap();
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(directory.join(&snapshot).join("receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["region"], n);
+        let status: Value = serde_json::from_slice(
+            &master::read_current_in(&directory, None, region)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert_eq!(status["region"], n);
+        assert_eq!(status["resource_version"], "1.0.0.104");
+        assert!(master::read_current_in(&directory, None, Region::Jp).is_err());
+        assert!(master::read_current_in(&directory, Some("MasterFixture"), Region::Jp).is_err());
+        let manifest: registry::PublishedManifest = serde_json::from_slice(
+            &registry::manifest(&directory, None, global_scope(region))
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert_eq!(manifest.scope.region, region);
+        assert_eq!(manifest.resource_version.as_deref(), Some("1.0.0.104"));
+        assert!(registry::manifest(&directory, None, registry_scope()).is_err());
+        assert!(registry::table(
+            &directory,
+            Region::Jp,
+            &manifest.snapshot,
+            "MasterFixture",
+            &manifest.files[0].sha256
+        )
+        .is_err());
+        // Content identity is region scoped: the same tables differ from JP's identity.
+        let (_jp_root, _, jp_output, _) = registry_fixture();
+        let jp: registry::PublishedManifest = serde_json::from_slice(
+            &registry::manifest(&jp_output, None, registry_scope())
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(jp.files == manifest.files);
+        assert_ne!(jp.content_sha256, manifest.content_sha256);
+
+        // Proxy registry routes under /api/v1/{region}.
+        let app = crate::api::router_at(
+            c.clone(),
+            format!("public-{n}"),
+            format!("internal-{n}"),
+            &format!("/api/v1/{n}"),
+            &format!("/internal/v1/{n}"),
+        );
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/{n}/master-data/manifest"),
+            &format!("public-{n}"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["scope"]["region"], n);
+        assert_eq!(body["content_sha256"], manifest.content_sha256);
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/{n}/master-data"),
+            &format!("public-{n}"),
+        )
+        .await;
+        assert_eq!((status, body["region"].as_str()), (200, Some(n)));
+        let (status, _) = get_json(
+            &app,
+            &format!(
+                "/api/v1/{n}/master-data/snapshots/{}/tables/MasterFixture/{}",
+                manifest.snapshot, manifest.files[0].sha256
+            ),
+            &format!("public-{n}"),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Standalone registry with regional paths serves the same identity.
+        let mut registry_cfg = standalone_registry_config(directory.clone());
+        registry_cfg.scope = global_scope(region);
+        registry_cfg.regional_paths = true;
+        let owner_app = registry_cfg.prepare().unwrap().router;
+        let (status, body) = get_json(
+            &owner_app,
+            &format!("/api/v1/{n}/master-data/manifest"),
+            "owner-read",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["content_sha256"], manifest.content_sha256);
+        assert_eq!(
+            get_json(&owner_app, "/api/v1/jp/master-data/manifest", "owner-read")
+                .await
+                .0,
+            404
+        );
+
+        // indented_root Git publication with version.json and region-named commits.
+        let state = root.path().join("git");
+        let options = master_git::Options {
+            layout: master_git::Layout::IndentedRoot,
+            branch: "main".into(),
+        };
+        let policy = master_git::CommitPolicy::default();
+        let receipt = master_git::commit_with_options(
+            &directory,
+            &state,
+            global_scope(region),
+            &policy,
+            &options,
+        )
+        .await
+        .unwrap();
+        assert!(receipt.changed);
+        assert_eq!(receipt.content_sha256, manifest.content_sha256);
+        let repository = state.join("repository.git");
+        assert_eq!(
+            git_output(&repository, &["show", "main:version.json"]).unwrap(),
+            String::from_utf8(master_git::version_document("master-fixture", "1.0.0.104")).unwrap()
+        );
+        assert_eq!(
+            git_output(&repository, &["log", "-1", "--format=%s", "main"]).unwrap(),
+            format!("Sirius Master {n} master-fixture\n")
+        );
+        // The Git state is owned by this region; another region's scope is refused.
+        let other = [Region::Jp, Region::Tw, Region::En, Region::Kr][(index + 2) % 4];
+        assert!(matches!(
+            master_git::commit_with_options(
+                &directory,
+                &state,
+                global_scope(other),
+                &policy,
+                &options
+            )
+            .await,
+            Err(master_git::Error::Ownership)
+        ));
+        #[cfg(unix)]
+        {
+            let remote_path = root.path().join("remote.git");
+            assert!(std::process::Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&remote_path)
+                .status()
+                .unwrap()
+                .success());
+            let remote = master_git::Remote {
+                proxy_url_env: None,
+                url: url::Url::from_directory_path(&remote_path)
+                    .unwrap()
+                    .to_string(),
+                authorization_env: None,
+                allow_http: false,
+                allow_file: true,
+            };
+            let pushed = master_git::publish_with_options(
+                &directory,
+                &root.path().join("git-remote"),
+                global_scope(region),
+                &remote,
+                &policy,
+                &options,
+            )
+            .await
+            .unwrap();
+            assert!(pushed.remote_verified);
+            assert_eq!(
+                git_output(&remote_path, &["show", "main:version.json"]).unwrap(),
+                "{\n  \"dataVersion\": \"master-fixture\",\n  \"assetVersion\": \"1.0.0.104\"\n}\n"
+            );
+        }
+
+        // Same-region owner/consumer synchronization carries region and asset version.
+        let (origin, server) = peer_http_server(owner_app.clone()).await;
+        let token_env = format!("SIRIUS_GLOBAL_SYNC_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&token_env, "owner-read");
+        let policy_for = |regional_paths| master_sync::Config {
+            origin: origin.clone(),
+            token_env: token_env.clone(),
+            regional_paths,
+            allow_http: true,
+            interval_seconds: 60,
+            timeout_seconds: 5,
+            request_timeout_ms: 2000,
+        };
+        let consumer = root.path().join("consumer");
+        let syncer = master_sync::Syncer::standalone(
+            policy_for(true),
+            global_scope(region),
+            consumer.clone(),
+        )
+        .unwrap();
+        let synced = syncer.update_once().await.unwrap();
+        assert_eq!(synced["action"], "updated");
+        assert_eq!(synced["receipt"]["region"], n);
+        assert_eq!(synced["receipt"]["source"], "registry");
+        assert_eq!(synced["receipt"]["resource_version"], "1.0.0.104");
+        assert_eq!(synced["content_sha256"], manifest.content_sha256);
+        assert_eq!(syncer.update_once().await.unwrap()["action"], "unchanged");
+        // Cross-region consumers are rejected: another region's regional path does not exist,
+        // and a non-regional owner's manifest fails the consumer's scope check.
+        let wrong = master_sync::Syncer::standalone(
+            policy_for(true),
+            global_scope(other),
+            root.path().join("x"),
+        )
+        .unwrap();
+        assert!(wrong.update_once().await.is_err());
+        server.abort();
+        let mut flat_cfg = standalone_registry_config(directory.clone());
+        flat_cfg.scope = global_scope(region);
+        let (flat_origin, flat_server) = peer_http_server(flat_cfg.prepare().unwrap().router).await;
+        let mut flat = policy_for(false);
+        flat.origin = flat_origin;
+        let wrong_scope = master_sync::Syncer::standalone(
+            flat.clone(),
+            global_scope(other),
+            root.path().join("y"),
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong_scope.update_once().await,
+            Err(master_sync::Error::Integrity)
+        ));
+        assert!(!root.path().join("y/CURRENT").exists());
+        // A same-scope owner never installs on top of another region's directory history.
+        let before = std::fs::read(jp_output.join("CURRENT")).unwrap();
+        let onto_jp =
+            master_sync::Syncer::standalone(flat, global_scope(region), jp_output.clone()).unwrap();
+        assert!(matches!(
+            onto_jp.update_once().await,
+            Err(master_sync::Error::Storage)
+        ));
+        assert_eq!(std::fs::read(jp_output.join("CURRENT")).unwrap(), before);
+        flat_server.abort();
+
+        // Notifications use the region's internal path and scope.
+        let hints = Arc::new(Mutex::new(Vec::new()));
+        let seen = hints.clone();
+        let notify_app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let seen = seen.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                seen.lock()
+                    .unwrap()
+                    .push((path, serde_json::from_slice::<Value>(&body).unwrap()));
+                (
+                    axum::http::StatusCode::ACCEPTED,
+                    axum::Json(json!({"status":"accepted"})),
+                )
+            }
+        });
+        let (notify_origin, notify_server) = peer_http_server(notify_app).await;
+        let mut target = crate::master_notify::Target::new(
+            &notify_origin,
+            "consumer-hint",
+            global_scope(region),
+            true,
+            true,
+            2000,
+        )
+        .unwrap();
+        assert!(target.deliver(&manifest.content_sha256).await.unwrap());
+        {
+            let hints = hints.lock().unwrap();
+            assert_eq!(hints[0].0, format!("/internal/v1/{n}/master-data/sync"));
+            assert_eq!(hints[0].1["scope"]["region"], n);
+        }
+        notify_server.abort();
+    }
+}
+
+#[test]
+fn global_master_cdn_authorization_is_explicit_and_jp_keeps_its_credential() {
+    use crate::{config::CdnAuthorization, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    for (region, endpoint, cdn) in GLOBAL_SERVICES {
+        let mut cfg = global_master_config(region, cdn, &root.path().join(region.name()));
+        cfg.endpoint = endpoint.into();
+        cfg.validate().unwrap();
+        // A credential for the anonymous root is ambiguous; a username is meaningless.
+        let mut bad = cfg.clone();
+        bad.cdn_credential_env = BTreeMap::from([(cdn.into(), "SIRIUS_UNUSED_CDN".into())]);
+        assert!(bad.validate().is_err());
+        let mut bad = cfg.clone();
+        bad.master_update.as_mut().unwrap().username_env = Some("SIRIUS_UNUSED_USER".into());
+        assert!(bad.validate().is_err());
+        // Basic remains available for Global, but requires the credential reference.
+        let mut basic = cfg.clone();
+        let update = basic.master_update.as_mut().unwrap();
+        update.cdn_authorization = CdnAuthorization::Basic;
+        update.username_env = Some("SIRIUS_UNUSED_USER".into());
+        assert!(basic.validate().is_err());
+        basic.cdn_credential_env = BTreeMap::from([(cdn.into(), "SIRIUS_UNUSED_CDN".into())]);
+        basic.validate().unwrap();
+        // Discovery-only Global profiles no longer need a CDN credential reference.
+        let mut discovery = cfg.clone();
+        discovery.master_update = None;
+        discovery.master_directory = None;
+        discovery.validate().unwrap();
+        // Region-mismatched CDN roots stay rejected.
+        for (other, _, other_cdn) in GLOBAL_SERVICES {
+            if other != region {
+                let mut wrong = cfg.clone();
+                wrong.default_cdn_root = other_cdn.into();
+                assert!(wrong.validate().is_err());
+            }
+        }
+        // CN stays reserved.
+        let mut cn = cfg.clone();
+        cn.region = Region::Cn;
+        assert!(cn.validate().is_err());
+    }
+    // JP Master always requires Basic with its credential reference.
+    let jp = remote_master_config_at("https://static.bang-dream-on.jp", root.path());
+    jp.validate().unwrap();
+    let parsed: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60\n",
+    )
+    .unwrap();
+    assert_eq!(parsed.cdn_authorization, CdnAuthorization::Basic);
+    let mut anonymous = jp.clone();
+    let update = anonymous.master_update.as_mut().unwrap();
+    update.cdn_authorization = CdnAuthorization::None;
+    update.username_env = None;
+    assert!(anonymous.validate().is_err());
+    anonymous.cdn_credential_env.clear();
+    assert!(anonymous.validate().is_err());
+    let mut missing = jp.clone();
+    missing.cdn_credential_env.clear();
+    assert!(missing.validate().is_err());
+    let mut missing = jp.clone();
+    missing.master_update.as_mut().unwrap().username_env = None;
+    assert!(missing.validate().is_err());
+    let mut discovery = jp.clone();
+    discovery.master_update = None;
+    discovery.cdn_credential_env.clear();
+    assert!(discovery.validate().is_err());
+}
+
+#[tokio::test]
+async fn jp_master_download_still_requires_its_credential_and_global_ignores_announced_roots() {
+    use crate::{master_update::MasterUpdater, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    // JP without the referenced CDN secret never contacts the CDN.
+    let cdn = cdn_fixture(vec![]).await;
+    let game = fixture(vec![Reply::version(), Reply::version()]).await;
+    let mut cfg = remote_master_config(&cdn, &root.path().join("jp"));
+    let reference = cfg.cdn_credential_env.values().next().unwrap().clone();
+    std::env::remove_var(&reference);
+    let c = client(&game, cfg.clone());
+    let updater = MasterUpdater::new(&cfg, c).unwrap();
+    assert!(matches!(
+        updater.update_once().await,
+        Err(crate::master_update::UpdateError::Target)
+    ));
+    assert!(cdn.received.lock().unwrap().is_empty());
+    // An anonymous JP (or CN) updater cannot be constructed, even bypassing validation.
+    let update = cfg.master_update.as_mut().unwrap();
+    update.cdn_authorization = crate::config::CdnAuthorization::None;
+    update.username_env = None;
+    for region in [Region::Jp, Region::Cn] {
+        cfg.region = region;
+        let c = client(&game, regional_config(Region::Jp));
+        assert!(MasterUpdater::new(&cfg, c).is_err());
+    }
+    // Global anonymous access follows only the configured root, never a server-announced one.
+    let cdn = cdn_fixture(vec![]).await;
+    let game = fixture(vec![global_version_reply("master-fixture", "1.0.0.104")
+        .header("x-sirius-env", "https://elsewhere.example/prod/en_x")])
+    .await;
+    let cfg = global_master_config(Region::En, &cdn.url, &root.path().join("en"));
+    let c = client(&game, cfg.clone());
+    let updater = MasterUpdater::new(&cfg, c).unwrap();
+    assert!(matches!(
+        updater.update_once().await,
+        Err(crate::master_update::UpdateError::Target)
+    ));
+    assert!(cdn.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn master_import_records_region_and_directories_never_mix_regions() {
+    use crate::{master, master_registry as registry, region::Region};
+    let (_root, input, jp_output, first) = registry_fixture();
+    assert_eq!(first.region, Region::Jp);
+    let (_, decoder, _) = master_fixture();
+    // A JP directory never accepts another region's import.
+    assert!(
+        master::import_directory_for_region(&input, &jp_output, &decoder, None, Region::Tw)
+            .is_err()
+    );
+    assert!(
+        master::import_directory_for_region(&input, &jp_output, &decoder, None, Region::Cn)
+            .is_err()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let kr = root.path().join("kr");
+    let receipt =
+        master::import_directory_for_region(&input, &kr, &decoder, Some("1.0.0.104"), Region::Kr)
+            .unwrap();
+    assert_eq!(receipt.region, Region::Kr);
+    registry::manifest(&kr, None, global_scope(Region::Kr)).unwrap();
+    let history = registry::history(&kr, global_scope(Region::Kr), 10).unwrap();
+    assert_eq!(history.entries.len(), 1);
+    assert!(registry::history(&kr, global_scope(Region::En), 10).is_err());
+    assert!(master::import_directory(&input, &kr, &decoder).is_err());
+    // Legacy JP receipts (no region field) remain JP snapshots and keep their identity.
+    let snapshot = std::fs::read_to_string(jp_output.join("CURRENT")).unwrap();
+    let path = jp_output.join(&snapshot).join("receipt.json");
+    let mut legacy: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(legacy["region"], "jp");
+    let before = registry::manifest(&jp_output, None, registry_scope()).unwrap();
+    legacy.as_object_mut().unwrap().remove("region");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let after = registry::manifest(&jp_output, None, registry_scope()).unwrap();
+    assert_eq!(before.bytes, after.bytes);
+    assert!(registry::manifest(&jp_output, None, global_scope(Region::Tw)).is_err());
+    let status: Value = serde_json::from_slice(
+        &master::read_current_in(&jp_output, None, Region::Jp)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(status["region"], "jp");
+    master::import_directory(&input, &jp_output, &decoder).unwrap();
+    for bad in [json!("cn"), json!("global"), json!(1)] {
+        legacy["region"] = bad;
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(registry::history(&jp_output, registry_scope(), 10).is_err());
+    }
+}
+
+#[test]
+fn multi_region_master_publishers_validate_with_distinct_state() {
+    use crate::deployment::DeploymentConfig;
+    let source = include_str!("../docs/examples/master-publisher.yaml");
+    for (name, value) in [
+        ("SIRIUS_JP_API_TOKEN", "publisher-public-jp"),
+        ("SIRIUS_JP_INTERNAL_TOKEN", "publisher-internal-jp"),
+        ("SIRIUS_TW_API_TOKEN", "publisher-public-tw"),
+        ("SIRIUS_TW_INTERNAL_TOKEN", "publisher-internal-tw"),
+        ("SIRIUS_EN_API_TOKEN", "publisher-public-en"),
+        ("SIRIUS_EN_INTERNAL_TOKEN", "publisher-internal-en"),
+        ("SIRIUS_KR_API_TOKEN", "publisher-public-kr"),
+        ("SIRIUS_KR_INTERNAL_TOKEN", "publisher-internal-kr"),
+        ("SIRIUS_JP_CDN_USERNAME", "publisher-cdn-user"),
+        ("SIRIUS_JP_CDN_CREDENTIAL", "publisher-cdn-secret"),
+        (
+            "SIRIUS_MASTER_KEY_HEX",
+            &(0..32).map(|i| format!("{i:02x}")).collect::<String>(),
+        ),
+        (
+            "SIRIUS_MASTER_IV_HEX",
+            &(32..64).map(|i| format!("{i:02x}")).collect::<String>(),
+        ),
+        (
+            "SIRIUS_MASTER_GIT_JP_AUTHORIZATION",
+            "Authorization: Bearer git-jp",
+        ),
+        (
+            "SIRIUS_MASTER_GIT_HK_AUTHORIZATION",
+            "Authorization: Bearer git-hk",
+        ),
+        (
+            "SIRIUS_MASTER_GIT_EN_AUTHORIZATION",
+            "Authorization: Bearer git-en",
+        ),
+        (
+            "SIRIUS_MASTER_GIT_KR_AUTHORIZATION",
+            "Authorization: Bearer git-kr",
+        ),
+    ] {
+        std::env::set_var(name, value);
+    }
+    let deployment = DeploymentConfig::parse(source).unwrap();
+    let DeploymentConfig::Multi(multi) = &deployment else {
+        panic!("publisher example must be multi-region");
+    };
+    for (name, c) in &multi.regions {
+        let update = c.master_update.as_ref().unwrap();
+        let git = c.master_git.as_ref().unwrap();
+        assert_eq!(git.layout, crate::master_git::Layout::IndentedRoot);
+        assert_eq!(git.branch, "main");
+        let repository = if name == "tw" { "hk" } else { name.as_str() };
+        assert_eq!(
+            git.remote.as_ref().unwrap().url,
+            format!("https://github.com/Srirus-Project/sirius-{repository}-master.git")
+        );
+        assert_eq!(
+            update.cdn_authorization == crate::config::CdnAuthorization::Basic,
+            name == "jp"
+        );
+    }
+    let prepared = deployment.prepare().unwrap();
+    assert_eq!(prepared.updaters.len(), 4);
+    assert_eq!(prepared.git_publishers.len(), 4);
+    // Shared directories, remotes or Git credentials across regions are rejected.
+    let mutate = |edit: &dyn Fn(&mut crate::deployment::MultiConfig)| {
+        let mut changed = multi.as_ref().clone();
+        edit(&mut changed);
+        DeploymentConfig::Multi(Box::new(changed))
+    };
+    let shared_directory = mutate(&|m| {
+        let jp = m.regions["jp"].master_directory.clone();
+        m.regions.get_mut("kr").unwrap().master_directory = jp;
+    });
+    assert!(shared_directory.validate().is_err());
+    let shared_state = mutate(&|m| {
+        let state = m.regions["en"]
+            .master_git
+            .as_ref()
+            .unwrap()
+            .state_directory
+            .clone();
+        m.regions
+            .get_mut("tw")
+            .unwrap()
+            .master_git
+            .as_mut()
+            .unwrap()
+            .state_directory = state;
+    });
+    assert!(shared_state.validate().is_err());
+    let state_is_snapshot = mutate(&|m| {
+        let directory = m.regions["en"].master_directory.clone().unwrap();
+        m.regions
+            .get_mut("kr")
+            .unwrap()
+            .master_git
+            .as_mut()
+            .unwrap()
+            .state_directory = directory;
+    });
+    assert!(state_is_snapshot.validate().is_err());
+    let shared_remote = mutate(&|m| {
+        let remote = m.regions["jp"].master_git.as_ref().unwrap().remote.clone();
+        m.regions
+            .get_mut("en")
+            .unwrap()
+            .master_git
+            .as_mut()
+            .unwrap()
+            .remote = remote;
+    });
+    assert!(shared_remote.validate().is_err());
+    let shared_token = mutate(&|m| {
+        m.regions
+            .get_mut("kr")
+            .unwrap()
+            .master_git
+            .as_mut()
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .authorization_env = Some("SIRIUS_MASTER_GIT_EN_AUTHORIZATION".into());
+    });
+    shared_token.validate().unwrap();
+    assert!(shared_token.prepare().is_err());
+    let anonymous_jp = mutate(&|m| {
+        let jp = m.regions.get_mut("jp").unwrap();
+        let update = jp.master_update.as_mut().unwrap();
+        update.cdn_authorization = crate::config::CdnAuthorization::None;
+        update.username_env = None;
+        jp.cdn_credential_env.clear();
+    });
+    assert!(anonymous_jp.validate().is_err());
 }

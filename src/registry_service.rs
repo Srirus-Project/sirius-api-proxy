@@ -53,7 +53,7 @@ impl Config {
         yaml_serde::from_slice(&bytes).map_err(|_| invalid())
     }
     pub fn prepare(&self) -> Result<Prepared, AppError> {
-        if self.scope.region != crate::region::Region::Jp
+        if !self.scope.region.master_supported()
             || self.scope.environment.is_empty()
             || self.scope.environment.len() > 256
             || !self
@@ -214,11 +214,11 @@ impl Config {
             ))
             .with_state(state.clone());
         let prefix = if self.regional_paths {
-            "/api/v1/jp/master-data"
+            format!("/api/v1/{}/master-data", self.scope.region.name())
         } else {
-            "/api/v1/master-data"
+            "/api/v1/master-data".into()
         };
-        let mut router = Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-master-registry","version":env!("CARGO_PKG_VERSION")}))})).nest(prefix,routes);
+        let mut router = Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-master-registry","version":env!("CARGO_PKG_VERSION")}))})).nest(&prefix,routes);
         if let Some(token) = internal_token {
             let internal = Router::new()
                 .route("/master-data/updater", get(owner_status))
@@ -234,14 +234,12 @@ impl Config {
                     crate::api::authorize,
                 ))
                 .with_state(state);
-            router = router.nest(
-                if self.regional_paths {
-                    "/internal/v1/jp"
-                } else {
-                    "/internal/v1"
-                },
-                internal,
-            );
+            let internal_prefix = if self.regional_paths {
+                format!("/internal/v1/{}", self.scope.region.name())
+            } else {
+                "/internal/v1".into()
+            };
+            router = router.nest(&internal_prefix, internal);
         }
         if let Some(log) = &self.access_log {
             router = crate::access_log::AccessLog::new(log.clone())
@@ -316,7 +314,7 @@ impl Service {
                 let scope = self.scope.clone();
                 tokio::task::spawn_blocking(move || match (selection, table) {
                     (Selection::Snapshot(id), Some((name, hash))) => {
-                        registry::table(&root, &id, &name, &hash)
+                        registry::table(&root, scope.region, &id, &name, &hash)
                     }
                     (Selection::Snapshot(id), None) => registry::manifest(&root, Some(&id), scope),
                     (Selection::Hash(hash), None) => {

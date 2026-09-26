@@ -1,4 +1,6 @@
-# JSON is valid YAML. Replace the CDN placeholder with the selected server-list base URL.
+# JSON is valid YAML. default_cdn_root is the first CDN line of the Korea server-list entry.
+# Optional Master pipeline (docs/REGIONS.md#master-data): remove the leading "# " from the
+# commented lines to download Master data without CDN authorization and publish it to Git.
 {
   "region": "kr",
   "platform": "Android",
@@ -10,8 +12,10 @@
   "protocol_directory": "protocol/global/1.0.1",
   "api_token_env": "SIRIUS_KR_API_TOKEN",
   "internal_token_env": "SIRIUS_KR_INTERNAL_TOKEN",
-  "default_cdn_root": "https://cdn.example.invalid/prod/kr_REPLACE_FROM_SERVER_LIST",
-  "cdn_credential_env": {
-    "https://cdn.example.invalid/prod/kr_REPLACE_FROM_SERVER_LIST": "SIRIUS_KR_CDN_CREDENTIAL"
-  }
+  "default_cdn_root": "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52",
+  # "master_directory": "data/kr/master",
+  # "master_update": {"cdn_authorization": "none", "key_hex_env": "SIRIUS_MASTER_KEY_HEX", "iv_hex_env": "SIRIUS_MASTER_IV_HEX", "interval_seconds": 300},
+  # "master_git": {"state_directory": "data/kr/master-git", "layout": "indented_root", "branch": "main",
+  #   "remote": {"url": "https://github.com/Srirus-Project/sirius-kr-master.git", "authorization_env": "SIRIUS_MASTER_GIT_KR_AUTHORIZATION"}},
+  "cdn_credential_env": {}
 }

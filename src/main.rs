@@ -225,19 +225,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if !args.is_empty() && args != ["master-update"] && args != ["master-sync"] {
-        let resource_version = match args.len() {
-            3 => None,
-            5 if args[3] == "--resource-version" => Some(args[4].as_str()),
-            _ => None,
-        };
-        if !(args.len() == 3 || resource_version.is_some()) || args[0] != "master-import" {
-            return Err(
-                "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY [--resource-version VERSION] | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
-            );
+        const USAGE: &str = "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY [--resource-version VERSION] [--region jp|tw|en|kr] | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]";
+        if args.len() < 3 || args[0] != "master-import" || args.len().is_multiple_of(2) {
+            return Err(USAGE.into());
         }
-        use sirius_api_proxy::master::{
-            import_directory_with_resource_version, key_from_hex, MasterDecoder,
+        let mut resource_version = None;
+        let mut region = None;
+        for pair in args[3..].chunks(2) {
+            let slot = match pair[0].as_str() {
+                "--resource-version" => &mut resource_version,
+                "--region" => &mut region,
+                _ => return Err(USAGE.into()),
+            };
+            if slot.replace(pair[1].as_str()).is_some() {
+                return Err(USAGE.into());
+            }
+        }
+        // Without --region the import is recorded as JP, as before 1.2.1.
+        let region = match region {
+            None => sirius_api_proxy::region::Region::Jp,
+            Some(name) => yaml_serde::from_str::<sirius_api_proxy::region::Region>(name)
+                .ok()
+                .filter(|r| r.master_supported() && r.name() == name)
+                .ok_or("--region must be jp, tw, en or kr")?,
         };
+        use sirius_api_proxy::master::{import_directory_for_region, key_from_hex, MasterDecoder};
         let key = key_from_hex(
             &std::env::var("SIRIUS_MASTER_KEY_HEX")
                 .map_err(|_| "SIRIUS_MASTER_KEY_HEX is missing")?,
@@ -246,11 +258,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &std::env::var("SIRIUS_MASTER_IV_HEX")
                 .map_err(|_| "SIRIUS_MASTER_IV_HEX is missing")?,
         )?;
-        let receipt = import_directory_with_resource_version(
+        let receipt = import_directory_for_region(
             std::path::Path::new(&args[1]),
             std::path::Path::new(&args[2]),
             &MasterDecoder::new(&key, iv),
             resource_version,
+            region,
         )
         .map_err(|error| error.to_string())?;
         println!("{}", serde_json::to_string(&receipt)?);

@@ -21,6 +21,8 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 # Enable only when CDN username/password and Master key/IV are configured.
 # Runs once on startup, then waits this interval after each completed attempt.
 # master_update:
+#   # basic (default; required for JP) or none (TW/EN/KR only, no CDN credential for the root).
+#   cdn_authorization: basic
 #   username_env: SIRIUS_CDN_USERNAME
 #   key_hex_env: SIRIUS_MASTER_KEY_HEX
 #   iv_hex_env: SIRIUS_MASTER_IV_HEX
@@ -124,7 +126,7 @@ response_cache:
 #       priority: 10
 #       regional_paths: true
 
-# Optional Master owner notifications. Requires master_directory; JP only.
+# Optional Master owner notifications. Requires master_directory; JP, TW, EN or KR.
 # Each token authorizes the remote consumer's internal endpoint and must be distinct
 # from this deployment's local credentials. See docs/MASTER_REGISTRY.md.
 # master_notify:
@@ -137,7 +139,7 @@ response_cache:
 #       regional_paths: true
 #       allow_http: false
 
-# Optional JP Master Git publication (Unix or Windows; requires master_directory).
+# Optional Master Git publication (JP, TW, EN or KR; Unix or Windows; requires master_directory).
 # Separate managed state, never a source checkout. No remote means local commits only.
 # master_git:
 #   state_directory: ./data/master-git

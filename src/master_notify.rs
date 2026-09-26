@@ -30,7 +30,7 @@ impl Target {
         allow_http: bool,
         timeout_ms: u64,
     ) -> Result<Self, Error> {
-        if scope.region != crate::region::Region::Jp || !(100..=30_000).contains(&timeout_ms) {
+        if !scope.region.master_supported() || !(100..=30_000).contains(&timeout_ms) {
             return Err(Error::Config);
         }
         // Use the same strict origin/token rules as the peer transport.
@@ -148,7 +148,7 @@ pub struct TargetConfig {
 }
 impl Config {
     pub fn validate(&self, config: &crate::config::Config) -> Result<(), crate::error::AppError> {
-        if config.region != crate::region::Region::Jp
+        if !config.region.master_supported()
             || config
                 .master_directory
                 .as_ref()
@@ -160,7 +160,7 @@ impl Config {
     }
     /// Checks independent of the service assembly that owns the published state.
     pub(crate) fn validate_policy(&self, scope: &Scope) -> Result<(), crate::error::AppError> {
-        if scope.region != crate::region::Region::Jp
+        if !scope.region.master_supported()
             || self.targets.is_empty()
             || self.targets.len() > 16
             || !(10..=3600).contains(&self.interval_seconds)
@@ -375,11 +375,8 @@ pub(crate) fn protected_tokens(configs: &[&crate::config::Config]) -> Vec<String
         );
         names.extend(c.upstream.proxy_authorization_env.iter());
         if let Some(update) = &c.master_update {
-            names.extend([
-                &update.username_env,
-                &update.key_hex_env,
-                &update.iv_hex_env,
-            ]);
+            names.extend(update.username_env.iter());
+            names.extend([&update.key_hex_env, &update.iv_hex_env]);
             names.extend(update.network.proxy_authorization_env.iter());
         }
         protected.extend(names.into_iter().filter_map(|n| std::env::var(n).ok()));

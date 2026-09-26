@@ -135,7 +135,7 @@ impl Syncer {
         game: Option<Arc<GameClient>>,
     ) -> Result<Arc<Self>, AppError> {
         policy.validate()?;
-        if scope.region != crate::region::Region::Jp
+        if !scope.region.master_supported()
             || scope.environment.is_empty()
             || scope.environment.len() > 256
             || !scope
@@ -242,6 +242,7 @@ impl Syncer {
         let target = self.manifest().await?;
         let output = self.output.clone();
         let scope = self.scope.clone();
+        let scope_region = scope.region;
         let target_hash = target.content_sha256.clone();
         let target_resource = target.resource_version.clone();
         let (writer, current, unchanged) = tokio::task::spawn_blocking(move || {
@@ -258,6 +259,7 @@ impl Syncer {
                     && current.files.iter().all(|f| {
                         master_registry::table(
                             &output,
+                            scope_region,
                             &current.snapshot,
                             f.name.trim_end_matches(".json"),
                             &f.sha256,
@@ -283,10 +285,12 @@ impl Syncer {
                 if current.files.iter().any(|old| old == file) {
                     let output = self.output.clone();
                     let snapshot = current.snapshot.clone();
+                    let region = self.scope.region;
                     let file = file.clone();
                     tokio::task::spawn_blocking(move || {
                         master_registry::table(
                             &output,
+                            region,
                             &snapshot,
                             file.name.trim_end_matches(".json"),
                             &file.sha256,

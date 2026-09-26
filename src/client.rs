@@ -320,21 +320,41 @@ impl GameClient {
             .as_ref()
             .filter(|(v, _)| crate::master::safe_version(v))
             .ok_or(AppError::MasterUnavailable)?;
-        if state.observation.grpc_status != Some(0)
-            || state.observation.maintenance
-            || !state.credential_valid
-        {
+        if state.observation.grpc_status != Some(0) || state.observation.maintenance {
             return Err(AppError::MasterUnavailable);
         }
-        let password = self
-            .cdn_secrets
-            .get(&state.cdn_root)
-            .ok_or(AppError::MasterUnavailable)?;
+        let anonymous = self
+            .config
+            .master_update
+            .as_ref()
+            .is_some_and(|u| u.cdn_authorization == crate::config::CdnAuthorization::None);
+        let password = if anonymous {
+            // Anonymous access applies only to the configured Global root without a
+            // credential reference; a server-announced different root is never followed.
+            if !self.config.region.master_supported()
+                || self.config.region.family() != "global"
+                || state.cdn_root != self.config.default_cdn_root
+                || self.config.cdn_credential_env.contains_key(&state.cdn_root)
+            {
+                return Err(AppError::MasterUnavailable);
+            }
+            None
+        } else {
+            if !state.credential_valid {
+                return Err(AppError::MasterUnavailable);
+            }
+            Some(
+                self.cdn_secrets
+                    .get(&state.cdn_root)
+                    .ok_or(AppError::MasterUnavailable)?
+                    .clone(),
+            )
+        };
         Ok(crate::master_update::MasterTarget {
             version: version.clone(),
             resource_version: resource_version.clone(),
             root: state.cdn_root.clone(),
-            password: password.clone(),
+            password,
         })
     }
     pub async fn refresh_resource_snapshot(self: &Arc<Self>) -> Result<ResourceSnapshot, AppError> {

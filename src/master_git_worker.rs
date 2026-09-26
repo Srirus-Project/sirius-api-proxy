@@ -43,7 +43,7 @@ impl Config {
             .validate()
             .map_err(|_| AppError::Config("invalid Master Git branch"))?;
         if !cfg!(any(unix, windows))
-            || game.region != crate::region::Region::Jp
+            || !game.region.master_supported()
             || self.state_directory.as_os_str().is_empty()
             || game
                 .master_directory

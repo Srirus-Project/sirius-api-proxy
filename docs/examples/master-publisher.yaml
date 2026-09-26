@@ -1,0 +1,118 @@
+# Multi-region Master publisher: every operational region (JP, TW, EN, KR) downloads its own
+# Master data from its own CDN and publishes it to its own Git repository in the
+# indented_root layout (re-indented tables at the root plus version.json).
+# Every *_env value names an environment variable; no secret is stored in this file.
+# Each region needs distinct master_directory, master_git.state_directory, remote and
+# Git token. See docs/MASTER_REGISTRY.md and docs/REGIONS.md.
+listen: 127.0.0.1:9999
+regions:
+  jp:
+    region: "jp"
+    platform: "iOS"
+    environment: "release"
+    endpoint: "https://api.bang-dream-on.jp"
+    client_version: "1.0.3"
+    protocol_directory: "protocol/sirius/1.0.3"
+    api_token_env: "SIRIUS_JP_API_TOKEN"
+    internal_token_env: "SIRIUS_JP_INTERNAL_TOKEN"
+    master_directory: "data/jp/master"
+    # JP Master CDN requires HTTP Basic: username plus the credential referenced below.
+    master_update:
+      cdn_authorization: "basic"
+      username_env: "SIRIUS_JP_CDN_USERNAME"
+      key_hex_env: "SIRIUS_MASTER_KEY_HEX"
+      iv_hex_env: "SIRIUS_MASTER_IV_HEX"
+      interval_seconds: 300
+    master_git:
+      state_directory: "data/jp/master-git"
+      layout: "indented_root"
+      branch: "main"
+      commit:
+        author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
+      remote:
+        url: "https://github.com/Srirus-Project/sirius-jp-master.git"
+        authorization_env: "SIRIUS_MASTER_GIT_JP_AUTHORIZATION"
+    default_cdn_root: "https://static.bang-dream-on.jp"
+    cdn_credential_env:
+      "https://static.bang-dream-on.jp": "SIRIUS_JP_CDN_CREDENTIAL"
+  tw:
+    # Region identifier stays tw; its publication repository is sirius-hk-master.
+    region: "tw"
+    platform: "Android"
+    environment: "release"
+    endpoint: "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com"
+    client_version: "1.0.1"
+    protocol_directory: "protocol/global/1.0.1"
+    api_token_env: "SIRIUS_TW_API_TOKEN"
+    internal_token_env: "SIRIUS_TW_INTERNAL_TOKEN"
+    master_directory: "data/tw/master"
+    # Global Master CDNs do not require authentication: no Authorization header is sent.
+    # Requires that cdn_credential_env has no entry for default_cdn_root.
+    master_update:
+      cdn_authorization: "none"
+      key_hex_env: "SIRIUS_MASTER_KEY_HEX"
+      iv_hex_env: "SIRIUS_MASTER_IV_HEX"
+      interval_seconds: 300
+    master_git:
+      state_directory: "data/tw/master-git"
+      layout: "indented_root"
+      branch: "main"
+      commit:
+        author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
+      remote:
+        url: "https://github.com/Srirus-Project/sirius-hk-master.git"
+        authorization_env: "SIRIUS_MASTER_GIT_HK_AUTHORIZATION"
+    default_cdn_root: "https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10"
+    cdn_credential_env: {}
+  en:
+    region: "en"
+    platform: "Android"
+    environment: "release"
+    endpoint: "https://l14-prod-va-all-gs-sirius.bilibiligame.net"
+    client_version: "1.0.1"
+    protocol_directory: "protocol/global/1.0.1"
+    api_token_env: "SIRIUS_EN_API_TOKEN"
+    internal_token_env: "SIRIUS_EN_INTERNAL_TOKEN"
+    master_directory: "data/en/master"
+    master_update:
+      cdn_authorization: "none"
+      key_hex_env: "SIRIUS_MASTER_KEY_HEX"
+      iv_hex_env: "SIRIUS_MASTER_IV_HEX"
+      interval_seconds: 300
+    master_git:
+      state_directory: "data/en/master-git"
+      layout: "indented_root"
+      branch: "main"
+      commit:
+        author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
+      remote:
+        url: "https://github.com/Srirus-Project/sirius-en-master.git"
+        authorization_env: "SIRIUS_MASTER_GIT_EN_AUTHORIZATION"
+    default_cdn_root: "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0"
+    cdn_credential_env: {}
+  kr:
+    region: "kr"
+    platform: "Android"
+    environment: "release"
+    endpoint: "https://l14-prod-kr-all-gs-sirius.bilibiligame.net"
+    client_version: "1.0.1"
+    protocol_directory: "protocol/global/1.0.1"
+    api_token_env: "SIRIUS_KR_API_TOKEN"
+    internal_token_env: "SIRIUS_KR_INTERNAL_TOKEN"
+    master_directory: "data/kr/master"
+    master_update:
+      cdn_authorization: "none"
+      key_hex_env: "SIRIUS_MASTER_KEY_HEX"
+      iv_hex_env: "SIRIUS_MASTER_IV_HEX"
+      interval_seconds: 300
+    master_git:
+      state_directory: "data/kr/master-git"
+      layout: "indented_root"
+      branch: "main"
+      commit:
+        author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
+      remote:
+        url: "https://github.com/Srirus-Project/sirius-kr-master.git"
+        authorization_env: "SIRIUS_MASTER_GIT_KR_AUTHORIZATION"
+    default_cdn_root: "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52"
+    cdn_credential_env: {}

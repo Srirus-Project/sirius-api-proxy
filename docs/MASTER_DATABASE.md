@@ -10,8 +10,9 @@ export SIRIUS_MASTER_DATABASE_PASSWORD='replace-with-a-dedicated-password'
 sirius-api-proxy master-db-import docs/examples/master-database.yaml
 ```
 
-Set `source`, scope and database connection fields in a private copy of the example. JP is
-the only verified Master format; the source must pass existing manifest/table verification.
+Set `source`, scope and database connection fields in a private copy of the example. JP, TW,
+EN and KR share the verified Master format; the source must pass existing manifest/table
+verification and be recorded for the scope's region.
 The configured scope must match the source deployment's region/environment/platform.
 
 Transport defaults to TLS with CA and hostname verification, using the bundled WebPKI trust roots
@@ -62,8 +63,8 @@ cannot represent causes transaction rollback even though exact JSON bytes are al
 
 ## Background publication
 
-Configure `master_database` on the JP single-region configuration or JP profile of a multi-region
-deployment. `master_directory` must be set. The connection fields match the CLI example:
+Configure `master_database` on a JP, TW, EN or KR single-region configuration or profile of a
+multi-region deployment. `master_directory` must be set. The connection fields match the CLI example:
 
 ```yaml
 master_directory: ./master
@@ -92,8 +93,8 @@ passwords or filesystem paths. Last-success status is process-local and rebuilt 
 
 Use a dedicated database password distinct from API, internal, game, CDN, peer, updater,
 notification and Git credentials in every deployment profile. Profiles may share database
-credentials deliberately; rows remain scoped by region/environment/platform. Global Master
-publication remains unsupported. Other service functions do not require the database to be up.
+credentials deliberately; rows remain scoped by region/environment/platform. CN is
+rejected. Other service functions do not require the database to be up.
 
 A standalone registry service remains separate pending work.
 Only PostgreSQL is implemented; no database fallback occurs.

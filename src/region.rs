@@ -64,6 +64,11 @@ impl Region {
         };
         expected.is_none_or(|region| region == self)
     }
+    /// Regions whose Master pipeline (download, storage, registry, sync, notifications, Git
+    /// and database publication) is verified. CN is reserved and never operational.
+    pub fn master_supported(self) -> bool {
+        !matches!(self, Self::Cn)
+    }
     pub fn default_platform(self) -> Platform {
         if self == Self::Jp {
             Platform::Ios

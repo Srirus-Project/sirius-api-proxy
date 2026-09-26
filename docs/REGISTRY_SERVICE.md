@@ -7,9 +7,10 @@ background game updater or runtime Protobuf bundle. An optional owner worker fet
 `protocol/`. It shares the normal binary's TLS listener, application/access logging and
 SIGINT/SIGTERM shutdown. Configuration is bounded to 64 KiB and rejects unknown fields.
 
-A process serves one explicit JP/environment/platform scope using either immutable local
-file snapshots or the PostgreSQL mirror. Global Master formats, including reserved CN,
-are rejected before network activity. `regional_paths: true` inserts `/jp` after `/api/v1`;
+A process serves one explicit region/environment/platform scope (`jp`, `tw`, `en` or `kr`) using
+either immutable local file snapshots or the PostgreSQL mirror. Reserved CN is rejected before
+network activity. File snapshots recorded for another region are not served. `regional_paths:
+true` inserts the scope's region after `/api/v1` and `/internal/v1` (for example `/api/v1/tw`);
 there are no implicit aliases. Use separate instances/listeners for different scopes.
 
 The file backend observes CURRENT on each request. The PostgreSQL backend reads committed
@@ -119,7 +120,7 @@ must also differ from all three. Source transport uses verified HTTPS, no ambien
 or hidden retries; explicit HTTP is limited to the existing loopback-only testing policy. No game
 account, game server access or runtime proto bundle is needed. Restart to rotate configuration/secrets.
 
-| Internal route under `/internal/v1` (or `/internal/v1/jp`) | Behavior |
+| Internal route under `/internal/v1` (or `/internal/v1/{region}`) | Behavior |
 | --- | --- |
 | `GET /master-data/updater` | Pending/running/ready/failed/stopped and process-local last success |
 | `POST /master-data/refresh` | Queue a coalesced source reconciliation; return 202 |
@@ -204,7 +205,7 @@ Consumers must keep periodic polling. Transport uses verified HTTPS, no ambient 
 or hidden retries, and bounded replies; `allow_http` is an explicit testing opt-in.
 
 Notification tokens must differ from the registry read token, internal token, source token and
-database password. With an owner, `GET /internal/v1[/jp]/master-data/notifications` (internal token)
+database password. With an owner, `GET /internal/v1[/{region}]/master-data/notifications` (internal token)
 reports `pending`, `ready`, `retrying`, `unavailable` or `stopped`, the served content hash and each
 target's name and accepted hash, without origins, credentials or paths. Shutdown cancels an
 in-flight delivery.

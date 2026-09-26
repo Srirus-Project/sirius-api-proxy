@@ -54,7 +54,7 @@ impl PublishedManifest {
     pub fn validate(&self, scope: &Scope) -> Result<(), MasterError> {
         if self.schema_version != 1
             || &self.scope != scope
-            || scope.region != Region::Jp
+            || !scope.region.master_supported()
             || !self.snapshot.starts_with("master-")
             || !master::safe_component(&self.snapshot)
             || self.version != self.source_manifest.version
@@ -171,10 +171,21 @@ fn snapshot_directory(root: &Path, snapshot: &str) -> Result<PathBuf, MasterErro
     }
     Ok(path)
 }
-fn source(directory: &Path) -> Result<Manifest, MasterError> {
-    source_with_provenance(directory).map(|(source, _)| source)
+fn source(directory: &Path, region: Region) -> Result<Manifest, MasterError> {
+    let (source, _, recorded) = source_with_provenance(directory)?;
+    if recorded != region {
+        return Err(MasterError::Format);
+    }
+    Ok(source)
 }
-fn source_with_provenance(directory: &Path) -> Result<(Manifest, Option<String>), MasterError> {
+/// Region recorded by a committed snapshot (legacy receipts without one are JP).
+pub(crate) fn snapshot_region(root: &Path, snapshot: &str) -> Result<Region, MasterError> {
+    let directory = snapshot_directory(root, snapshot)?;
+    source_with_provenance(&directory).map(|(_, _, region)| region)
+}
+fn source_with_provenance(
+    directory: &Path,
+) -> Result<(Manifest, Option<String>, Region), MasterError> {
     let source = Manifest::parse(&regular(
         &directory.join("MasterManifest.json"),
         master::MAX_MANIFEST,
@@ -193,7 +204,8 @@ fn source_with_provenance(directory: &Path) -> Result<(Manifest, Option<String>)
         return Err(MasterError::Format);
     }
     let resource_version = master::recorded_resource_version(&receipt)?;
-    Ok((source, resource_version))
+    let region = master::recorded_region(&receipt)?;
+    Ok((source, resource_version, region))
 }
 fn inventory(directory: &Path, source: &Manifest) -> Result<Inventory, MasterError> {
     let path = directory.join("tables.json");
@@ -239,7 +251,7 @@ pub fn manifest(
     snapshot: Option<&str>,
     scope: Scope,
 ) -> Result<Document, MasterError> {
-    if scope.region != Region::Jp
+    if !scope.region.master_supported()
         || scope.environment.is_empty()
         || scope.environment.len() > 256
         || !scope
@@ -254,7 +266,11 @@ pub fn manifest(
         None => current_snapshot(root)?,
     };
     let directory = snapshot_directory(root, &snapshot)?;
-    let (mut source, resource_version) = source_with_provenance(&directory)?;
+    let (mut source, resource_version, region) = source_with_provenance(&directory)?;
+    // Content identity is scoped: a snapshot is served only under the region that made it.
+    if region != scope.region {
+        return Err(MasterError::Format);
+    }
     source.files.sort_by(|a, b| a.name.cmp(&b.name));
     let inventory = inventory(&directory, &source)?;
     let content = content_hash(&scope, &source, &inventory)?;
@@ -277,6 +293,7 @@ pub fn manifest(
 }
 pub fn table(
     root: &Path,
+    region: Region,
     snapshot: &str,
     table: &str,
     expected_hash: &str,
@@ -285,7 +302,7 @@ pub fn table(
         return Err(MasterError::NotFound);
     }
     let directory = snapshot_directory(root, snapshot)?;
-    let source = source(&directory)?;
+    let source = source(&directory, region)?;
     if !source
         .files
         .iter()
@@ -352,7 +369,7 @@ pub(crate) fn predecessor(root: &Path) -> Result<Option<String>, MasterError> {
     };
     let snapshot = String::from_utf8(pointer).map_err(|_| MasterError::Format)?;
     let directory = snapshot_directory(root, &snapshot)?;
-    source(&directory)?;
+    source_with_provenance(&directory)?;
     Ok(Some(snapshot))
 }
 

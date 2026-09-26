@@ -2,8 +2,8 @@
 
 Use `SIRIUS_CONFIG_PATH=sirius-multi-region-config.yaml` with a copy of
 `sirius-multi-region-config.example.yaml`. The example contains JP, TW, EN and KR;
-remove regions you do not operate. Replace Global CDN placeholders with verified
-server-list roots and supply the corresponding environment secrets.
+remove regions you do not operate. Global CDN roots are the first line of each region's
+verified server list; supply the corresponding environment secrets.
 
 The top-level `listen` binds one HTTP listener, or HTTPS when [top-level TLS](LISTENER_TLS.md) is configured. `regions` maps region names to the
 same client settings used by a single-region file, excluding `listen`, `tls` and `access_log`. Each map
@@ -26,8 +26,9 @@ Health is unauthenticated process liveness, not proof that every game server is 
 
 Each region owns its client, protocol generation, observations, snapshot, game account
 and session lock. Protocol reload affects only the selected region. Master workers
-are created per supported region and share graceful service shutdown; Global Master
-storage remains rejected until its contracts are verified. Configure game credentials
+are created per region (JP, TW, EN, KR) and share graceful service shutdown. Each region needs
+distinct Master directories, Git state directories, Git remotes and Git tokens; see
+[the publisher example](examples/master-publisher.yaml). Configure game credentials
 only for their owning region. Never copy JP credentials into Global settings.
 
 Each route uses that region's API or internal token. Use distinct tokens across regions

@@ -15,6 +15,28 @@
   `asset_version_unavailable`, leaving refs unchanged.
 - Upgrade note: consumers reject unknown manifest fields, so upgrade consumers and registries
   before owners that record provenance.
+- The Master pipeline is enabled for TW, EN and KR: `master_directory`, `master_update`,
+  `master-import`, registry routes, `master_sync`, `master_notify`, `master_git`,
+  `master_database` and `registry-serve`. CN stays rejected. Global downloads use the same
+  `{CdnRoot}/master/{version}/…` layout and Master key/IV as JP. The asset version comes from the
+  Global VersionResponse `resourceVersion`.
+- `master_update.cdn_authorization`: `basic` (default, required for JP) or `none`. `none` sends no
+  Authorization header. It is accepted only for TW/EN/KR, without `username_env`, and when
+  `default_cdn_root` has no credential reference. It never follows a server-announced root. Global
+  profiles no longer need a CDN credential reference. `master_update.username_env` is required
+  only for `basic`.
+- Snapshot receipts and the Master status record `region`. Receipts without one are legacy JP
+  snapshots, so JP content hashes and Git trees are unchanged. Reads, registry and history,
+  sync, Git and database publication, and new installations reject a snapshot recorded for
+  another region. `master-import ... --region tw|en|kr` records a Global import.
+- The standalone registry's `regional_paths` uses the scope's region (`/api/v1/{region}`,
+  `/internal/v1/{region}`) instead of always `/jp`. Multi-region deployments reject shared Master
+  directories, shared Git state directories and shared Git remotes across regions.
+  `GET /api/v1/regions` adds a `master_data` flag.
+- `docs/examples/{tw,en,kr}.yaml` and the multi-region example use the verified server-list CDN
+  roots instead of placeholders, and ship commented Master blocks.
+  `docs/examples/master-publisher.yaml` shows JP/TW/EN/KR `master_update` plus `indented_root`
+  Git publication.
 
 ## 1.2.0
 
