@@ -137,7 +137,7 @@ response_cache:
 #       regional_paths: true
 #       allow_http: false
 
-# Optional JP Master Git publication (Unix; requires master_directory).
+# Optional JP Master Git publication (Unix or Windows; requires master_directory).
 # Separate managed state, never a source checkout. No remote means local commits only.
 # master_git:
 #   state_directory: ./data/master-git
@@ -169,3 +169,18 @@ response_cache:
 #     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
 #     timeout_seconds: 120
 #     keep_snapshots: 20
+#     max_read_connections: 4
+
+# Optional per-client API tokens (X-Sirius-Token) with PostgreSQL users and region grants.
+# See docs/CLIENT_AUTH.md. The static API bearer keeps working.
+# client_auth:
+#   signing_key_env: SIRIUS_CLIENT_JWT_KEY
+#   cache_seconds: 60
+#   cache_entries: 10000
+#   database:
+#     host: database.example.invalid
+#     database: sirius_clients
+#     username: sirius_client_reader
+#     password_env: SIRIUS_CLIENT_DB_PASSWORD
+#     timeout_seconds: 10
+#     max_connections: 4

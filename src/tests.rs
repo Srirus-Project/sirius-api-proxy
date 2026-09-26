@@ -11768,6 +11768,12 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
             DeploymentConfig::Multi(_) => panic!("{region} example must be single-region"),
         }
     }
+    let single = include_str!("../sirius-api-config.example.yaml");
+    for block in ["master_database:", "client_auth:"] {
+        let uncommented = uncomment_block(single, block);
+        assert!(uncommented.contains(&format!("\n{block}\n")), "{block}");
+        yaml_serde::from_str::<Config>(&uncommented).unwrap();
+    }
     let registry = include_str!("../docs/examples/master-registry.yaml");
     yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
     let notify = uncomment_block(registry, "notify:");
