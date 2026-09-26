@@ -221,3 +221,10 @@ host the exact Linux binary passed authorization and scope checks, native protoc
 live game system query, and served as the game API for the paired updater's full and
 incremental end-to-end runs. Published archives were re-downloaded, checksum-verified and
 startup-tested. Global remains limited to verified discovery/version capabilities; CN is reserved.
+
+Post-1.2.0 (1.2.1, unreleased): Master Git `indented_root` layout and configurable branch for
+public per-region Master repositories; asset-version provenance recorded with installations,
+exposed in manifests outside content identity and carried by owner-to-consumer sync. Native
+layout output is unchanged. Covered by real-Git tests (tree listing, byte-exact indentation,
+token-preservation property, dedup, table removal, missing provenance, branch/remote), updater
+and sync provenance tests; Linux and Windows CI.

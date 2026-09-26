@@ -320,6 +320,14 @@ async fn store_snapshot(
                 return Err(Error::Integrity);
             }
         }
+        // Asset-version provenance is outside content identity: identical tables may gain a
+        // recorded asset version. Keep the served manifest current without losing a known one.
+        if snapshot.manifest.resource_version.is_some()
+            && saved.resource_version != snapshot.manifest.resource_version
+        {
+            sqlx::query("UPDATE public.sirius_master_snapshots SET manifest=$3 WHERE scope=$1 AND content_hash=$2")
+                .bind(&scope).bind(hash).bind(&snapshot.manifest_bytes).execute(&mut **tx).await.map_err(|_| Error::Database)?;
+        }
     } else {
         sqlx::query("INSERT INTO public.sirius_master_snapshots(scope,content_hash,manifest,touched) VALUES($1,$2,$3,0)")
             .bind(&scope).bind(hash).bind(&snapshot.manifest_bytes).execute(&mut **tx).await.map_err(|_| Error::Database)?;

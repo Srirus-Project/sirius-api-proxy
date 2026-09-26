@@ -13,6 +13,8 @@ use tokio::sync::Mutex;
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MasterTarget {
     pub version: String,
+    /// Asset version from the same VERSION response as `version`, when the game reported one.
+    pub resource_version: Option<String>,
     pub root: String,
     pub password: String,
 }
@@ -255,12 +257,19 @@ impl MasterUpdater {
         // Installed JSON is independently usable during maintenance/download failures.
         let output = self.output.clone();
         let version = target.version.clone();
+        let resource_version = target.resource_version.clone();
         let current = tokio::task::spawn_blocking(move || -> Option<Value> {
             let current = master::read_current(&output, None).ok()?;
             if current.version != version {
                 return None;
             }
             let status: Value = serde_json::from_slice(&current.bytes).ok()?;
+            // A snapshot installed without asset-version provenance is reinstalled once the
+            // game reports one with the same master version. A recorded value is kept: it is
+            // the provenance of this Master installation, not a live asset-version mirror.
+            if resource_version.is_some() && status.get("resource_version").is_none() {
+                return None;
+            }
             // A missing/truncated table triggers a full repair instead of an unchanged result.
             for table in status["tables"].as_array()? {
                 let document = master::read_current(&output, Some(table.as_str()?)).ok()?;
@@ -302,9 +311,16 @@ impl MasterUpdater {
         }
         let decoder = self.decoder.clone();
         let output = self.output.clone();
+        let resource_version = target.resource_version.clone();
         let prepared = tokio::task::spawn_blocking(move || {
             // Keep encrypted tempdir owned by this task even if the caller times out.
-            master::prepare_directory(encrypted.path(), &output, &decoder, "remote")
+            master::prepare_directory(
+                encrypted.path(),
+                &output,
+                &decoder,
+                "remote",
+                resource_version,
+            )
         })
         .await
         .map_err(|_| UpdateError::Master)??;

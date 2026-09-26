@@ -243,6 +243,7 @@ impl Syncer {
         let output = self.output.clone();
         let scope = self.scope.clone();
         let target_hash = target.content_sha256.clone();
+        let target_resource = target.resource_version.clone();
         let (writer, current, unchanged) = tokio::task::spawn_blocking(move || {
             let current = master_registry::manifest(&output, None, scope)
                 .ok()
@@ -250,7 +251,10 @@ impl Syncer {
                     serde_json::from_slice::<PublishedManifest>(&document.bytes).ok()
                 });
             let unchanged = current.as_ref().is_some_and(|current| {
+                // Asset-version provenance is outside content identity, so compare it too:
+                // identical tables with newly recorded provenance reinstall from local reuse.
                 current.content_sha256 == target_hash
+                    && current.resource_version == target_resource
                     && current.files.iter().all(|f| {
                         master_registry::table(
                             &output,

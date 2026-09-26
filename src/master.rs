@@ -93,11 +93,15 @@ pub fn read_current(directory: &Path, table: Option<&str>) -> Result<MasterDocum
         if receipt["version"] != manifest.version || receipt["snapshot"] != snapshot {
             return Err(MasterError::Format);
         }
-        serde_json::to_vec(&serde_json::json!({
+        let mut status = serde_json::json!({
             "version":manifest.version, "snapshot":snapshot,
             "source":source,
             "tables":manifest.files.iter().map(|f|f.name.trim_end_matches(".bin")).collect::<Vec<_>>()
-        })).map_err(|_|MasterError::Format)?
+        });
+        if let Some(resource) = recorded_resource_version(&receipt)? {
+            status["resource_version"] = resource.into();
+        }
+        serde_json::to_vec(&status).map_err(|_| MasterError::Format)?
     };
     Ok(MasterDocument {
         version: manifest.version,
@@ -124,6 +128,22 @@ pub struct ImportReceipt {
     pub tables: usize,
     pub json_bytes: u64,
     pub source: &'static str,
+    /// Asset (resource) version observed in the same game VERSION response that produced
+    /// `version`, or carried from the owner manifest. Absent for legacy snapshots and imports
+    /// without an explicit value; never synthesized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_version: Option<String>,
+}
+/// Read the optional asset-version provenance of a snapshot receipt. A present value must be
+/// a safe version string; absence is the legacy state.
+pub(crate) fn recorded_resource_version(
+    receipt: &serde_json::Value,
+) -> Result<Option<String>, MasterError> {
+    match receipt.get("resource_version") {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) if safe_version(value) => Ok(Some(value.clone())),
+        Some(_) => Err(MasterError::Format),
+    }
 }
 pub fn key_from_hex(value: &str) -> Result<[u8; 32], MasterError> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -274,8 +294,24 @@ pub fn import_directory(
     output: &Path,
     decoder: &MasterDecoder,
 ) -> Result<ImportReceipt, MasterError> {
+    import_directory_with_resource_version(input, output, decoder, None)
+}
+/// Local import with an operator-supplied asset version (there is no game observation).
+pub fn import_directory_with_resource_version(
+    input: &Path,
+    output: &Path,
+    decoder: &MasterDecoder,
+    resource_version: Option<&str>,
+) -> Result<ImportReceipt, MasterError> {
     let _lock = WriterLock::acquire(output)?;
-    prepare_directory(input, output, decoder, "local-import")?.publish(output)
+    prepare_directory(
+        input,
+        output,
+        decoder,
+        "local-import",
+        resource_version.map(str::to_owned),
+    )?
+    .publish(output)
 }
 
 pub(crate) struct PreparedImport {
@@ -288,7 +324,14 @@ pub(crate) fn prepare_directory(
     output: &Path,
     decoder: &MasterDecoder,
     source: &'static str,
+    resource_version: Option<String>,
 ) -> Result<PreparedImport, MasterError> {
+    if resource_version
+        .as_deref()
+        .is_some_and(|v| !safe_version(v))
+    {
+        return Err(MasterError::Format);
+    }
     let manifest_bytes = read_bounded(&input.join("MasterManifest.json"), MAX_MANIFEST)?;
     let manifest = Manifest::parse(&manifest_bytes)?;
     fs::create_dir_all(output)?;
@@ -332,6 +375,7 @@ pub(crate) fn prepare_directory(
         tables: manifest.files.len(),
         json_bytes: total,
         source,
+        resource_version,
     };
     write_synced(
         &staging.path().join("receipt.json"),
@@ -409,6 +453,7 @@ pub(crate) fn prepare_registry(
         tables: manifest.files.len(),
         json_bytes: total,
         source: "registry",
+        resource_version: manifest.resource_version.clone(),
     };
     write_synced(
         &staging.path().join("receipt.json"),

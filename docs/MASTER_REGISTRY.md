@@ -27,12 +27,37 @@ A consumer must pin the manifest before reading files and independently verify e
 file's hash/size and the expected scope. It must never combine CURRENT-relative table reads
 into one snapshot while an owner might publish a new version.
 
+### Asset version provenance
+
+A manifest may also carry an optional `resource_version`: the asset (resource) version recorded
+when that snapshot was installed. The CDN updater takes it from the same game VERSION response
+that supplied the Master version (the response's `resourceVersion` field where the protocol has
+one; for JP, whose VersionResponse has no such field, the `x-asset-version` header of that same
+response, selected for the configured client version and platform exactly like resource
+snapshots). The final pre-publication VERSION check must report the same Master version, asset
+version and CDN credential, otherwise the update fails as changed. The value is stored in the
+snapshot's `receipt.json`, shown as `resource_version` in the local Master status, and omitted
+when absent. Legacy snapshots and plain `master-import` runs have none; `master-import IN OUT
+--resource-version VERSION` records an operator-supplied value. Nothing synthesizes it.
+
+It is installation provenance, not a live asset mirror: a later asset-only change does not
+reinstall an already-provenanced Master version. When an installed snapshot has no recorded
+value and the game reports one for the same Master version, the updater reinstalls that version
+once (a full CDN download) to record it. Owner-to-consumer sync installs the owner's value;
+a consumer whose tables are identical but whose provenance differs reinstalls from its local
+tables without downloading them. Consumers reject manifests with unknown fields, so upgrade
+consumers before owners that will publish `resource_version`.
+
 ## Identity and HTTP caching
 
 `content_sha256` is SHA-256 over compact UTF-8 JSON with recursively lexicographically sorted
 object keys and the fields `schema_version`, `scope`, `source_manifest`, `files`. Both file arrays
 are sorted by name. It includes the version through `source_manifest`; it excludes the local
-snapshot UUID. Reimporting identical data therefore retains content identity while receiving a
+snapshot UUID and the optional `resource_version`: identity names table content, and the same
+tables keep the same identity whether or not provenance was recorded (a Master version is
+installed with one asset version, so identity still distinguishes normal installations). The
+PostgreSQL mirror replaces a stored manifest whose identity matches but whose provenance differs from the newly
+recorded provenance. Reimporting identical data therefore retains content identity while receiving a
 new storage identifier. Whitespace and number spelling inside the actual table files are never
 rewritten: their hashes and byte sizes refer to the original decoded bytes. Tests include
 independently calculated Python hash/canonical-JSON vectors.
@@ -306,11 +331,13 @@ The command pins CURRENT, validates the manifest and every table's hash, size an
 stages exact plaintext bytes in temporary storage. It creates Git blobs with filters disabled
 and constructs a fresh tree, so removed tables leave the new tree without altering old commits.
 `sirius-publication.json` records the scoped source manifest and content identity without the
-node-local snapshot UUID. Identical content therefore reuses the existing commit after a
+node-local snapshot UUID or asset provenance. Identical content therefore reuses the existing commit after a
 reimport, rather than creating timestamp-only commits. No receipt, keys or CDN credentials
 are included. The reserved publication filename cannot also be a table.
 
-The branch is `master-data`, with new commits parented to the previous commit. A compare-and-swap
+The branch is `master-data` by default (`master_git.branch`), with new commits parented to the
+previous commit. This describes the default `native` layout; see
+[Indented root layout](#indented-root-layout) for the alternative. A compare-and-swap
 reference update commits the new tree; failed validation leaves the prior reference unchanged.
 A cancelled/failed command may leave unreachable Git objects, and loss of the response at the
 reference update is ambiguous: rerun the identical operation to inspect/reuse the committed tree.
@@ -330,7 +357,8 @@ before the full optional Git publication feature is complete.
 SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-push ./master-git-state https://git.example/master-data.git
 ```
 
-The command uses the same verified snapshot, scoped state lock and `master-data` branch. It
+The command uses the same verified snapshot, scoped state lock, layout and branch
+(default `master-data`) as the profile's `master_git` settings. It
 checks the remote branch before creating a new local commit. An absent remote branch can be
 created; a remote equal to or behind the local branch can be advanced. A remote ahead of or
 diverged from local history fails verification before adding a local commit. A new empty
@@ -386,6 +414,55 @@ or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must b
 Git credential: deployment preparation rejects reuse of other service credentials, including
 underlying Bearer tokens and decoded Basic passwords. No remote is contacted at preparation;
 the configured background worker performs publication after service startup.
+
+### Indented root layout
+
+`master_git.layout` selects the published tree; the CLI commands use the profile's value too.
+
+- `native` (default): exact decoded table bytes plus `sirius-publication.json`, unchanged
+  from 1.2.0.
+- `indented_root`: at the repository root, every table of the pinned verified snapshot under
+  its usual name (for example `MasterExample.json`), re-indented with two spaces and a trailing
+  newline, plus `version.json`. Nothing else is in the tree.
+
+```json
+{
+  "dataVersion": "<Master version>",
+  "assetVersion": "<recorded resource_version>"
+}
+```
+
+Re-indentation is a token-preserving pretty printer over the original bytes, not a parse and
+reserialize: object key order, duplicate keys, number spellings (`1.0`, `1e3`, `-0`), string
+escapes and non-ASCII text are copied exactly; only insignificant whitespace changes. Empty
+objects and arrays are written `{}` and `[]`. Content hashes and sizes in manifests still refer
+to the original bytes; Git holds the formatted form. Tables removed upstream disappear from the
+next tree, and identical content reuses the existing commit. Commit messages keep
+`Sirius Master <region> <version>`.
+
+If the pinned snapshot has no recorded asset version, `indented_root` publication fails with
+error code `asset_version_unavailable` before any Git command runs, leaving refs untouched. It
+is retried at the next installation wakeup or interval; no empty or placeholder value is
+written. The `native` layout does not need provenance.
+
+`master_git.branch` (default `master-data`) names the local and remote branch, for example
+`main`. It accepts slash-separated components of ASCII letters, digits, `.`, `_` and `-`; a
+component cannot be empty, start with `.` or `-`, end with `.` or `.lock`, or contain `..`,
+and `HEAD` is rejected. Changing the branch or layout of an existing state directory starts or
+continues that branch in the same managed repository; other branches are left untouched. The
+remote safety rules are unchanged: a remote branch that is ahead or diverged, including an
+initialized repository whose `main` already has a README commit, is refused. Publish to an
+empty repository or to a branch that Sirius owns.
+
+```yaml
+master_git:
+  state_directory: ./data/master-git-jp
+  layout: indented_root
+  branch: main
+  remote:
+    url: https://github.com/example/sirius-jp-master.git
+    authorization_env: SIRIUS_MASTER_GIT_AUTHORIZATION
+```
 
 ### Commit identity and signatures
 

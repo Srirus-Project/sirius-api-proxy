@@ -26,6 +26,144 @@ pub enum Error {
     Snapshot,
     #[error("Master Git publication failed")]
     Git,
+    #[error("invalid Master Git layout or branch")]
+    LayoutConfig,
+    #[error("Master snapshot has no recorded asset version")]
+    AssetVersion,
+}
+/// Repository tree layout of a publication commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layout {
+    /// Exact plaintext table bytes plus `sirius-publication.json` (1.2.0 layout).
+    #[default]
+    Native,
+    /// Every table re-indented (whitespace only) at the root plus `version.json`.
+    IndentedRoot,
+}
+pub const DEFAULT_BRANCH: &str = "master-data";
+/// Publication layout and target branch (`refs/heads/<branch>` locally and remotely).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Options {
+    pub layout: Layout,
+    pub branch: String,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            layout: Layout::Native,
+            branch: DEFAULT_BRANCH.into(),
+        }
+    }
+}
+impl Options {
+    pub fn validate(&self) -> Result<(), Error> {
+        if valid_branch(&self.branch) {
+            Ok(())
+        } else {
+            Err(Error::LayoutConfig)
+        }
+    }
+    fn reference(&self) -> String {
+        format!("refs/heads/{}", self.branch)
+    }
+}
+/// A conservative subset of Git branch names: slash-separated components of ASCII letters,
+/// digits, `.`, `_` and `-`, none empty, starting with `.`/`-` or ending with `.`/`.lock`.
+pub fn valid_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 128
+        && branch != "HEAD"
+        && branch.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with(['.', '-'])
+                && !part.ends_with('.')
+                && !part.ends_with(".lock")
+                && !part.contains("..")
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+}
+/// Re-indent JSON with two spaces and a trailing newline, changing insignificant whitespace
+/// only. Tokens (key order, duplicate keys, number spellings, string escapes) are copied from
+/// the original bytes. Input must already be valid JSON; unbalanced input returns `None`.
+pub fn reindent(input: &[u8]) -> Option<Vec<u8>> {
+    fn newline(out: &mut Vec<u8>, depth: usize) {
+        out.push(b'\n');
+        out.resize(out.len() + 2 * depth, b' ');
+    }
+    let whitespace = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+    let mut out = Vec::with_capacity(input.len() + input.len() / 2 + 1);
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(&byte) = input.get(i) {
+        match byte {
+            b if whitespace(b) => i += 1,
+            b'"' => {
+                let start = i;
+                i += 1;
+                loop {
+                    match *input.get(i)? {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+                out.extend_from_slice(&input[start..i]);
+            }
+            b'{' | b'[' => {
+                let close = if byte == b'{' { b'}' } else { b']' };
+                let mut next = i + 1;
+                while input.get(next).is_some_and(|b| whitespace(*b)) {
+                    next += 1;
+                }
+                out.push(byte);
+                if input.get(next) == Some(&close) {
+                    out.push(close);
+                    i = next + 1;
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                    i += 1;
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                newline(&mut out, depth);
+                out.push(byte);
+                i += 1;
+            }
+            b',' => {
+                out.push(b',');
+                newline(&mut out, depth);
+                i += 1;
+            }
+            b':' => {
+                out.extend_from_slice(b": ");
+                i += 1;
+            }
+            _ => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    if depth != 0 || out.is_empty() {
+        return None;
+    }
+    out.push(b'\n');
+    Some(out)
+}
+/// Root `version.json` of the indented layout.
+pub fn version_document(data_version: &str, asset_version: &str) -> Vec<u8> {
+    format!(
+        "{{\n  \"dataVersion\": {},\n  \"assetVersion\": {}\n}}\n",
+        serde_json::Value::from(data_version),
+        serde_json::Value::from(asset_version)
+    )
+    .into_bytes()
 }
 #[derive(Clone, Serialize)]
 pub struct Receipt {
@@ -157,6 +295,7 @@ struct Prepared {
     staging: tempfile::TempDir,
     manifest: PublishedManifest,
     names: Vec<String>,
+    reference: String,
 }
 /// Windows canonical paths use the `\\?\` verbatim form, which Git for Windows rejects
 /// (`cannot mkdir ...: Invalid argument`). Convert drive and UNC forms back to ordinary
@@ -188,7 +327,12 @@ fn verbatim_windows_paths_become_plain_absolute_paths() {
         );
     }
 }
-fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, Error> {
+fn prepare(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    options: &Options,
+) -> Result<Prepared, Error> {
     if let Ok(meta) = fs::symlink_metadata(destination) {
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(Error::Ownership);
@@ -243,10 +387,23 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
     let document = master_registry::manifest(source, None, scope).map_err(|_| Error::Snapshot)?;
     let manifest: PublishedManifest =
         serde_json::from_slice(&document.bytes).map_err(|_| Error::Snapshot)?;
+    // Fail before any Git command: an indented publication never carries a synthesized value.
+    let asset_version = match options.layout {
+        Layout::IndentedRoot => Some(
+            manifest
+                .resource_version
+                .clone()
+                .ok_or(Error::AssetVersion)?,
+        ),
+        Layout::Native => None,
+    };
     let staging = tempfile::tempdir().map_err(|_| Error::Snapshot)?;
     let mut names = Vec::new();
     for file in &manifest.files {
-        if file.name == "sirius-publication.json" {
+        if matches!(
+            file.name.as_str(),
+            "sirius-publication.json" | "version.json"
+        ) {
             return Err(Error::Snapshot);
         }
         let table = file.name.strip_suffix(".json").ok_or(Error::Snapshot)?;
@@ -255,15 +412,37 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
         if document.bytes.len() as u64 != file.size {
             return Err(Error::Snapshot);
         }
-        fs::write(staging.path().join(&file.name), document.bytes).map_err(|_| Error::Snapshot)?;
+        let bytes = match options.layout {
+            Layout::Native => document.bytes,
+            Layout::IndentedRoot => reindent(&document.bytes).ok_or(Error::Snapshot)?,
+        };
+        fs::write(staging.path().join(&file.name), bytes).map_err(|_| Error::Snapshot)?;
         names.push(file.name.clone());
     }
+    if let Some(asset_version) = asset_version {
+        fs::write(
+            staging.path().join("version.json"),
+            version_document(&manifest.version, &asset_version),
+        )
+        .map_err(|_| Error::Snapshot)?;
+        names.push("version.json".into());
+        names.sort();
+        return Ok(Prepared {
+            policy: CommitPolicy::default(),
+            _owner: owner,
+            directory,
+            staging,
+            manifest,
+            names,
+            reference: options.reference(),
+        });
+    }
     // Node-local UUIDs are excluded, so an identical import produces the same Git tree.
+    // Asset provenance is excluded too, keeping the 1.2.0 native tree a function of content.
     let mut metadata = serde_json::to_value(&manifest).map_err(|_| Error::Snapshot)?;
-    metadata
-        .as_object_mut()
-        .ok_or(Error::Snapshot)?
-        .remove("snapshot");
+    let object = metadata.as_object_mut().ok_or(Error::Snapshot)?;
+    object.remove("snapshot");
+    object.remove("resource_version");
     fs::write(
         staging.path().join("sirius-publication.json"),
         serde_json::to_vec_pretty(&metadata).map_err(|_| Error::Snapshot)?,
@@ -278,6 +457,7 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
         staging,
         manifest,
         names,
+        reference: options.reference(),
     })
 }
 fn oid(bytes: Vec<u8>) -> Result<String, Error> {
@@ -347,7 +527,16 @@ pub async fn commit_with_policy(
     scope: Scope,
     policy: &CommitPolicy,
 ) -> Result<Receipt, Error> {
-    commit_internal(source, destination, scope, None, policy).await
+    commit_with_options(source, destination, scope, policy, &Options::default()).await
+}
+pub async fn commit_with_options(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    policy: &CommitPolicy,
+    options: &Options,
+) -> Result<Receipt, Error> {
+    commit_internal(source, destination, scope, None, policy, options).await
 }
 pub async fn publish_with_policy(
     source: &Path,
@@ -356,8 +545,26 @@ pub async fn publish_with_policy(
     remote: &Remote,
     policy: &CommitPolicy,
 ) -> Result<Receipt, Error> {
+    publish_with_options(
+        source,
+        destination,
+        scope,
+        remote,
+        policy,
+        &Options::default(),
+    )
+    .await
+}
+pub async fn publish_with_options(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    remote: &Remote,
+    policy: &CommitPolicy,
+    options: &Options,
+) -> Result<Receipt, Error> {
     remote.validate()?;
-    commit_internal(source, destination, scope, Some(remote), policy).await
+    commit_internal(source, destination, scope, Some(remote), policy, options).await
 }
 async fn commit_internal(
     source: &Path,
@@ -365,16 +572,20 @@ async fn commit_internal(
     scope: Scope,
     remote: Option<&Remote>,
     policy: &CommitPolicy,
+    options: &Options,
 ) -> Result<Receipt, Error> {
     policy.validate()?;
+    options.validate()?;
     if !cfg!(any(unix, windows)) {
         return Err(Error::Git);
     }
     let source = source.to_owned();
     let destination = destination.to_owned();
-    let mut prepared = tokio::task::spawn_blocking(move || prepare(&source, &destination, scope))
-        .await
-        .map_err(|_| Error::Snapshot)??;
+    let owned = options.clone();
+    let mut prepared =
+        tokio::task::spawn_blocking(move || prepare(&source, &destination, scope, &owned))
+            .await
+            .map_err(|_| Error::Snapshot)??;
     prepared.policy = policy.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     command(
@@ -395,7 +606,7 @@ async fn commit_internal(
         vec![
             "symbolic-ref".into(),
             "HEAD".into(),
-            "refs/heads/master-data".into(),
+            prepared.reference.clone().into(),
         ],
         &[],
         deadline,
@@ -406,7 +617,7 @@ async fn commit_internal(
         vec![
             "for-each-ref".into(),
             "--format=%(objectname)".into(),
-            "refs/heads/master-data".into(),
+            prepared.reference.clone().into(),
         ],
         &[],
         deadline,
@@ -495,7 +706,7 @@ async fn commit_internal(
         &prepared,
         vec![
             "update-ref".into(),
-            "refs/heads/master-data".into(),
+            prepared.reference.clone().into(),
             commit.clone().into(),
             parent.unwrap_or_else(|| "0".repeat(40)).into(),
         ],
@@ -650,7 +861,7 @@ async fn remote_head(
             "ls-remote".into(),
             "--refs".into(),
             remote.url.clone().into(),
-            "refs/heads/master-data".into(),
+            prepared.reference.clone().into(),
         ],
         deadline,
     )
@@ -664,7 +875,7 @@ async fn remote_head(
         return Err(Error::Git);
     }
     let (hash, reference) = lines[0].split_once('\t').ok_or(Error::Git)?;
-    if reference != "refs/heads/master-data" {
+    if reference != prepared.reference {
         return Err(Error::Git);
     }
     Ok(Some(oid(hash.as_bytes().to_vec())?))
@@ -690,7 +901,7 @@ async fn check_remote(
             "--no-tags".into(),
             "--no-write-fetch-head".into(),
             remote.url.clone().into(),
-            "+refs/heads/master-data:refs/sirius/remote-check".into(),
+            format!("+{}:refs/sirius/remote-check", prepared.reference).into(),
         ],
         deadline,
     )
@@ -734,7 +945,7 @@ async fn finish(
                 "push".into(),
                 "--porcelain".into(),
                 remote.url.clone().into(),
-                format!("{}:refs/heads/master-data", receipt.commit).into(),
+                format!("{}:{}", receipt.commit, prepared.reference).into(),
             ],
             deadline,
         )

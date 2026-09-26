@@ -187,6 +187,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|g| g.commit.clone())
             .unwrap_or_default();
+        let options = config
+            .master_git
+            .as_ref()
+            .map(|g| g.options())
+            .unwrap_or_default();
         let receipt = if push {
             let remote = sirius_api_proxy::master_git::Remote {
                 proxy_url_env: std::env::var_os("SIRIUS_MASTER_GIT_PROXY_URL")
@@ -197,20 +202,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allow_http: false,
                 allow_file: args[2].starts_with("file://"),
             };
-            sirius_api_proxy::master_git::publish_with_policy(
+            sirius_api_proxy::master_git::publish_with_options(
                 source,
                 std::path::Path::new(&args[1]),
                 scope,
                 &remote,
                 &policy,
+                &options,
             )
             .await?
         } else {
-            sirius_api_proxy::master_git::commit_with_policy(
+            sirius_api_proxy::master_git::commit_with_options(
                 source,
                 std::path::Path::new(&args[1]),
                 scope,
                 &policy,
+                &options,
             )
             .await?
         };
@@ -218,12 +225,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if !args.is_empty() && args != ["master-update"] && args != ["master-sync"] {
-        if args.len() != 3 || args[0] != "master-import" {
+        let resource_version = match args.len() {
+            3 => None,
+            5 if args[3] == "--resource-version" => Some(args[4].as_str()),
+            _ => None,
+        };
+        if !(args.len() == 3 || resource_version.is_some()) || args[0] != "master-import" {
             return Err(
-                "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
+                "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY [--resource-version VERSION] | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]".into(),
             );
         }
-        use sirius_api_proxy::master::{import_directory, key_from_hex, MasterDecoder};
+        use sirius_api_proxy::master::{
+            import_directory_with_resource_version, key_from_hex, MasterDecoder,
+        };
         let key = key_from_hex(
             &std::env::var("SIRIUS_MASTER_KEY_HEX")
                 .map_err(|_| "SIRIUS_MASTER_KEY_HEX is missing")?,
@@ -232,10 +246,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &std::env::var("SIRIUS_MASTER_IV_HEX")
                 .map_err(|_| "SIRIUS_MASTER_IV_HEX is missing")?,
         )?;
-        let receipt = import_directory(
+        let receipt = import_directory_with_resource_version(
             std::path::Path::new(&args[1]),
             std::path::Path::new(&args[2]),
             &MasterDecoder::new(&key, iv),
+            resource_version,
         )
         .map_err(|error| error.to_string())?;
         println!("{}", serde_json::to_string(&receipt)?);

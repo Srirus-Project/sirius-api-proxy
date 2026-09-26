@@ -8439,6 +8439,8 @@ async fn master_git_worker_publishes_on_start_and_update_with_independent_notifi
     cfg.listen = Some("127.0.0.1:0".parse().unwrap());
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        layout: Default::default(),
+        branch: crate::master_git::DEFAULT_BRANCH.into(),
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
@@ -8517,6 +8519,8 @@ async fn master_git_worker_periodically_retries_rejected_push_preserving_install
     let mut cfg = config();
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        layout: Default::default(),
+        branch: crate::master_git::DEFAULT_BRANCH.into(),
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
@@ -8570,6 +8574,8 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
     let name = format!("SIRIUS_GIT_WORKER_{}", uuid::Uuid::new_v4().simple());
     cfg.master_directory = Some(source);
     cfg.master_git = Some(crate::master_git_worker::Config {
+        layout: Default::default(),
+        branch: crate::master_git::DEFAULT_BRANCH.into(),
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
@@ -8650,6 +8656,8 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
     let mut cfg = config();
     cfg.master_directory = Some(source.clone());
     cfg.master_git = Some(crate::master_git_worker::Config {
+        layout: Default::default(),
+        branch: crate::master_git::DEFAULT_BRANCH.into(),
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
@@ -12177,4 +12185,772 @@ async fn client_tokens_check_credentials_region_grants_and_cache_against_postgre
     ] {
         sqlx::query(sql).execute(&mut conn).await.unwrap();
     }
+}
+
+/// Remove insignificant whitespace (outside strings) without interpreting any token.
+fn strip_json_whitespace(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in input {
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            in_string = b == b'"';
+            out.push(b);
+        }
+    }
+    out
+}
+
+fn assert_reindent_preserves_tokens(input: &[u8]) -> Vec<u8> {
+    let output = crate::master_git::reindent(input).unwrap();
+    assert_eq!(strip_json_whitespace(&output), strip_json_whitespace(input));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::from_slice::<Value>(input).unwrap()
+    );
+    assert!(output.ends_with(b"\n") && !output.ends_with(b"\n\n"));
+    // Idempotent: formatting the formatted document changes nothing.
+    assert_eq!(crate::master_git::reindent(&output).unwrap(), output);
+    output
+}
+
+const INDENT_FIXTURE: &str = concat!(
+    "{\"b\":1,\"a\":[1.0,1e3,-0,1E+3,0.5e-7,-12.50],\"a\":\"dup\",",
+    "\"s\":\"q\\\"uote\\nline\\u00e9\\ud83d\\ude00\\\\\",\"e\":{},\"f\":[ ],",
+    "\"n\":{\"x\":[[],[{}],[1,[2,[3]]]],\"y\":null,\"z\":true},",
+    "\"u\":\"日本\", \"p\":\" a, b: {c} [d] \\t\" ,\r\n \"w\": { \"k\" : false }}"
+);
+const INDENT_EXPECTED: &str = r#"{
+  "b": 1,
+  "a": [
+    1.0,
+    1e3,
+    -0,
+    1E+3,
+    0.5e-7,
+    -12.50
+  ],
+  "a": "dup",
+  "s": "q\"uote\nline\u00e9\ud83d\ude00\\",
+  "e": {},
+  "f": [],
+  "n": {
+    "x": [
+      [],
+      [
+        {}
+      ],
+      [
+        1,
+        [
+          2,
+          [
+            3
+          ]
+        ]
+      ]
+    ],
+    "y": null,
+    "z": true
+  },
+  "u": "日本",
+  "p": " a, b: {c} [d] \t",
+  "w": {
+    "k": false
+  }
+}
+"#;
+
+#[test]
+fn master_git_reindent_changes_whitespace_only_with_exact_bytes() {
+    use crate::master_git::reindent;
+    let output = assert_reindent_preserves_tokens(INDENT_FIXTURE.as_bytes());
+    assert_eq!(std::str::from_utf8(&output).unwrap(), INDENT_EXPECTED);
+    for (input, expected) in [
+        ("[]", "[]\n"),
+        (" { } ", "{}\n"),
+        ("[\n]", "[]\n"),
+        ("-0", "-0\n"),
+        ("\"\\u0000\\/\"", "\"\\u0000\\/\"\n"),
+        ("[{\"a\":[]}]", "[\n  {\n    \"a\": []\n  }\n]\n"),
+        (
+            "{\"\\\"k\\\\\":{\"\":1}}",
+            "{\n  \"\\\"k\\\\\": {\n    \"\": 1\n  }\n}\n",
+        ),
+    ] {
+        assert_eq!(
+            std::str::from_utf8(&assert_reindent_preserves_tokens(input.as_bytes())).unwrap(),
+            expected
+        );
+    }
+    for invalid in ["", "   ", "[", "]", "{\"a\":[1}", "\"open"] {
+        assert!(reindent(invalid.as_bytes()).is_none(), "{invalid:?}");
+    }
+    assert_eq!(
+        crate::master_git::version_document("1.2.3/0123456789abcdef0123456789abcdef", "a.1_b-2"),
+        b"{\n  \"dataVersion\": \"1.2.3/0123456789abcdef0123456789abcdef\",\n  \"assetVersion\": \"a.1_b-2\"\n}\n"
+    );
+}
+
+#[test]
+fn master_git_reindent_property_preserves_every_token_of_generated_documents() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+    }
+    fn space(rng: &mut Rng, out: &mut String) {
+        for _ in 0..rng.next(3) {
+            out.push([' ', '\t', '\n', '\r'][rng.next(4) as usize]);
+        }
+    }
+    fn string(rng: &mut Rng, out: &mut String) {
+        const PARTS: [&str; 12] = [
+            "a",
+            "Z",
+            "\\\"",
+            "\\\\",
+            "\\n",
+            "\\u00e9",
+            "\\ud83d\\ude00",
+            " ",
+            "{",
+            "]",
+            ",:",
+            "日",
+        ];
+        out.push('"');
+        for _ in 0..rng.next(5) {
+            out.push_str(PARTS[rng.next(PARTS.len() as u64) as usize]);
+        }
+        out.push('"');
+    }
+    fn value(rng: &mut Rng, depth: u32, out: &mut String) {
+        const SCALARS: [&str; 12] = [
+            "0",
+            "-0",
+            "1.0",
+            "1e3",
+            "1E+3",
+            "-2.50e-7",
+            "123456789012345678901234567890",
+            "true",
+            "false",
+            "null",
+            "0.1",
+            "-1",
+        ];
+        match if depth > 4 {
+            2 + rng.next(2)
+        } else {
+            rng.next(4)
+        } {
+            0 => {
+                out.push('{');
+                let keys = rng.next(4);
+                space(rng, out);
+                for i in 0..keys {
+                    if i > 0 {
+                        out.push(',');
+                        space(rng, out);
+                    }
+                    if rng.next(3) == 0 {
+                        out.push_str("\"dup\"");
+                    } else {
+                        string(rng, out);
+                    }
+                    space(rng, out);
+                    out.push(':');
+                    space(rng, out);
+                    value(rng, depth + 1, out);
+                    space(rng, out);
+                }
+                out.push('}');
+            }
+            1 => {
+                out.push('[');
+                space(rng, out);
+                for i in 0..rng.next(4) {
+                    if i > 0 {
+                        out.push(',');
+                        space(rng, out);
+                    }
+                    value(rng, depth + 1, out);
+                    space(rng, out);
+                }
+                out.push(']');
+            }
+            2 => string(rng, out),
+            _ => out.push_str(SCALARS[rng.next(SCALARS.len() as u64) as usize]),
+        }
+    }
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..2000 {
+        let mut document = String::new();
+        space(&mut rng, &mut document);
+        value(&mut rng, 0, &mut document);
+        space(&mut rng, &mut document);
+        assert_reindent_preserves_tokens(document.as_bytes());
+        // For canonical serde_json output the result is exactly serde_json's pretty format.
+        let canonical: Value = serde_json::from_str(&document).unwrap();
+        let pretty = [
+            serde_json::to_vec_pretty(&canonical).unwrap(),
+            b"\n".to_vec(),
+        ]
+        .concat();
+        assert_eq!(
+            crate::master_git::reindent(&serde_json::to_vec(&canonical).unwrap()).unwrap(),
+            pretty
+        );
+    }
+}
+
+/// Install a verified snapshot from plaintext tables (the owner/consumer install path).
+fn install_plain_master(
+    output: &std::path::Path,
+    version: &str,
+    resource_version: Option<&str>,
+    tables: &[(&str, &[u8])],
+) -> crate::master::ImportReceipt {
+    use crate::master_registry as registry;
+    let mut tables = tables.to_vec();
+    tables.sort_by_key(|(name, _)| *name);
+    let source = crate::master::Manifest {
+        version: version.into(),
+        files: tables
+            .iter()
+            .map(|(name, _)| crate::master::Entry {
+                name: format!("{name}.bin"),
+                hash: registry::digest(name.as_bytes()),
+                size: 96,
+            })
+            .collect(),
+    };
+    let files: Vec<_> = tables
+        .iter()
+        .map(|(name, bytes)| registry::file(format!("{name}.json"), bytes))
+        .collect();
+    let inventory = registry::Inventory {
+        schema_version: 1,
+        version: version.into(),
+        files: files.clone(),
+    };
+    let manifest = registry::PublishedManifest {
+        schema_version: 1,
+        scope: registry_scope(),
+        snapshot: "master-owner".into(),
+        version: version.into(),
+        resource_version: resource_version.map(Into::into),
+        content_sha256: registry::content_hash(&registry_scope(), &source, &inventory).unwrap(),
+        files,
+        source_manifest: source,
+    };
+    std::fs::create_dir_all(output).unwrap();
+    let _writer = crate::master::WriterLock::acquire(output).unwrap();
+    let staging = tempfile::Builder::new()
+        .prefix(".master-sync-")
+        .tempdir_in(output)
+        .unwrap();
+    for (name, bytes) in &tables {
+        std::fs::write(staging.path().join(format!("{name}.json")), bytes).unwrap();
+    }
+    crate::master::prepare_registry(staging, &manifest)
+        .unwrap()
+        .publish(output)
+        .unwrap()
+}
+
+fn git_output(repository: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args(args)
+        .output()
+        .unwrap();
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).unwrap())
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn master_git_indented_root_publishes_only_tables_and_version_on_configured_branch() {
+    use crate::{master_git, master_registry as registry};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let repository = state.join("repository.git");
+    let options = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: "main".into(),
+    };
+    let policy = master_git::CommitPolicy::default();
+    let commit = |options: master_git::Options| {
+        let (source, state, policy) = (source.clone(), state.clone(), policy.clone());
+        async move {
+            master_git::commit_with_options(&source, &state, registry_scope(), &policy, &options)
+                .await
+        }
+    };
+    let git = |args: &[&str]| git_output(&repository, args).unwrap();
+    let alpha = INDENT_FIXTURE.as_bytes();
+    let beta: &[u8] = b"[{\"id\":1,\"v\":1.0}]";
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-1"),
+        &[("MasterAlpha", alpha), ("MasterBeta", beta)],
+    );
+    let first = commit(options.clone()).await.unwrap();
+    assert!(first.changed);
+    assert_eq!(git(&["symbolic-ref", "HEAD"]).trim(), "refs/heads/main");
+    assert!(git_output(
+        &repository,
+        &["rev-parse", "--verify", "refs/heads/master-data"]
+    )
+    .is_none());
+    assert_eq!(git(&["rev-parse", "refs/heads/main"]).trim(), first.commit);
+    assert_eq!(
+        git(&[
+            "ls-tree",
+            "-r",
+            "--format=%(objectmode) %(objecttype) %(path)",
+            "main"
+        ]),
+        "100644 blob MasterAlpha.json\n100644 blob MasterBeta.json\n100644 blob version.json\n"
+    );
+    assert_eq!(git(&["show", "main:MasterAlpha.json"]), INDENT_EXPECTED);
+    assert_eq!(
+        git(&["show", "main:MasterBeta.json"]),
+        "[\n  {\n    \"id\": 1,\n    \"v\": 1.0\n  }\n]\n"
+    );
+    assert_eq!(
+        git(&["show", "main:version.json"]),
+        "{\n  \"dataVersion\": \"1.0.0\",\n  \"assetVersion\": \"asset-1\"\n}\n"
+    );
+    assert_eq!(
+        git(&["log", "-1", "--format=%s", "main"]).trim(),
+        "Sirius Master jp 1.0.0"
+    );
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&source, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(first.content_sha256, manifest.content_sha256);
+    // Repeated publication and an identical reinstall (new snapshot UUID) reuse the commit.
+    assert!(!commit(options.clone()).await.unwrap().changed);
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-1"),
+        &[("MasterAlpha", alpha), ("MasterBeta", beta)],
+    );
+    let repeated = commit(options.clone()).await.unwrap();
+    assert!(!repeated.changed);
+    assert_eq!(repeated.commit, first.commit);
+    // A table removed upstream disappears from the tree; history is linear.
+    install_plain_master(&source, "1.0.1", Some("asset-2"), &[("MasterAlpha", alpha)]);
+    let next = commit(options.clone()).await.unwrap();
+    assert!(next.changed);
+    assert_eq!(git(&["rev-parse", "main^"]).trim(), first.commit);
+    assert_eq!(
+        git(&["ls-tree", "--name-only", "main"]),
+        "MasterAlpha.json\nversion.json\n"
+    );
+    assert_eq!(
+        git(&["show", "main:version.json"]),
+        "{\n  \"dataVersion\": \"1.0.1\",\n  \"assetVersion\": \"asset-2\"\n}\n"
+    );
+    // The native layout keeps its 1.2.0 tree: provenance never enters sirius-publication.json.
+    let native = commit(master_git::Options::default()).await.unwrap();
+    assert!(native.changed);
+    assert_eq!(
+        git(&["ls-tree", "--name-only", "refs/heads/master-data"]),
+        "MasterAlpha.json\nsirius-publication.json\n"
+    );
+    assert_eq!(
+        git(&["show", "refs/heads/master-data:MasterAlpha.json"]),
+        INDENT_FIXTURE
+    );
+    let metadata: Value = serde_json::from_str(&git(&[
+        "show",
+        "refs/heads/master-data:sirius-publication.json",
+    ]))
+    .unwrap();
+    assert!(metadata.get("resource_version").is_none() && metadata.get("snapshot").is_none());
+    assert_eq!(git(&["rev-parse", "main"]).trim(), next.commit);
+    // Identical tables without recorded provenance: the native tree is unchanged, while the
+    // indented publication fails before touching any ref.
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", alpha)]);
+    let native_again = commit(master_git::Options::default()).await.unwrap();
+    assert!(!native_again.changed);
+    assert_eq!(native_again.commit, native.commit);
+    assert!(matches!(
+        commit(options.clone()).await,
+        Err(master_git::Error::AssetVersion)
+    ));
+    assert_eq!(git(&["rev-parse", "main"]).trim(), next.commit);
+    assert_eq!(
+        git(&["for-each-ref", "--format=%(refname)"]),
+        "refs/heads/main\nrefs/heads/master-data\n"
+    );
+    for branch in [
+        "", "HEAD", "-x", ".x", "a..b", "a/", "/a", "a//b", "x.lock", "a b", "a~1", "é",
+    ] {
+        let invalid = master_git::Options {
+            layout: master_git::Layout::IndentedRoot,
+            branch: branch.into(),
+        };
+        assert!(
+            matches!(commit(invalid).await, Err(master_git::Error::LayoutConfig)),
+            "{branch:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_indented_root_pushes_configured_branch_to_remote() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&remote_path)
+        .status()
+        .unwrap()
+        .success());
+    let remote = master_git::Remote {
+        proxy_url_env: None,
+        url: url::Url::from_directory_path(&remote_path)
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let options = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: "release/main".into(),
+    };
+    install_plain_master(
+        &source,
+        "2.0.0",
+        Some("r9"),
+        &[("MasterOnly", b"{\"a\":{}}")],
+    );
+    let policy = master_git::CommitPolicy::default();
+    let publish = || {
+        master_git::publish_with_options(
+            &source,
+            &state,
+            registry_scope(),
+            &remote,
+            &policy,
+            &options,
+        )
+    };
+    let receipt = publish().await.unwrap();
+    assert!(receipt.changed && receipt.remote_verified);
+    assert_eq!(
+        git_output(
+            &remote_path,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        )
+        .unwrap(),
+        format!("refs/heads/release/main {}\n", receipt.commit)
+    );
+    assert_eq!(
+        git_output(&remote_path, &["show", "release/main:MasterOnly.json"]).unwrap(),
+        "{\n  \"a\": {}\n}\n"
+    );
+    let again = publish().await.unwrap();
+    assert!(!again.changed && again.remote_verified);
+    assert_eq!(again.commit, receipt.commit);
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn master_git_worker_reports_missing_asset_version_and_retries_after_installation() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    install_plain_master(&source, "3.0.0", None, &[("MasterA", b"[]")]);
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.master_directory = Some(source.clone());
+    cfg.master_git = Some(crate::master_git_worker::Config {
+        layout: crate::master_git::Layout::IndentedRoot,
+        branch: "main".into(),
+        commit: Default::default(),
+        state_directory: root.path().join("git"),
+        interval_seconds: 86400,
+        remote: None,
+    });
+    let game = GameClient::new(cfg.clone()).unwrap();
+    let mut worker = crate::master_git_worker::Worker::new(&cfg, game.clone()).unwrap();
+    assert!(matches!(
+        worker.update_once().await,
+        Err(crate::master_git::Error::AssetVersion)
+    ));
+    let status = game.master_git_status().await;
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error_code"], "asset_version_unavailable");
+    let repository = root.path().join("git/repository.git");
+    assert_eq!(
+        git_output(&repository, &["for-each-ref"]).unwrap_or_default(),
+        ""
+    );
+    install_plain_master(&source, "3.0.1", Some("a-3"), &[("MasterA", b"[]")]);
+    let receipt = worker.update_once().await.unwrap();
+    assert!(receipt.changed);
+    assert_eq!(game.master_git_status().await["status"], "ready");
+    assert_eq!(
+        git_output(&repository, &["show", "main:version.json"]).unwrap(),
+        "{\n  \"dataVersion\": \"3.0.1\",\n  \"assetVersion\": \"a-3\"\n}\n"
+    );
+}
+
+#[test]
+fn master_git_layout_and_branch_configuration_is_strict_and_defaults_to_native() {
+    use crate::master_git_worker::Config as GitConfig;
+    let parsed: GitConfig = yaml_serde::from_str("state_directory: ./git\n").unwrap();
+    assert_eq!(parsed.layout, crate::master_git::Layout::Native);
+    assert_eq!(parsed.branch, "master-data");
+    assert_eq!(parsed.options(), crate::master_git::Options::default());
+    let parsed: GitConfig =
+        yaml_serde::from_str("state_directory: ./git\nlayout: indented_root\nbranch: main\n")
+            .unwrap();
+    assert_eq!(parsed.layout, crate::master_git::Layout::IndentedRoot);
+    assert_eq!(parsed.branch, "main");
+    for invalid in [
+        "state_directory: ./git\nlayout: pretty\n",
+        "state_directory: ./git\nlayout: IndentedRoot\n",
+        "state_directory: ./git\nbranches: main\n",
+    ] {
+        assert!(
+            yaml_serde::from_str::<GitConfig>(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    let (root, _, source, _) = registry_fixture();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.master_directory = Some(source);
+    cfg.master_git = Some(parsed);
+    cfg.master_git.as_mut().unwrap().state_directory = root.path().join("git");
+    assert!(cfg.validate().is_ok());
+    for branch in ["feature/x-1.2", "a_b"] {
+        cfg.master_git.as_mut().unwrap().branch = branch.into();
+        assert!(cfg.validate().is_ok(), "{branch}");
+    }
+    for branch in [
+        "",
+        "refs/heads/../x",
+        "main.lock",
+        "main\n",
+        "a:b",
+        "a@{1}",
+        "a*",
+    ] {
+        cfg.master_git.as_mut().unwrap().branch = branch.into();
+        assert!(cfg.validate().is_err(), "{branch:?}");
+    }
+}
+
+#[tokio::test]
+async fn master_update_records_asset_version_from_the_same_version_observation() {
+    use crate::{master_registry as registry, master_update::MasterUpdater};
+    let asset = |version: &str| {
+        Reply::version().header(
+            "x-asset-version",
+            &format!(r#"{{"version":"{version}","iOS":"hash-{version}"}}"#),
+        )
+    };
+    // Legacy installation of the same Master version without provenance.
+    let root = tempfile::tempdir().unwrap();
+    let input = tempfile::tempdir().unwrap();
+    let (mut manifest, decoder, bytes) = master_fixture();
+    manifest.version = "master-fixture".into();
+    std::fs::write(
+        input.path().join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(input.path().join("MasterFixture.bin"), bytes).unwrap();
+    let legacy = crate::master::import_directory(input.path(), root.path(), &decoder).unwrap();
+    assert!(legacy.resource_version.is_none());
+    let legacy_manifest = registry::manifest(root.path(), None, registry_scope()).unwrap();
+    assert!(!String::from_utf8_lossy(&legacy_manifest.bytes).contains("resource_version"));
+    let legacy_manifest: registry::PublishedManifest =
+        serde_json::from_slice(&legacy_manifest.bytes).unwrap();
+    // A game response without an asset version keeps the legacy snapshot unchanged.
+    let cdn = cdn_fixture(vec![
+        cdn_reply(remote_master_manifest()),
+        cdn_reply(bytes.to_vec()),
+        cdn_reply(remote_master_manifest()),
+        cdn_reply(bytes.to_vec()),
+    ])
+    .await;
+    let game = fixture(vec![
+        Reply::version(),
+        asset("a1"),
+        asset("a1"),
+        asset("a2"),
+        asset("a3"),
+        asset("a4"),
+    ])
+    .await;
+    let cfg = remote_master_config(&cdn, root.path());
+    let c = client(&game, cfg.clone());
+    let updater = MasterUpdater::new(&cfg, c.clone()).unwrap();
+    assert_eq!(updater.update_once().await.unwrap()["action"], "unchanged");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("CURRENT")).unwrap(),
+        legacy.snapshot
+    );
+    // Once reported, the same Master version is reinstalled once with its provenance.
+    let result = updater.update_once().await.unwrap();
+    assert_eq!(result["action"], "updated");
+    assert_eq!(result["receipt"]["resource_version"], "a1");
+    let status: Value = serde_json::from_slice(
+        &crate::master::read_current(root.path(), None)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(status["resource_version"], "a1");
+    let installed: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(root.path(), None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(installed.resource_version.as_deref(), Some("a1"));
+    installed.validate(&registry_scope()).unwrap();
+    // Provenance does not change table content identity.
+    assert_eq!(installed.content_sha256, legacy_manifest.content_sha256);
+    // A later asset-only observation does not rewrite the recorded installation provenance.
+    assert_eq!(updater.update_once().await.unwrap()["action"], "unchanged");
+    // The final check must observe the same pair; a changed asset version aborts publication.
+    let current = std::fs::read(root.path().join("CURRENT")).unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let cfg = remote_master_config(&cdn, fresh.path());
+    let changed = MasterUpdater::new(&cfg, client(&game, cfg.clone()))
+        .unwrap()
+        .update_once()
+        .await;
+    assert!(matches!(
+        changed,
+        Err(crate::master_update::UpdateError::Changed)
+    ));
+    assert!(!fresh.path().join("CURRENT").exists());
+    assert_eq!(std::fs::read(root.path().join("CURRENT")).unwrap(), current);
+    // A manifest carrying an unsafe asset version is rejected.
+    let mut unsafe_manifest = installed.clone();
+    unsafe_manifest.resource_version = Some("../x".into());
+    assert!(unsafe_manifest.validate(&registry_scope()).is_err());
+}
+
+#[tokio::test]
+async fn master_sync_propagates_owner_asset_version_without_redownloading_tables() {
+    let (_owner_root, _, output, _) = registry_fixture();
+    let owner_game = fixture(vec![]).await;
+    let mut owner_cfg = config();
+    owner_cfg.master_directory = Some(output.clone());
+    let app = api::router(
+        client(&owner_game, owner_cfg),
+        "owner-read".into(),
+        "owner-admin".into(),
+    );
+    let (origin, server) = peer_http_server(app).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let cfg = master_sync_config(origin, consumer.path().join("master"));
+    let consumer_root = cfg.master_directory.clone().unwrap();
+    let sync =
+        crate::master_sync::Syncer::new(&cfg, GameClient::new(cfg.clone()).unwrap()).unwrap();
+    let installed = |root: &std::path::Path| -> crate::master_registry::PublishedManifest {
+        serde_json::from_slice(
+            &crate::master_registry::manifest(root, None, registry_scope())
+                .unwrap()
+                .bytes,
+        )
+        .unwrap()
+    };
+    let first = sync.update_once().await.unwrap();
+    assert_eq!(first["action"], "updated");
+    assert!(installed(&consumer_root).resource_version.is_none());
+    // The owner records provenance for identical tables: consumers adopt it by local reuse.
+    let (mut manifest, decoder, data) = master_fixture();
+    let input = tempfile::tempdir().unwrap();
+    manifest.version = "fixture-v1".into();
+    std::fs::write(
+        input.path().join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(input.path().join("MasterFixture.bin"), data).unwrap();
+    crate::master::import_directory_with_resource_version(
+        input.path(),
+        &output,
+        &decoder,
+        Some("owner-asset-7"),
+    )
+    .unwrap();
+    assert!(crate::master::import_directory_with_resource_version(
+        input.path(),
+        &output,
+        &decoder,
+        Some("../bad")
+    )
+    .is_err());
+    let owner = installed(&output);
+    assert_eq!(owner.resource_version.as_deref(), Some("owner-asset-7"));
+    assert_eq!(owner.content_sha256, first["content_sha256"]);
+    let adopted = sync.update_once().await.unwrap();
+    assert_eq!(adopted["action"], "updated");
+    assert_eq!(adopted["downloaded_files"], 0);
+    assert_eq!(adopted["receipt"]["resource_version"], "owner-asset-7");
+    assert_eq!(adopted["receipt"]["source"], "registry");
+    let local = installed(&consumer_root);
+    assert_eq!(local.resource_version.as_deref(), Some("owner-asset-7"));
+    assert_eq!(local.content_sha256, owner.content_sha256);
+    assert_eq!(sync.update_once().await.unwrap()["action"], "unchanged");
+    // A consumer can publish the indented layout from the propagated provenance.
+    let state = consumer.path().join("git");
+    crate::master_git::commit_with_options(
+        &consumer_root,
+        &state,
+        registry_scope(),
+        &Default::default(),
+        &crate::master_git::Options {
+            layout: crate::master_git::Layout::IndentedRoot,
+            branch: "main".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        git_output(
+            &state.join("repository.git"),
+            &["show", "main:version.json"]
+        )
+        .unwrap(),
+        "{\n  \"dataVersion\": \"fixture-v1\",\n  \"assetVersion\": \"owner-asset-7\"\n}\n"
+    );
+    server.abort();
 }

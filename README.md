@@ -114,6 +114,8 @@ Raw credential fields and grpc-message values are not returned to callers.
 ```sh
 # Offline import; supply SIRIUS_MASTER_KEY_HEX and SIRIUS_MASTER_IV_HEX.
 ./sirius-api-proxy master-import /path/to/encrypted-master ./master-data
+# Optionally record the matching asset version (needed by the indented Git layout).
+./sirius-api-proxy master-import /path/to/encrypted-master ./master-data --resource-version VERSION
 # One remote update using the configured master_update settings.
 ./sirius-api-proxy master-update
 # Hot reload a complete, compatible proto bundle.

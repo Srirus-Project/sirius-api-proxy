@@ -40,6 +40,11 @@ pub struct PublishedManifest {
     pub scope: Scope,
     pub snapshot: String,
     pub version: String,
+    /// Asset (resource) version recorded with this installation, from the same game VERSION
+    /// observation as `version` (or carried from the owner). Absent on legacy snapshots.
+    /// Provenance only: excluded from `content_sha256`, which identifies table content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_version: Option<String>,
     pub content_sha256: String,
     pub files: Vec<File>,
     /// Original encrypted-file metadata, without any CDN credentials or keys.
@@ -53,6 +58,10 @@ impl PublishedManifest {
             || !self.snapshot.starts_with("master-")
             || !master::safe_component(&self.snapshot)
             || self.version != self.source_manifest.version
+            || self
+                .resource_version
+                .as_deref()
+                .is_some_and(|v| !master::safe_version(v))
         {
             return Err(MasterError::Format);
         }
@@ -163,6 +172,9 @@ fn snapshot_directory(root: &Path, snapshot: &str) -> Result<PathBuf, MasterErro
     Ok(path)
 }
 fn source(directory: &Path) -> Result<Manifest, MasterError> {
+    source_with_provenance(directory).map(|(source, _)| source)
+}
+fn source_with_provenance(directory: &Path) -> Result<(Manifest, Option<String>), MasterError> {
     let source = Manifest::parse(&regular(
         &directory.join("MasterManifest.json"),
         master::MAX_MANIFEST,
@@ -180,7 +192,8 @@ fn source(directory: &Path) -> Result<Manifest, MasterError> {
     {
         return Err(MasterError::Format);
     }
-    Ok(source)
+    let resource_version = master::recorded_resource_version(&receipt)?;
+    Ok((source, resource_version))
 }
 fn inventory(directory: &Path, source: &Manifest) -> Result<Inventory, MasterError> {
     let path = directory.join("tables.json");
@@ -241,7 +254,7 @@ pub fn manifest(
         None => current_snapshot(root)?,
     };
     let directory = snapshot_directory(root, &snapshot)?;
-    let mut source = source(&directory)?;
+    let (mut source, resource_version) = source_with_provenance(&directory)?;
     source.files.sort_by(|a, b| a.name.cmp(&b.name));
     let inventory = inventory(&directory, &source)?;
     let content = content_hash(&scope, &source, &inventory)?;
@@ -250,6 +263,7 @@ pub fn manifest(
         scope,
         snapshot,
         version: source.version.clone(),
+        resource_version,
         content_sha256: content,
         files: inventory.files,
         source_manifest: source,

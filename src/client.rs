@@ -49,6 +49,8 @@ struct State {
     master_database: Value,
     master_update: Value,
     observation: Observation,
+    /// Master data version and asset version taken together from one VERSION response.
+    master_pair: Option<(String, Option<String>)>,
     snapshot: Option<ResourceSnapshot>,
     snapshot_stale: bool,
     cdn_root: String,
@@ -123,6 +125,7 @@ impl GameClient {
             master_git: json!({"status": if config.master_git.is_some() {"pending"} else {"disabled"}}),
             master_update: json!({"status": if config.master_update.is_some() || config.master_sync.is_some() {"pending"} else {"disabled"}}),
             observation: Observation::default(),
+            master_pair: None,
             snapshot: None,
             snapshot_stale: true,
             cdn_root: config.default_cdn_root.clone(),
@@ -225,6 +228,7 @@ impl GameClient {
             .write()
             .map_err(|_| AppError::ProtocolDefinition)? = Arc::new(candidate);
         state.observation = Observation::default();
+        state.master_pair = None;
         state.snapshot_stale = true;
         Ok(status)
     }
@@ -309,11 +313,12 @@ impl GameClient {
     ) -> Result<crate::master_update::MasterTarget, AppError> {
         self.call(VERSION, json!({})).await?;
         let state = self.state.lock().await;
-        let version = state
-            .observation
-            .master_version
+        // Both versions come from the same VERSION response; never pair a master version
+        // with an asset version from another observation.
+        let (version, resource_version) = state
+            .master_pair
             .as_ref()
-            .filter(|v| crate::master::safe_version(v))
+            .filter(|(v, _)| crate::master::safe_version(v))
             .ok_or(AppError::MasterUnavailable)?;
         if state.observation.grpc_status != Some(0)
             || state.observation.maintenance
@@ -327,6 +332,7 @@ impl GameClient {
             .ok_or(AppError::MasterUnavailable)?;
         Ok(crate::master_update::MasterTarget {
             version: version.clone(),
+            resource_version: resource_version.clone(),
             root: state.cdn_root.clone(),
             password: password.clone(),
         })
@@ -863,13 +869,30 @@ impl GameClient {
                         && s.parse::<hyper::header::HeaderValue>().is_ok()
                 })
                 .ok_or(AppError::Protocol)?;
-            let mut state = self.state.lock().await;
-            state.observation.master_version = Some(version.to_string());
-            state.observation.resource_version = value
+            let body_resource = value
                 .get("resourceVersion")
                 .and_then(Value::as_str)
                 .filter(|v| crate::master::safe_version(v))
                 .map(str::to_owned);
+            // JP VersionResponse has no resource field; its asset version is carried by the
+            // x-asset-version header of the same response (selected like resource snapshots).
+            let asset = body_resource.clone().or_else(|| {
+                header(&metadata, "x-asset-version")
+                    .and_then(|raw| {
+                        resources::select_platform(
+                            raw,
+                            &self.config.client_version,
+                            self.config.platform(),
+                        )
+                        .ok()
+                    })
+                    .map(|(version, _)| version)
+                    .filter(|v| crate::master::safe_version(v))
+            });
+            let mut state = self.state.lock().await;
+            state.observation.master_version = Some(version.to_string());
+            state.observation.resource_version = body_resource;
+            state.master_pair = Some((version.to_string(), asset));
         }
         self.promote_snapshot(&metadata, &protocol.status.version)
             .await;

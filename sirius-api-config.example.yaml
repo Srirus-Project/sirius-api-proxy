@@ -142,6 +142,11 @@ response_cache:
 # master_git:
 #   state_directory: ./data/master-git
 #   interval_seconds: 300
+#   # native (default): exact tables + sirius-publication.json. indented_root: every table
+#   # re-indented at the repository root plus version.json {dataVersion, assetVersion};
+#   # requires recorded asset-version provenance (see docs/MASTER_REGISTRY.md).
+#   layout: native
+#   branch: master-data # for example main
 #   commit:
 #     author:
 #       name: Sirius Master Publisher

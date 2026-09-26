@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.1 (unreleased)
+
+- Master Git publication gains `master_git.layout: indented_root`: every table re-indented
+  (whitespace only, tokens preserved) at the repository root plus `version.json` with
+  `dataVersion` and `assetVersion`. `native` remains the default and its tree is unchanged.
+- `master_git.branch` selects the published branch (default `master-data`), for example `main`.
+- Master snapshots record the asset version from the same game VERSION response as the Master
+  version (JP: the `x-asset-version` header). Manifests expose it as optional `resource_version`,
+  excluded from `content_sha256`; owner-to-consumer sync carries it. A snapshot without it is
+  reinstalled once when the game reports one for the same Master version.
+  `master-import ... --resource-version VERSION` records it for local imports.
+- `indented_root` publication without recorded provenance fails with
+  `asset_version_unavailable`, leaving refs unchanged.
+- Upgrade note: consumers reject unknown manifest fields, so upgrade consumers and registries
+  before owners that record provenance.
+
 ## 1.2.0
 
 Restores the reusable service capabilities of the original Haruki API for Sirius. Sekai-specific

@@ -15,15 +15,33 @@ pub struct Config {
     #[serde(default = "interval")]
     pub interval_seconds: u64,
     pub remote: Option<master_git::Remote>,
+    /// `native` (default, 1.2.0 tree) or `indented_root` (re-indented tables + version.json).
+    #[serde(default)]
+    pub layout: master_git::Layout,
+    /// Published branch, locally and on the remote.
+    #[serde(default = "branch")]
+    pub branch: String,
 }
 fn interval() -> u64 {
     300
 }
+fn branch() -> String {
+    master_git::DEFAULT_BRANCH.into()
+}
 impl Config {
+    pub fn options(&self) -> master_git::Options {
+        master_git::Options {
+            layout: self.layout,
+            branch: self.branch.clone(),
+        }
+    }
     pub fn validate(&self, game: &GameConfig) -> Result<(), AppError> {
         self.commit
             .validate()
             .map_err(|_| AppError::Config("invalid Master Git commit policy"))?;
+        self.options()
+            .validate()
+            .map_err(|_| AppError::Config("invalid Master Git branch"))?;
         if !cfg!(any(unix, windows))
             || game.region != crate::region::Region::Jp
             || self.state_directory.as_os_str().is_empty()
@@ -134,21 +152,23 @@ impl Worker {
             .await;
         let result = match &self.config.remote {
             Some(remote) => {
-                master_git::publish_with_policy(
+                master_git::publish_with_options(
                     &self.source,
                     &self.config.state_directory,
                     self.scope.clone(),
                     remote,
                     &self.config.commit,
+                    &self.config.options(),
                 )
                 .await
             }
             None => {
-                master_git::commit_with_policy(
+                master_git::commit_with_options(
                     &self.source,
                     &self.config.state_directory,
                     self.scope.clone(),
                     &self.config.commit,
+                    &self.config.options(),
                 )
                 .await
             }
@@ -167,6 +187,8 @@ impl Worker {
                     master_git::Error::RemoteConfig => "remote_config",
                     master_git::Error::RemoteChanged => "remote_history",
                     master_git::Error::Git => "git_operation",
+                    master_git::Error::LayoutConfig => "layout_config",
+                    master_git::Error::AssetVersion => "asset_version_unavailable",
                 };
                 self.game.record_master_git(json!({"status":"failed","checked_at":chrono::Utc::now(),"error_code":code,"last_success":self.last_success})).await;
                 tracing::warn!(
