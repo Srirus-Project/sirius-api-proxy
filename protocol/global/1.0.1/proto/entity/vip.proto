@@ -1,0 +1,11 @@
+syntax = "proto3";
+package entity;
+message Vip {
+  int32 point = 1;
+  int32 consecutive_login_count = 2;
+  optional int64 last_login_count_at = 3;
+  optional int64 last_daily_point_at = 4;
+  int32 last_daily_reward_day_number = 5;
+  optional int64 last_daily_reward_at = 6;
+  int32 gained_reward_rank = 7;
+}

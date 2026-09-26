@@ -1,7 +1,6 @@
 syntax = "proto3";
 package app.masterdata;
 import "entity/method_options/method_options.proto";
-
 message VersionRequest {
 }
 message VersionResponse {

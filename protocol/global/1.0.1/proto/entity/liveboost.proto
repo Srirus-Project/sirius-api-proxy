@@ -1,0 +1,10 @@
+syntax = "proto3";
+package entity;
+message LiveBoost {
+  int32 amount = 1;
+  int64 previous_recovery_at = 2;
+  int32 daily_ad_view = 3;
+  int32 daily_full_consume_count = 4;
+  int64 last_daily_reset_at = 5;
+  int32 campaign_daily_count = 6;
+}

@@ -1,5 +1,6 @@
 #[path = "src/proto_source.rs"]
 mod proto_source;
+#[allow(dead_code)]
 #[path = "src/routes.rs"]
 mod routes;
 use heck::{ToSnakeCase, ToUpperCamelCase};
@@ -74,7 +75,7 @@ fn generate(family: &str, path: &str) {
     }
     let mut encode = String::new();
     let mut decode = String::new();
-    for route in routes::for_family(family) {
+    for route in routes::contract_for_family(family) {
         let (service, method) = route.trim_start_matches('/').rsplit_once('/').unwrap();
         let method = pool
             .get_service_by_name(service)

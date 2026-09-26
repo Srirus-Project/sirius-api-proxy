@@ -3,6 +3,8 @@
 # commented lines to download Master data without CDN authorization and publish it to Git.
 # Optional resource snapshots for the asset updater (docs/REGIONS.md#resource-snapshots): the
 # resource_snapshot line serves schema-3 snapshots from the anonymous catalog .hash.
+# Optional Global SDK guest account (docs/ACCOUNTS.md#global-accounts): uncomment the accounts
+# and global_login lines, create the private identity file and export SIRIUS_GLOBAL_SDK_APP_KEY.
 {
   "region": "hk",
   "platform": "Android",
@@ -20,5 +22,7 @@
   # "master_git": {"state_directory": "data/hk/master-git", "layout": "indented_root", "branch": "main",
   #   "remote": {"url": "https://github.com/Srirus-Project/sirius-hk-master.git", "authorization_env": "SIRIUS_MASTER_GIT_HK_AUTHORIZATION"}},
   # "resource_snapshot": {"cdn_authorization": "none", "catalog_hash_ttl_seconds": 60},
+  # "accounts": [{"name": "hk-guest", "global_identity_file": "/run/secrets/sirius-global-guest-1.json"}],
+  # "global_login": {"sdk_app_key_env": "SIRIUS_GLOBAL_SDK_APP_KEY", "login_min_interval_seconds": 300, "max_logins_per_day": 24},
   "cdn_credential_env": {}
 }

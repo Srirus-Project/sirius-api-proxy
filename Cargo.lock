@@ -2314,6 +2314,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "libc",
+ "md-5",
  "pbjson",
  "pbjson-build",
  "pbjson-types",

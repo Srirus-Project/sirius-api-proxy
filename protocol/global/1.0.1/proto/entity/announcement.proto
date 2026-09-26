@@ -1,0 +1,33 @@
+syntax = "proto3";
+package entity;
+enum AnnouncementCategory {
+  UNSPECIFIED = 0;
+  OTHER = 1;
+  EVENT = 2;
+  GACHA = 3;
+  CAMPAIGN = 4;
+  UPDATE = 5;
+  MAINTENANCE = 6;
+  BUG = 7;
+}
+message Announcement {
+  int64 id = 1;
+  .entity.AnnouncementCategory category = 2;
+  string title = 3;
+  string banner_path = 4;
+  string banner_url = 5;
+  string body = 6;
+  int64 start_at = 7;
+  int64 end_at = 8;
+  int32 sort_order = 9;
+  string pickup_banner_path = 10;
+  string pickup_banner_url = 11;
+  int64 pickup_start_at = 12;
+  int64 pickup_end_at = 13;
+  int64 last_updated_at = 14;
+  int64 stylesheet_id = 15;
+}
+message AnnouncementExternalContent {
+  int64 id = 1;
+  string banner_path = 2;
+}

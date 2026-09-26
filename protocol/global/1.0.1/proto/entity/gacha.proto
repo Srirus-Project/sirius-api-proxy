@@ -1,0 +1,12 @@
+syntax = "proto3";
+package entity;
+message GachaCount {
+  int64 product_id = 1;
+  int32 count = 2;
+  int64 last_execute = 3;
+  int64 gacha_id = 4;
+}
+message GachaPoint {
+  int64 gacha_id = 1;
+  int32 point = 2;
+}

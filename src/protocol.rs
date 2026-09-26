@@ -109,11 +109,53 @@ fn field(
     }
     Ok(())
 }
+/// Field `number` must exist with the given JSON name (when given), kind and cardinality.
+fn numbered(
+    message: &MessageDescriptor,
+    number: u32,
+    json: Option<&str>,
+    kind: Kind,
+    repeated: bool,
+) -> Result<(), AppError> {
+    let f = message
+        .get_field(number)
+        .ok_or(AppError::ProtocolDefinition)?;
+    if json.is_some_and(|name| f.json_name() != name)
+        || f.kind() != kind
+        || f.is_list() != repeated
+        || f.is_map()
+    {
+        return invalid();
+    }
+    Ok(())
+}
+/// JSON name of `ServerInfo` field 8 (the area ID). The Global client names it `areaID`; the
+/// proxy publishes it as `areaId` regardless (see [`normalize_servers`]).
+pub(crate) fn server_area_json_name(pool: &DescriptorPool) -> Option<String> {
+    let m = method(pool, crate::routes::SERVER_LIST).ok()?;
+    let Kind::Message(info) = m.output().get_field(1)?.kind() else {
+        return None;
+    };
+    Some(info.get_field(8)?.json_name().to_owned())
+}
+/// Keep the public `/api/v1/servers` key `areaId` whatever the bundle names field 8.
+pub(crate) fn normalize_servers(pool: &DescriptorPool, value: &mut serde_json::Value) {
+    let Some(name) = server_area_json_name(pool).filter(|n| n != "areaId") else {
+        return;
+    };
+    if let Some(servers) = value.get_mut("servers").and_then(|v| v.as_array_mut()) {
+        for server in servers.iter_mut().filter_map(|s| s.as_object_mut()) {
+            if let Some(area) = server.remove(&name) {
+                server.insert("areaId".into(), area);
+            }
+        }
+    }
+}
 fn validate_contract(pool: &DescriptorPool, family: &str) -> Result<(), AppError> {
     let skip_auth = pool
         .get_extension_by_name("entity.method_options.skip_authentication")
         .ok_or(AppError::ProtocolDefinition)?;
-    for route in crate::routes::for_family(family) {
+    for route in crate::routes::contract_for_family(family) {
         let m = method(pool, route)?;
         if m.is_client_streaming() || m.is_server_streaming() {
             return invalid();
@@ -149,7 +191,8 @@ fn validate_contract(pool: &DescriptorPool, family: &str) -> Result<(), AppError
             crate::routes::SERVER_LIST => {
                 let server = m
                     .output()
-                    .get_field_by_name("servers")
+                    .get_field(1)
+                    .filter(|f| f.name() == "servers")
                     .ok_or(AppError::ProtocolDefinition)?;
                 let Kind::Message(info) = server.kind() else {
                     return invalid();
@@ -157,19 +200,67 @@ fn validate_contract(pool: &DescriptorPool, family: &str) -> Result<(), AppError
                 if !server.is_list() || server.is_map() {
                     return invalid();
                 }
-                for key in [
-                    "name",
-                    "cdnRoot",
-                    "apiServerRoot",
-                    "chatServerRoot",
-                    "atServerRoot",
-                    "liveServer",
-                    "displayName",
-                    "areaId",
-                    "ageIconSpriteName",
+                for (number, key) in [
+                    (1, "name"),
+                    (2, "cdnRoot"),
+                    (3, "apiServerRoot"),
+                    (4, "chatServerRoot"),
+                    (5, "atServerRoot"),
+                    (6, "liveServer"),
+                    (7, "displayName"),
+                    (9, "ageIconSpriteName"),
                 ] {
-                    field(&info, key, Kind::String, false)?;
+                    numbered(&info, number, Some(key), Kind::String, false)?;
                 }
+                // The area ID is checked by number: the client's JSON name is `areaID`.
+                numbered(&info, 8, None, Kind::String, false)?;
+            }
+            crate::routes::PLAYER_LOGIN => {
+                let input = m.input();
+                for (number, key) in [
+                    (1, "sdkUid"),
+                    (2, "sdkAccessToken"),
+                    (4, "deviceModel"),
+                    (5, "operatingSystem"),
+                    (6, "clientVersion"),
+                    (8, "clientPackage"),
+                    (13, "idToken"),
+                ] {
+                    numbered(&input, number, Some(key), Kind::String, false)?;
+                }
+                for (number, key) in [
+                    (3, "platform"),
+                    (10, "globalChannelId"),
+                    (11, "brandId"),
+                    (12, "areaId"),
+                ] {
+                    numbered(&input, number, Some(key), Kind::Uint32, false)?;
+                }
+                let uuid = input.get_field(7).ok_or(AppError::ProtocolDefinition)?;
+                let Kind::Message(uuid) = uuid.kind() else {
+                    return invalid();
+                };
+                if input
+                    .get_field(7)
+                    .is_some_and(|f| f.json_name() != "uuid" || f.is_list())
+                {
+                    return invalid();
+                }
+                numbered(&uuid, 1, Some("adId"), Kind::String, false)?;
+                numbered(&uuid, 2, Some("identifier"), Kind::String, false)?;
+                let output = m.output();
+                let credential = output.get_field(1).ok_or(AppError::ProtocolDefinition)?;
+                let Kind::Message(credential_type) = credential.kind() else {
+                    return invalid();
+                };
+                if credential.json_name() != "credential" || credential.is_list() {
+                    return invalid();
+                }
+                numbered(&credential_type, 1, Some("id"), Kind::String, false)?;
+                numbered(&credential_type, 2, Some("credential"), Kind::String, false)?;
+                numbered(&output, 2, Some("cpServerId"), Kind::String, false)?;
+                numbered(&output, 3, Some("cpServerName"), Kind::String, false)?;
+                numbered(&output, 4, Some("isNewUser"), Kind::Uint32, false)?;
             }
             WHOAMI => field(&m.output(), "playerId", Kind::String, false)?,
             ANNOUNCEMENTS => {
@@ -202,7 +293,7 @@ pub(crate) fn compatible(old: &DescriptorPool, new: &DescriptorPool) -> Result<(
     };
     let mut pending = Vec::new();
     let mut visited = HashSet::new();
-    for route in crate::routes::for_family(family) {
+    for route in crate::routes::contract_for_family(family) {
         let a = method(old, route)?;
         let b = method(new, route)?;
         if a.input().full_name() != b.input().full_name()

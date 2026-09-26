@@ -54,6 +54,7 @@ fn config() -> Config {
         internal_token_env: "unused".into(),
         accounts: Vec::new(),
         account_pool: Default::default(),
+        global_login: None,
         player_id_env: None,
         player_credential_env: None,
         master_directory: None,
@@ -1248,20 +1249,20 @@ async fn remote_master_repairs_missing_table_in_matching_version() {
     );
 }
 
-fn copy_protocol_bundle() -> tempfile::TempDir {
-    fn copy(source: &std::path::Path, target: &std::path::Path) {
-        std::fs::create_dir_all(target).unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir() {
-                copy(&entry.path(), &target.join(entry.file_name()));
-            } else {
-                std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
-            }
+fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target.join(entry.file_name()));
+        } else {
+            std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
         }
     }
+}
+fn copy_protocol_bundle() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    copy(
+    copy_tree(
         &crate::config::default_protocol_directory().join("proto"),
         &temp.path().join("proto"),
     );
@@ -1853,14 +1854,22 @@ fn global_native_codec_and_protocol_family_are_independent() {
         bundle.decode(VERSION, &wire).unwrap(),
         json!({"version":"m","resourceVersion":"r"})
     );
-    let servers = json!({"servers":[{"name":"EN Region","areaId":"3","cdnRoot":"https://cdn.example/prod/en_fixture","apiServerRoot":"https://api.example"}]});
+    // The client's descriptor names ServerInfo field 8 `areaID`; the proxy publishes `areaId`.
+    let servers = json!({"servers":[{"name":"EN Region","areaID":"3","cdnRoot":"https://cdn.example/prod/en_fixture","apiServerRoot":"https://api.example"}]});
     let method = crate::protocol::method(&bundle.pool, crate::routes::SERVER_LIST).unwrap();
     let bytes = DynamicMessage::deserialize(method.output(), servers.clone())
         .unwrap()
         .encode_to_vec();
+    let mut decoded = bundle.decode(crate::routes::SERVER_LIST, &bytes).unwrap();
+    assert_eq!(decoded, servers);
+    crate::protocol::normalize_servers(&bundle.pool, &mut decoded);
     assert_eq!(
-        bundle.decode(crate::routes::SERVER_LIST, &bytes).unwrap(),
-        servers
+        decoded,
+        json!({"servers":[{"name":"EN Region","areaId":"3","cdnRoot":"https://cdn.example/prod/en_fixture","apiServerRoot":"https://api.example"}]})
+    );
+    assert_eq!(
+        crate::protocol::server_area_json_name(&bundle.pool).as_deref(),
+        Some("areaID")
     );
     assert!(bundle
         .encode(crate::routes::SERVER_LIST, json!({}))
@@ -1880,7 +1889,7 @@ fn global_native_codec_and_protocol_family_are_independent() {
     ));
 }
 #[tokio::test]
-async fn global_sends_android_headers_and_refuses_unverified_player_routes() {
+async fn global_sends_android_headers_and_needs_an_account_for_player_routes() {
     let mut reply = Reply::version();
     reply.bytes = framed(vec![0x0a, 1, b'm', 0x12, 1, b'r']);
     let f = fixture(vec![reply]).await;
@@ -1892,7 +1901,7 @@ async fn global_sends_android_headers_and_refuses_unverified_player_routes() {
     assert!(matches!(
         c.call(crate::routes::PROFILE, json!({"playerProfileId":"1"}))
             .await,
-        Err(AppError::UnsupportedRegionOperation)
+        Err(AppError::AccountUnavailable)
     ));
     assert!(f.received.lock().unwrap().is_empty());
     assert_eq!(
@@ -1967,17 +1976,7 @@ fn known_region_endpoints_cannot_be_relabelled() {
 async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     let temp = tempfile::tempdir().unwrap();
     let source = std::path::Path::new("protocol/global/1.0.1");
-    for path in [
-        "bundle.json",
-        "proto/app/masterdata/masterdata_service.proto",
-        "proto/app/playerlogin/playerlogin_service.proto",
-        "proto/entity/method_options/method_options.proto",
-        "proto/google/protobuf/descriptor.proto",
-    ] {
-        let target = temp.path().join(path);
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::copy(source.join(path), target).unwrap();
-    }
+    copy_tree(source, temp.path());
     let mut cfg = config();
     cfg.region = crate::region::Region::En;
     cfg.protocol_directory = temp.path().into();
@@ -2190,7 +2189,8 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
                 )
                 .await
                 .0,
-                501
+                // Supported on Global, but this region has no account configured.
+                503
             );
         }
     }
@@ -2241,6 +2241,7 @@ fn pool_config() -> Config {
             player_id_env: Some(id),
             credential_env: Some(key),
             credentials_file: None,
+            global_identity_file: None,
         });
     }
     c
@@ -2368,6 +2369,7 @@ async fn pool_reload_drains_active_calls_and_rolls_back_invalid_files() {
         player_id_env: None,
         credential_env: None,
         credentials_file: Some(path.clone()),
+        global_identity_file: None,
     });
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut identity = whoami_reply("old-player");
@@ -5245,7 +5247,11 @@ async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
         json!({"type":"profile","profile_id":1}),
     );
     let reply = body(peer_send(app, "hk-peer", request).await).await;
-    assert_eq!(reply["outcome"]["kind"]["type"], "unsupported_operation");
+    // Profile is a Global operation now; without an account nothing is dispatched.
+    assert_eq!(
+        reply["outcome"]["kind"]["type"],
+        "unavailable_before_dispatch"
+    );
     assert!(f.received.lock().unwrap().is_empty());
 }
 
@@ -11959,7 +11965,14 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
             c.master_git.as_ref().unwrap().layout,
             crate::master_git::Layout::IndentedRoot
         );
+        assert!(c.accounts[0].global_identity_file.is_some() && c.global_login.is_some());
     }
+    // The identity template has the documented schema (placeholders only).
+    let identity = crate::global_account::Identity::parse(include_bytes!(
+        "../docs/examples/global-identity.example.json"
+    ))
+    .unwrap();
+    assert!(identity.sdk.uid.starts_with("REPLACE_WITH_"));
     let single = include_str!("../sirius-api-config.example.yaml");
     for block in ["master_database:", "client_auth:"] {
         let uncommented = uncomment_block(single, block);
@@ -14251,5 +14264,1485 @@ async fn jp_snapshot_stays_schema_2_without_layout_fields() {
         "cdn_authorization",
     ] {
         assert!(!snapshot.contains_key(field), "{field}");
+    }
+}
+
+/// Global (HK/EN/KR) accounts: SDK identity files, lazy PlayerLogin, signals and redaction.
+/// Only local mocks are used: an HTTP SDK mock and an h2c game mock per region.
+mod global_accounts {
+    use super::*;
+    use crate::{
+        accounts::AccountConfig,
+        global_account::LoginConfig,
+        global_sdk,
+        region::Region,
+        routes::{
+            EVENT_RANKING, PLAYER_DATA, PLAYER_LOGIN, PROFILE, SERVER_LIST, VERSION as V, WHOAMI,
+        },
+    };
+    use std::{
+        collections::VecDeque,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    const UID: &str = "7318842196";
+    const ACCESS_KEY: &str = "SECRETACCESSKEY-a1";
+    const ID_TOKEN: &str = "SECRETIDTOKEN-b2";
+    const REFRESHED_ID_TOKEN: &str = "SECRETIDTOKEN-refreshed";
+    const UDID: &str = "SECRETUDID-c3";
+    const UNITY_ID: &str = "5ec2e7a11d0000000000000000000abc";
+    const APP_KEY: &str = "fixture-app-key";
+
+    fn global_pool() -> &'static DescriptorPool {
+        static POOL: std::sync::OnceLock<DescriptorPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1"))
+                .unwrap()
+                .pool
+        })
+    }
+    fn gmsg(name: &str, value: Value) -> Vec<u8> {
+        DynamicMessage::deserialize(global_pool().get_message_by_name(name).unwrap(), value)
+            .unwrap()
+            .encode_to_vec()
+    }
+    fn ok(bytes: Vec<u8>) -> Reply {
+        let mut reply = Reply::version();
+        reply.bytes = framed(bytes);
+        reply
+    }
+    fn fail(status: u16, code: &str) -> Reply {
+        let mut reply = Reply::version();
+        reply.bytes.clear();
+        reply
+            .trailers
+            .insert("grpc-status", status.to_string().parse().unwrap());
+        reply
+            .trailers
+            .insert("grpc-message", "SECRET-upstream-message".parse().unwrap());
+        if !code.is_empty() {
+            reply
+                .trailers
+                .insert("x-sirius-error-code", code.parse().unwrap());
+        }
+        reply
+    }
+
+    /// A scripted Global game server for one region.
+    struct Upstream {
+        region: &'static str,
+        logins: AtomicUsize,
+        login_errors: Mutex<VecDeque<(u16, &'static str)>>,
+        call_errors: Mutex<VecDeque<(u16, &'static str)>>,
+    }
+    impl Upstream {
+        fn new(region: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                region,
+                logins: AtomicUsize::new(0),
+                login_errors: Mutex::new(VecDeque::new()),
+                call_errors: Mutex::new(VecDeque::new()),
+            })
+        }
+        fn player(&self) -> String {
+            format!("PLAYERID-{}", self.region)
+        }
+        fn credential(&self, n: usize) -> String {
+            format!("SECRETCRED-{}-{n}", self.region)
+        }
+        fn reply(&self, path: &str) -> Reply {
+            match path {
+                V => ok(gmsg(
+                    "app.masterdata.VersionResponse",
+                    json!({"version": format!("master-{}", self.region), "resourceVersion": "1.0.0.104"}),
+                )),
+                PLAYER_LOGIN => {
+                    if let Some((status, code)) = self.login_errors.lock().unwrap().pop_front() {
+                        return fail(status, code);
+                    }
+                    let n = self.logins.fetch_add(1, Ordering::SeqCst) + 1;
+                    ok(gmsg(
+                        "app.playerlogin.PlayerLoginResponse",
+                        json!({"credential": {"id": self.player(), "credential": self.credential(n)},
+                               "cpServerId": "16841", "cpServerName": "global server", "isNewUser": 1}),
+                    ))
+                }
+                // Global production rejects Whoami; the proxy must never send it.
+                WHOAMI => fail(7, ""),
+                _ => {
+                    if let Some((status, code)) = self.call_errors.lock().unwrap().pop_front() {
+                        return fail(status, code);
+                    }
+                    match path {
+                        PLAYER_DATA => ok(gmsg(
+                            "app.player.GetPlayerDataResponse",
+                            json!({"chatReportUsedToday": 3}),
+                        )),
+                        EVENT_RANKING => ok(gmsg(
+                            "app.event.GetRankingListResponse",
+                            json!({"ranking": [{"rank": 1, "point": 10}]}),
+                        )),
+                        PROFILE => ok(gmsg(
+                            "app.friend.FindByProfileIDResponse",
+                            json!({"playerProfile": {"id": "someone", "profileId": "9007199254740993"}}),
+                        )),
+                        SERVER_LIST => ok(gmsg(
+                            "app.playerlogin.GetServerListResponse",
+                            json!({"servers": [{"name": "EN Region", "areaID": "3"}]}),
+                        )),
+                        _ => fail(12, ""),
+                    }
+                }
+            }
+        }
+    }
+    async fn upstream(script: Arc<Upstream>) -> Fixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received: ReceivedRequests = Arc::new(Mutex::new(Vec::new()));
+        let seen = received.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                let script = script.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                        let seen = seen.clone();
+                        let script = script.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            let body = body.collect().await.unwrap().to_bytes();
+                            let path = parts.uri.path().to_owned();
+                            seen.lock()
+                                .unwrap()
+                                .push((path.clone(), parts.headers, body.to_vec()));
+                            let reply = script.reply(&path);
+                            let frames = vec![
+                                Ok::<_, Infallible>(Frame::data(Bytes::from(reply.bytes))),
+                                Ok(Frame::trailers(reply.trailers)),
+                            ];
+                            let response = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc+proto")
+                                .body(StreamBody::new(stream::iter(frames)))
+                                .unwrap();
+                            Ok::<_, Infallible>(response)
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+            }
+        });
+        Fixture {
+            url,
+            received,
+            task,
+        }
+    }
+    fn paths(f: &Fixture) -> Vec<String> {
+        f.received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.0.clone())
+            .collect()
+    }
+    fn count(f: &Fixture, path: &str) -> usize {
+        paths(f).iter().filter(|p| *p == path).count()
+    }
+
+    /// Local OneSDK mock: verifies every signature and answers tourist/cache login.
+    type SdkRequests = Arc<Mutex<Vec<(String, HeaderMap, BTreeMap<String, String>)>>>;
+    struct SdkMock {
+        url: String,
+        requests: SdkRequests,
+        codes: Arc<Mutex<VecDeque<i64>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for SdkMock {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    impl SdkMock {
+        fn count(&self, path: &str) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == path)
+                .count()
+        }
+    }
+    async fn sdk_mock() -> SdkMock {
+        let requests: SdkRequests = Arc::new(Mutex::new(Vec::new()));
+        let codes = Arc::new(Mutex::new(VecDeque::new()));
+        let (seen, scripted) = (requests.clone(), codes.clone());
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                let scripted = scripted.clone();
+                async move {
+                    let form = url::form_urlencoded::parse(&body)
+                        .into_owned()
+                        .collect::<Vec<(String, String)>>();
+                    let map = form.iter().cloned().collect::<BTreeMap<_, _>>();
+                    seen.lock()
+                        .unwrap()
+                        .push((uri.path().to_owned(), headers, map.clone()));
+                    let unsigned = form
+                        .iter()
+                        .filter(|(k, _)| k != "sign")
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let signed = map.get("sign") == Some(&global_sdk::sign(&unsigned, APP_KEY));
+                    let code = scripted.lock().unwrap().pop_front().unwrap_or(0);
+                    let body = if !signed {
+                        json!({"code": -999, "message": "bad sign"})
+                    } else if code != 0 {
+                        json!({"code": code, "message": "scripted"})
+                    } else if uri.path() == global_sdk::TOURIST_LOGIN {
+                        json!({"code": 0, "data": {"uid": UID.parse::<u64>().unwrap(), "access_key": ACCESS_KEY,
+                               "id_token": ID_TOKEN, "is_tourist": 1}})
+                    } else {
+                        json!({"code": 0, "data": {"uid": map.get("uid").cloned().unwrap_or_default(),
+                               "id_token": REFRESHED_ID_TOKEN}})
+                    };
+                    axum::Json(body)
+                }
+            },
+        );
+        let (url, task) = super::peer_http_server(app).await;
+        SdkMock {
+            url,
+            requests,
+            codes,
+            task,
+        }
+    }
+
+    fn device() -> Value {
+        json!({"udid": UDID, "model": "SM-FIXTURE", "pf_ver": "12", "dp": "1080*1920", "net": "4",
+               "operators": "5", "adid": "", "lang": "en", "time_zone": "UTC", "isRoot": "0",
+               "unity_device_model": "Fixture SM-FIXTURE",
+               "unity_operating_system": "Android OS 12 / API-32 (FIXTURE)",
+               "unity_device_id": UNITY_ID})
+    }
+    fn write_private(path: &Path, value: &Value) {
+        std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    fn identity_file(dir: &Path, players: Value) -> PathBuf {
+        let path = dir.join(format!("identity-{}.json", uuid::Uuid::new_v4().simple()));
+        write_private(
+            &path,
+            &json!({"schema": 1, "sdk": {"uid": UID, "access_key": ACCESS_KEY, "id_token": ID_TOKEN},
+                    "device": device(), "players": players}),
+        );
+        path
+    }
+    fn app_key_env() -> String {
+        let name = format!("SIRIUS_TEST_SDK_KEY_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&name, APP_KEY);
+        name
+    }
+    fn login_config(sdk: &SdkMock) -> LoginConfig {
+        LoginConfig {
+            sdk_origin: sdk.url.clone(),
+            sdk_app_key_env: app_key_env(),
+            login_min_interval_seconds: 0,
+            ..LoginConfig::default()
+        }
+    }
+    fn global_config(region: Region, f: &Fixture, sdk: &SdkMock, identity: &Path) -> Config {
+        let mut cfg = super::regional_config(region);
+        cfg.endpoint = f.url.clone();
+        cfg.cdn_credential_env = BTreeMap::new();
+        cfg.accounts.push(AccountConfig {
+            name: format!("{}-guest", region.name()),
+            player_id_env: None,
+            credential_env: None,
+            credentials_file: None,
+            global_identity_file: Some(identity.to_path_buf()),
+        });
+        cfg.global_login = Some(login_config(sdk));
+        cfg
+    }
+    struct Env {
+        _dir: tempfile::TempDir,
+        sdk: SdkMock,
+        script: Arc<Upstream>,
+        f: Fixture,
+        cfg: Config,
+    }
+    async fn env(region: Region) -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = sdk_mock().await;
+        let script = Upstream::new(region.name());
+        let f = upstream(script.clone()).await;
+        let identity = identity_file(dir.path(), json!({}));
+        let cfg = global_config(region, &f, &sdk, &identity);
+        Env {
+            _dir: dir,
+            sdk,
+            script,
+            f,
+            cfg,
+        }
+    }
+    fn x_headers(headers: &HeaderMap) -> std::collections::BTreeSet<String> {
+        headers
+            .keys()
+            .map(|k| k.as_str().to_owned())
+            .filter(|k| k.starts_with("x-"))
+            .collect()
+    }
+    fn status(c: &GameClient) -> Value {
+        c.account_status().unwrap()["accounts"][0].clone()
+    }
+
+    #[test]
+    fn sdk_signing_and_form_encoding_match_python_vectors() {
+        // Generated by global_guest.py `sign`/`prepare` with synthetic inputs and key.
+        type Vector<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+        let vectors: [Vector; 3] = [
+            (
+                &[("z", "中文 +%"), ("a", "A"), ("item_name", "ignore")],
+                "test",
+                "6297f541372af375e5bd121d5379ea2f",
+            ),
+            (
+                &[
+                    ("b", "2"),
+                    ("B", "1"),
+                    ("_", "u"),
+                    ("ä", "x"),
+                    ("Item_Desc", "skip"),
+                    ("timestamp", "123"),
+                ],
+                "synthetic-secret",
+                "17a23f23ac7b2b8f0768f3a79a13436f",
+            ),
+            (
+                &[("\u{1F600}", "emoji"), ("\u{FF01}", "fw"), ("z", "")],
+                "k",
+                "6fb84d06e7355fd7ec2a9c2a3a3159f0",
+            ),
+        ];
+        for (parameters, key, expected) in vectors {
+            let parameters = parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(global_sdk::sign(&parameters, key), expected);
+        }
+        let device: global_sdk::Device = serde_json::from_value(json!({
+            "udid": "fixture-udid-0001", "model": "Model + 1%", "pf_ver": "12", "dp": "3840*2160",
+            "net": "4", "operators": "5", "adid": "", "lang": "en", "time_zone": "Asia/Hong_Kong",
+            "isRoot": "0", "unity_device_model": "m", "unity_operating_system": "o",
+            "unity_device_id": "i"}))
+        .unwrap();
+        let common = "game_id=17703&server_id=16841&merchant_id=1045&app_ver=1.0.1&sdk_ver=4.2.12&channel_id=100&platform=google&platform_type=3&sdk_log_type=1&ad_ext=&web_code=6&udid=fixture-udid-0001&model=Model+%2B+1%25&pf_ver=12&dp=3840%2A2160&net=4&operators=5&adid=&lang=en&time_zone=Asia%2FHong_Kong&isRoot=0&timestamp=1700000000123";
+        assert_eq!(
+            global_sdk::form_encode(&global_sdk::prepare(
+                &device,
+                "synthetic-secret",
+                1_700_000_000_123,
+                None
+            )),
+            format!("{common}&sign=e9c703bd07fdfdd0bc3c7f025a028f25")
+        );
+        let cached = global_sdk::SdkAccount {
+            uid: "4242".into(),
+            access_key: "ak~x y*z".into(),
+            id_token: String::new(),
+            mid: None,
+        };
+        assert_eq!(
+            global_sdk::form_encode(&global_sdk::prepare(
+                &device,
+                "synthetic-secret",
+                1_700_000_000_123,
+                Some(&cached)
+            )),
+            format!(
+                "{common}&access_key=ak~x+y%2Az&uid=4242&sign=515fcbfb0f68cb9be8b5a6cda3e0c176"
+            )
+        );
+    }
+
+    #[test]
+    fn player_login_wire_format_matches_verified_probe_bytes() {
+        let bundle =
+            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1")).unwrap();
+        assert_eq!(bundle.status.codec, "native");
+        let sdk = global_sdk::SdkAccount {
+            uid: "4242".into(),
+            access_key: "ak~x y*z".into(),
+            id_token: "idt".into(),
+            mid: None,
+        };
+        let device: global_sdk::Device = serde_json::from_value(json!({
+            "udid": "u", "model": "m", "pf_ver": "12", "dp": "1*1", "net": "4", "lang": "en",
+            "time_zone": "UTC", "isRoot": "0", "unity_device_model": "Samsung SM-S9180",
+            "unity_operating_system": "Android OS 12 / API-32 (W528JS/224)",
+            "unity_device_id": "0123456789abcdef0123456789abcdef"}))
+        .unwrap();
+        let request = crate::global_account::login_request(&sdk, &device, "1.0.1");
+        // global_login_probe.py encode_message(LOGIN_REQ_SCHEMA, ...) for the same values:
+        // platform 0 and uuid.adId "" are omitted, area 6, channel 2001, brand 5.
+        let expected = "0a04343234321208616b7e7820792a7a221053616d73756e6720534d2d53393138302a23416e64726f6964204f53203132202f204150492d33322028573532384a532f323234293205312e302e313a22122030313233343536373839616263646566303132333435363738396162636465664213636f6d2e62696c6962696c692e73697269757350d10f580560066a03696474";
+        let encoded = bundle.encode(PLAYER_LOGIN, request).unwrap();
+        let hex = encoded
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, expected);
+        let hex =
+            "0a0f0a057069642d311206637265642d31120531363834311a0d676c6f62616c207365727665722001";
+        let response = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        let session =
+            crate::global_account::parse_login(&bundle.decode(PLAYER_LOGIN, &response).unwrap())
+                .unwrap();
+        assert_eq!(
+            (session.player_id.as_str(), session.credential.as_str()),
+            ("pid-1", "cred-1")
+        );
+        assert!(session.is_new_user);
+        assert_eq!(session.cp_server_name, "global server");
+        // The Global bundle has no Whoami RPC at all.
+        assert!(crate::protocol::method(&bundle.pool, WHOAMI).is_err());
+    }
+
+    #[test]
+    fn sdk_envelopes_stop_on_captcha_refusal_and_identity_change() {
+        use global_sdk::{interpret, SdkError};
+        let tourist = interpret(
+            &json!({"code":0,"data":{"uid":42,"access_key":"k","id_token":"t","mid":7}}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (tourist.uid.as_str(), tourist.mid.as_deref()),
+            ("42", Some("7"))
+        );
+        let cached = interpret(&json!({"code":0,"data":{"uid":"42"}}), Some(&tourist)).unwrap();
+        assert_eq!(
+            (cached.access_key.as_str(), cached.id_token.as_str()),
+            ("k", "t")
+        );
+        let refreshed = interpret(
+            &json!({"code":0,"data":{"uid":"42","access_key":"other","id_token":"t2"}}),
+            Some(&tourist),
+        )
+        .unwrap();
+        // CacheLoginActivity restores the original access key.
+        assert_eq!(
+            (refreshed.access_key.as_str(), refreshed.id_token.as_str()),
+            ("k", "t2")
+        );
+        for (body, error) in [
+            (json!({"code":200007,"data":{}}), SdkError::Captcha),
+            (json!({"code":500002}), SdkError::Refused(500002)),
+            (json!({"code":"0","data":{"uid":"42"}}), SdkError::Protocol),
+            (json!({"code":0.0,"data":{"uid":"42"}}), SdkError::Protocol),
+            (json!({"code":0,"data":{"uid":"43"}}), SdkError::Identity),
+            (json!({"code":0,"data":{}}), SdkError::Identity),
+        ] {
+            assert_eq!(interpret(&body, Some(&tourist)).err(), Some(error));
+        }
+        assert_eq!(
+            interpret(&json!({"code":0,"data":{"uid":"1"}}), None).err(),
+            Some(SdkError::Identity)
+        );
+        for origin in [
+            "https://l11-sdk-login-intl.biligame.net",
+            "https://l12-sdk-login-intl.biligame.net",
+            "https://l13-sdk-login-intl.biligame.net",
+        ] {
+            assert!(global_sdk::origin_allowed(origin));
+        }
+        for origin in [
+            "http://l11-sdk-login-intl.biligame.net",
+            "https://l14-sdk-login-intl.biligame.net",
+            "https://l11-sdk-login-intl.biligame.net/",
+            "https://example.com",
+        ] {
+            assert!(!global_sdk::origin_allowed(origin));
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_client_never_follows_redirects_or_reads_unbounded_bodies() {
+        let app = axum::Router::new()
+            .route(
+                global_sdk::TOURIST_LOGIN,
+                axum::routing::post(|| async {
+                    axum::response::Redirect::temporary("https://example.com/")
+                }),
+            )
+            .route(
+                global_sdk::CACHE_LOGIN,
+                axum::routing::post(|| async { "x".repeat(1024 * 1024 + 1) }),
+            );
+        let (url, task) = super::peer_http_server(app).await;
+        let client =
+            global_sdk::SdkClient::new(&url, APP_KEY.into(), Duration::from_secs(5), None).unwrap();
+        let device: global_sdk::Device = serde_json::from_value(device()).unwrap();
+        assert_eq!(
+            client.tourist_login(&device).await.err(),
+            Some(global_sdk::SdkError::Protocol)
+        );
+        let account = global_sdk::SdkAccount {
+            uid: UID.into(),
+            access_key: ACCESS_KEY.into(),
+            id_token: String::new(),
+            mid: None,
+        };
+        assert_eq!(
+            client.cache_login(&device, &account).await.err(),
+            Some(global_sdk::SdkError::Protocol)
+        );
+        assert!(global_sdk::SdkClient::new(
+            "https://example.com",
+            "k".into(),
+            Duration::from_secs(5),
+            None
+        )
+        .is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_plans_offline_and_creates_exactly_one_guest_with_the_flag() {
+        use crate::global_account::{bootstrap, BootstrapOptions};
+        let sdk = sdk_mock().await;
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let device_file = dir.path().join("device.json");
+        write_private(&device_file, &device());
+        let identity = dir.path().join("guest.json");
+        let mut options = BootstrapOptions {
+            device_file: device_file.clone(),
+            identity_file: identity.clone(),
+            sdk_origin: sdk.url.clone(),
+            app_key_env: app_key_env(),
+            create_sdk_guest: false,
+        };
+        let plan = bootstrap(&options).await.unwrap();
+        assert_eq!(plan["network_requests"], 0);
+        assert!(sdk.requests.lock().unwrap().is_empty());
+        assert!(!identity.exists());
+        options.create_sdk_guest = true;
+        let created = bootstrap(&options).await.unwrap();
+        assert_eq!(created["sdk_guest_created"], true);
+        assert!(!created.to_string().contains(ACCESS_KEY));
+        assert_eq!(sdk.count(global_sdk::TOURIST_LOGIN), 1);
+        {
+            let requests = sdk.requests.lock().unwrap();
+            let (_, headers, form) = &requests[0];
+            assert_eq!(headers["user-agent"], "Mozilla/5.0 BSGameSDK");
+            assert_eq!(headers["api-version"], "1");
+            assert_eq!(headers["one-sdk-ver"], "1.25.0");
+            assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+            assert_eq!(form["channel_id"], "100");
+            assert_eq!(form["platform"], "google");
+            assert_eq!(form["udid"], UDID);
+            assert!(!form.contains_key("access_key"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&identity).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let loaded = crate::global_account::Identity::load(&identity).unwrap();
+        assert_eq!(
+            (loaded.sdk.uid.as_str(), loaded.sdk.access_key.as_str()),
+            (UID, ACCESS_KEY)
+        );
+        assert_eq!(loaded.sdk.id_token, ID_TOKEN);
+        // Never repeated: the identity and attempt marker block a second run before any request.
+        assert!(bootstrap(&options).await.is_err());
+        std::fs::remove_file(&identity).unwrap();
+        assert!(bootstrap(&options).await.is_err());
+        assert_eq!(sdk.requests.lock().unwrap().len(), 1);
+        // A CAPTCHA stops without an identity file; the marker keeps the attempt visible.
+        let other = dir.path().join("second.json");
+        options.identity_file = other.clone();
+        sdk.codes
+            .lock()
+            .unwrap()
+            .push_back(global_sdk::CAPTCHA_CODE);
+        let error = bootstrap(&options).await.unwrap_err();
+        assert!(error.contains("CAPTCHA"));
+        assert!(!other.exists());
+        assert!(dir.path().join("second.json.attempt.json").exists());
+        assert_eq!(sdk.requests.lock().unwrap().len(), 2);
+        // Official origins only.
+        options.identity_file = dir.path().join("third.json");
+        options.sdk_origin = "https://example.com".into();
+        assert!(bootstrap(&options).await.is_err());
+        assert_eq!(sdk.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_performs_one_cache_login_and_one_player_login() {
+        let e = env(Region::En).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        let summary = c.verify_global_account("en-guest", false).await.unwrap();
+        assert_eq!(summary["player_login"], "ok");
+        assert_eq!(summary["sdk_cache_login"], "ok");
+        assert_eq!(summary["new_player"], true);
+        assert_eq!(summary["cp_server_name"], "global server");
+        assert_eq!(summary["player_pin"], "unset");
+        assert!(summary.get("player_id").is_none());
+        let text = summary.to_string();
+        for secret in [
+            UID,
+            ACCESS_KEY,
+            ID_TOKEN,
+            "SECRETCRED",
+            "PLAYERID",
+            UDID,
+            UNITY_ID,
+        ] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(e.sdk.count(global_sdk::TOURIST_LOGIN), 0);
+        assert_eq!(paths(&e.f), [PLAYER_LOGIN]);
+        let shown = GameClient::for_test(e.cfg.clone())
+            .verify_global_account("en-guest", true)
+            .await
+            .unwrap();
+        assert_eq!(shown["player_id"], "PLAYERID-en");
+        assert!(matches!(
+            c.verify_global_account("missing", false).await,
+            Err(AppError::NotFound)
+        ));
+        let jp = GameClient::for_test(config());
+        assert!(matches!(
+            jp.verify_global_account("x", false).await,
+            Err(AppError::UnsupportedRegionOperation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lazy_login_happens_once_for_concurrent_calls_with_verified_headers() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        assert_eq!(status(&c)["session_state"], "none");
+        // No login before the first authenticated request.
+        assert!(e.f.received.lock().unwrap().is_empty());
+        let calls = (0..10)
+            .map(|_| {
+                let c = c.clone();
+                tokio::spawn(async move { c.call(PLAYER_DATA, json!({})).await })
+            })
+            .collect::<Vec<_>>();
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap()["chatReportUsedToday"], 3);
+        }
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        assert_eq!(count(&e.f, V), 1);
+        assert_eq!(count(&e.f, PLAYER_DATA), 10);
+        assert_eq!(count(&e.f, WHOAMI), 0);
+        let received = e.f.received.lock().unwrap();
+        let login = received.iter().find(|r| r.0 == PLAYER_LOGIN).unwrap();
+        // PlayerLogin: exactly the client's login headers, no player or version headers.
+        assert_eq!(
+            x_headers(&login.1),
+            [
+                "x-client-version",
+                "x-platform",
+                "x-player-bid",
+                "x-request-id"
+            ]
+            .map(String::from)
+            .into()
+        );
+        assert_eq!(login.1["x-player-bid"], UID);
+        assert_eq!(login.1["x-platform"], "android");
+        assert_eq!(login.1["x-client-version"], "1.0.1");
+        let request = DynamicMessage::decode(
+            global_pool()
+                .get_message_by_name("app.playerlogin.PlayerLoginRequest")
+                .unwrap(),
+            &login.2[5..],
+        )
+        .unwrap();
+        let request = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            request,
+            json!({"sdkUid": UID, "sdkAccessToken": ACCESS_KEY, "deviceModel": "Fixture SM-FIXTURE",
+                   "operatingSystem": "Android OS 12 / API-32 (FIXTURE)", "clientVersion": "1.0.1",
+                   "uuid": {"identifier": UNITY_ID}, "clientPackage": "com.bilibili.sirius",
+                   "globalChannelId": 2001, "brandId": 5, "areaId": 6, "idToken": REFRESHED_ID_TOKEN})
+        );
+        // Authenticated reads: the header set verified live for GetPlayerData.
+        for data in received.iter().filter(|r| r.0 == PLAYER_DATA) {
+            assert_eq!(
+                x_headers(&data.1),
+                [
+                    "x-client-version",
+                    "x-master-version",
+                    "x-platform",
+                    "x-player-bid",
+                    "x-player-credential",
+                    "x-player-id",
+                    "x-request-id",
+                    "x-resource-version",
+                ]
+                .map(String::from)
+                .into()
+            );
+            assert_eq!(data.1["x-player-bid"], UID);
+            assert_eq!(data.1["x-player-id"], "PLAYERID-hk");
+            assert_eq!(data.1["x-player-credential"], "SECRETCRED-hk-1");
+            assert_eq!(data.1["x-master-version"], "master-hk");
+            assert_eq!(data.1["x-resource-version"], "1.0.0.104");
+            assert_eq!(data.1["x-platform"], "android");
+        }
+        // Anonymous Global calls still carry no account headers.
+        let version = received.iter().find(|r| r.0 == V).unwrap();
+        assert!(!version.1.contains_key("x-player-bid"));
+        assert!(!version.1.contains_key("x-player-credential"));
+        drop(received);
+        let s = status(&c);
+        assert_eq!(s["session_state"], "active");
+        assert_eq!(s["logins_24h"], 1);
+        assert!(s["last_login_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn token_signals_relogin_without_replay_and_repeated_failure_disables() {
+        let e = env(Region::En).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::Grpc(16))
+        ));
+        // The failed logical request is not replayed.
+        assert_eq!(count(&e.f, PLAYER_DATA), 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        let s = status(&c);
+        assert_eq!(s["session_state"], "relogin_pending");
+        assert_eq!(s["last_error_code"], "TOKEN_ILLEGAL");
+        assert_eq!(s["disabled"], false);
+        // TOKEN_*: the next request revalidates the SDK identity, then logs in again.
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 2);
+        let last = e.f.received.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(last["x-player-credential"], "SECRETCRED-en-2");
+        assert_eq!(status(&c)["session_state"], "active");
+        assert!(status(&c).get("last_error_code").is_none());
+        // PLAYER_NOT_*: a new PlayerLogin without another SDK request.
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((5, "PLAYER_NOT_FOUND"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 3);
+        // gRPC 16 without an application code is a token failure too; failing again right
+        // after the fresh login disables the account for an operator.
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .extend([(16, ""), (16, "TOKEN_MISSING")]);
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 4);
+        assert_eq!(status(&c)["disabled"], true);
+        let before = e.f.received.lock().unwrap().len();
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        assert_eq!(e.f.received.lock().unwrap().len(), before);
+        assert_eq!(count(&e.f, WHOAMI), 0);
+    }
+
+    #[tokio::test]
+    async fn ban_disables_and_login_queue_cools_down_without_polling() {
+        for (errors, calls, expected) in [
+            (vec![(7, "BAN_ACCOUNT")], vec![], "disabled"),
+            (vec![], vec![(7, "BAN_BILLING")], "disabled"),
+            (vec![(8, "AEGIS_QUEUE")], vec![], "cooling"),
+            (vec![(14, "AEGIS_SERVER_FULL")], vec![], "cooling"),
+        ] {
+            let e = env(Region::Kr).await;
+            e.script.login_errors.lock().unwrap().extend(errors.clone());
+            e.script.call_errors.lock().unwrap().extend(calls.clone());
+            let c = GameClient::for_test(e.cfg.clone());
+            assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+            let s = status(&c);
+            assert_eq!(s["session_state"], expected, "{errors:?} {calls:?}");
+            assert_eq!(
+                s["last_error_code"],
+                errors.iter().chain(&calls).next().unwrap().1
+            );
+            if expected == "cooling" {
+                let remaining = s["cooldown_remaining_seconds"].as_u64().unwrap();
+                assert!((890..=900).contains(&remaining), "{remaining}");
+            } else {
+                assert_eq!(s["disabled"], true);
+            }
+            let before = e.f.received.lock().unwrap().len();
+            let sdk_before = e.sdk.requests.lock().unwrap().len();
+            assert!(matches!(
+                c.call(PLAYER_DATA, json!({})).await,
+                Err(AppError::AccountUnavailable)
+            ));
+            assert_eq!(e.f.received.lock().unwrap().len(), before);
+            assert_eq!(e.sdk.requests.lock().unwrap().len(), sdk_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_failures_stop_logins_and_captcha_needs_an_operator() {
+        let e = env(Region::En).await;
+        e.sdk
+            .codes
+            .lock()
+            .unwrap()
+            .push_back(global_sdk::CAPTCHA_CODE);
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        let s = status(&c);
+        assert_eq!(s["disabled"], true);
+        assert_eq!(s["last_error_code"], "SDK_CAPTCHA");
+        // No PlayerLogin (or Version) after an SDK refusal, and no SDK retry.
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), 1);
+        // Reload restores the account (operator action); the SDK identity is revalidated.
+        c.reload_accounts().await.unwrap();
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_device_and_login_rate_limits_defer_logins() {
+        // CONCURRENT_DEVICE invalidates and cools down; reaching the limit disables.
+        let mut e = env(Region::Hk).await;
+        e.cfg.global_login.as_mut().unwrap().concurrent_device_limit = 2;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "CONCURRENT_DEVICE"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let s = status(&c);
+        assert_eq!(s["session_state"], "cooling");
+        assert_eq!(s["disabled"], false);
+        assert!(s["cooldown_remaining_seconds"].as_u64().unwrap() > 0);
+        let mut limited = e.cfg.clone();
+        limited
+            .global_login
+            .as_mut()
+            .unwrap()
+            .concurrent_device_limit = 1;
+        let c = GameClient::for_test(limited);
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "CONCURRENT_DEVICE"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(&c)["disabled"], true);
+
+        // Minimum login interval: a re-login inside the interval is deferred, not sent.
+        e.cfg
+            .global_login
+            .as_mut()
+            .unwrap()
+            .login_min_interval_seconds = 3600;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let logins = count(&e.f, PLAYER_LOGIN);
+        let sdk_requests = e.sdk.requests.lock().unwrap().len();
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        assert_eq!(count(&e.f, PLAYER_LOGIN), logins);
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), sdk_requests);
+        let s = status(&c);
+        assert_eq!(s["session_state"], "cooling");
+        assert!(s["cooldown_remaining_seconds"].as_u64().unwrap() > 3500);
+        // Reload re-enables accounts but keeps the login history, so it cannot bypass limits.
+        c.reload_accounts().await.unwrap();
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        assert_eq!(count(&e.f, PLAYER_LOGIN), logins);
+
+        // Daily cap.
+        e.cfg
+            .global_login
+            .as_mut()
+            .unwrap()
+            .login_min_interval_seconds = 0;
+        e.cfg.global_login.as_mut().unwrap().max_logins_per_day = 1;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let logins = count(&e.f, PLAYER_LOGIN);
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        assert_eq!(count(&e.f, PLAYER_LOGIN), logins);
+        let s = status(&c);
+        assert_eq!(s["logins_24h"], 1);
+        assert!(s["cooldown_remaining_seconds"].as_u64().unwrap() > 86_000);
+    }
+
+    #[tokio::test]
+    async fn account_identity_comes_from_player_login_and_whoami_is_never_sent() {
+        let mut e = env(Region::Kr).await;
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = identity_file(
+            dir.path(),
+            json!({"kr": {"expected_player_id": "PLAYERID-kr"}}),
+        );
+        e.cfg.accounts[0].global_identity_file = Some(pinned);
+        let c = GameClient::for_test(e.cfg.clone());
+        let app = api::router(c.clone(), "api".into(), "internal".into());
+        for path in [
+            "/internal/v1/accounts/kr-guest/identity",
+            "/internal/v1/account",
+            "/internal/v1/accounts/kr-guest/player-data",
+            "/internal/v1/account/player-data",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("authorization", "Bearer internal")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{path}");
+            let value = body(response).await;
+            if path.ends_with("identity") || path.ends_with("account") {
+                assert_eq!(value, json!({"playerId": "PLAYERID-kr"}));
+            }
+        }
+        assert_eq!(count(&e.f, WHOAMI), 0);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        assert_eq!(count(&e.f, PLAYER_DATA), 2);
+        // A pinned identity that logs into another player disables the account.
+        let dir = tempfile::tempdir().unwrap();
+        e.cfg.accounts[0].global_identity_file = Some(identity_file(
+            dir.path(),
+            json!({"kr": {"expected_player_id": "someone-else"}}),
+        ));
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(matches!(
+            c.call(WHOAMI, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        assert_eq!(status(&c)["last_error_code"], "PLAYER_MISMATCH");
+        assert_eq!(status(&c)["disabled"], true);
+        assert_eq!(count(&e.f, WHOAMI), 0);
+    }
+
+    #[tokio::test]
+    async fn public_global_operations_use_the_verified_routes() {
+        let e = env(Region::En).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        let app = api::router(c.clone(), "api".into(), "internal".into());
+        let get = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header("authorization", "Bearer api")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                (response.status(), body(response).await)
+            }
+        };
+        let (code, value) = get("/api/v1/players/by-profile-id/9007199254740993").await;
+        assert_eq!(code, 200);
+        assert_eq!(value["playerProfile"]["profileId"], "9007199254740993");
+        let (code, value) = get("/api/v1/events/12/rankings?ranks=1").await;
+        assert_eq!(code, 200);
+        assert_eq!(value["ranking"][0]["point"], 10);
+        let (code, value) = get("/api/v1/servers").await;
+        assert_eq!(code, 200);
+        // The descriptor's `areaID` keeps its public `areaId` key.
+        assert_eq!(
+            value,
+            json!({"servers": [{"name": "EN Region", "areaId": "3"}]})
+        );
+        let (_, value) = get("/api/v1/system").await;
+        let routes = value["supported_rpcs"].as_array().unwrap();
+        assert!(routes.contains(&json!(PROFILE)) && routes.contains(&json!(PLAYER_DATA)));
+        assert!(!routes.contains(&json!(WHOAMI)) && !routes.contains(&json!(PLAYER_LOGIN)));
+        let (_, value) = get("/api/v1/regions").await;
+        let en = value["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["region"] == "en")
+            .unwrap()
+            .clone();
+        assert_eq!(en["capability"], "global_proxy");
+        for (operation, expected) in [
+            ("version", "live_verified"),
+            ("servers", "live_verified"),
+            ("account_login", "live_verified"),
+            ("player_data", "live_verified"),
+            ("account_identity", "implemented_unverified"),
+            ("profile", "implemented_unverified"),
+            ("event_ranking", "implemented_unverified"),
+            ("event_deck", "implemented_unverified"),
+            ("music_ranking", "implemented_unverified"),
+            ("challenge_ranking", "implemented_unverified"),
+            ("announcements", "implemented_unverified"),
+        ] {
+            assert_eq!(en["operations"][operation], expected, "{operation}");
+        }
+        let cn = value["regions"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(cn["capability"], "reserved");
+        assert_eq!(cn["operations"]["profile"], "reserved");
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        assert_eq!(count(&e.f, WHOAMI), 0);
+        // Profile and ranking requests carry the Global account headers.
+        let received = e.f.received.lock().unwrap();
+        let profile = received.iter().find(|r| r.0 == PROFILE).unwrap();
+        assert_eq!(profile.1["x-player-bid"], UID);
+        assert_eq!(profile.1["x-resource-version"], "1.0.0.104");
+    }
+
+    #[tokio::test]
+    async fn response_cache_scope_survives_credential_rotation() {
+        let mut e = env(Region::En).await;
+        e.cfg.response_cache = serde_json::from_value(json!({"backend": "memory", "ttl_ms": 60000,
+            "max_entries": 100, "max_bytes": 1000000, "max_entry_bytes": 100000}))
+        .unwrap();
+        let c = GameClient::for_test(e.cfg.clone());
+        let ranking = json!({"eventId": "12", "ranks": [1]});
+        c.call(EVENT_RANKING, ranking.clone()).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 2);
+        // The rotated credential does not change the account's cache scope.
+        c.call(EVENT_RANKING, ranking).await.unwrap();
+        assert_eq!(count(&e.f, EVENT_RANKING), 1);
+    }
+
+    #[tokio::test]
+    async fn secrets_never_reach_logs_status_or_errors() {
+        use tracing_subscriber::fmt::MakeWriter;
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("sirius_api_proxy=trace")
+            .with_writer(buffer.clone())
+            .finish();
+        // With a single registered dispatcher, tracing-core computes callsite interest from the
+        // registering thread's default only, so a parallel test could cache "never" for these
+        // callsites. A second live dispatcher makes interest consider every dispatcher.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _default = tracing::subscriber::set_default(subscriber);
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        let app = api::router(c.clone(), "api".into(), "internal".into());
+        let mut outputs = Vec::new();
+        let get = |path: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(path)
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                body(response).await.to_string()
+            }
+        };
+        outputs.push(get("/internal/v1/account/player-data", "internal").await);
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        outputs.push(get("/internal/v1/account/player-data", "internal").await);
+        outputs.push(get("/internal/v1/accounts", "internal").await);
+        e.script
+            .login_errors
+            .lock()
+            .unwrap()
+            .push_back((7, "BAN_ACCOUNT"));
+        outputs.push(get("/api/v1/players/by-profile-id/5", "api").await);
+        outputs.push(get("/internal/v1/accounts", "internal").await);
+        outputs.push(get("/api/v1/system", "api").await);
+        outputs.push(
+            c.verify_global_account("hk-guest", false)
+                .await
+                .map_or_else(|e| e.to_string(), |v| v.to_string()),
+        );
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Global PlayerLogin succeeded"), "{logs}");
+        assert!(logs.contains("BAN_ACCOUNT"), "{logs}");
+        let joined = outputs.join("\n");
+        assert!(joined.contains("BAN_ACCOUNT"), "{joined}");
+        for secret in [
+            UID,
+            ACCESS_KEY,
+            ID_TOKEN,
+            REFRESHED_ID_TOKEN,
+            UDID,
+            UNITY_ID,
+            APP_KEY,
+            "SECRETCRED",
+            "PLAYERID",
+            "SECRET-upstream-message",
+        ] {
+            assert!(!logs.contains(secret), "log leaks {secret}");
+            assert!(!joined.contains(secret), "output leaks {secret}: {joined}");
+        }
+        // Player data itself is a private internal response; it carries no login secrets.
+        assert_eq!(count(&e.f, WHOAMI), 0);
+    }
+
+    #[test]
+    fn configuration_rejects_unsafe_global_account_setups() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity_file(dir.path(), json!({}));
+        let base = || {
+            let mut cfg = super::regional_config(Region::En);
+            cfg.cdn_credential_env = BTreeMap::new();
+            cfg.accounts.push(AccountConfig {
+                name: "en-guest".into(),
+                player_id_env: None,
+                credential_env: None,
+                credentials_file: None,
+                global_identity_file: Some(identity.clone()),
+            });
+            cfg.global_login = Some(LoginConfig::default());
+            cfg
+        };
+        assert!(base().validate().is_ok());
+        let mut cfg = base();
+        cfg.session_lock = false;
+        assert!(cfg.validate().is_err());
+        let mut cfg = base();
+        cfg.global_login = None;
+        assert!(cfg.validate().is_err());
+        for origin in [
+            "https://example.com",
+            "http://l11-sdk-login-intl.biligame.net",
+            "https://l11-sdk-login-intl.biligame.net/",
+        ] {
+            let mut cfg = base();
+            cfg.global_login.as_mut().unwrap().sdk_origin = origin.into();
+            assert!(cfg.validate().is_err(), "{origin}");
+        }
+        for mutate in [
+            |l: &mut LoginConfig| l.max_logins_per_day = 0,
+            |l: &mut LoginConfig| l.aegis_cooldown_seconds = 1,
+            |l: &mut LoginConfig| l.sdk_timeout_ms = 10,
+            |l: &mut LoginConfig| l.login_min_interval_seconds = 86_401,
+            |l: &mut LoginConfig| l.concurrent_device_limit = 0,
+        ] {
+            let mut cfg = base();
+            mutate(cfg.global_login.as_mut().unwrap());
+            assert!(cfg.validate().is_err());
+        }
+        // Static game credentials are JP only; identity files are Global only.
+        let mut cfg = base();
+        cfg.accounts[0].global_identity_file = None;
+        cfg.accounts[0].credentials_file = Some(identity.clone());
+        assert!(cfg.validate().is_err());
+        let mut cfg = base();
+        cfg.accounts[0].player_id_env = Some("X".into());
+        assert!(cfg.validate().is_err());
+        let mut cfg = base();
+        cfg.accounts.clear();
+        cfg.player_id_env = Some("A".into());
+        cfg.player_credential_env = Some("B".into());
+        assert!(cfg.validate().is_err());
+        let mut jp = config();
+        jp.accounts.push(base().accounts[0].clone());
+        assert!(jp.validate().is_err());
+        let mut jp = config();
+        jp.global_login = Some(LoginConfig::default());
+        assert!(jp.validate().is_err());
+        // YAML shape, including deny_unknown_fields.
+        assert!(yaml_serde::from_str::<LoginConfig>(
+            "sdk_origin: https://l12-sdk-login-intl.biligame.net\nmax_logins_per_day: 6\n"
+        )
+        .is_ok());
+        assert!(yaml_serde::from_str::<LoginConfig>("area_id: 3\n").is_err());
+        // Identity files: private, bounded, schema 1, no duplicate SDK identity in one region.
+        let pool_config = |files: Vec<PathBuf>| {
+            let mut cfg = base();
+            cfg.accounts = files
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| AccountConfig {
+                    name: format!("guest-{i}"),
+                    player_id_env: None,
+                    credential_env: None,
+                    credentials_file: None,
+                    global_identity_file: Some(path),
+                })
+                .collect();
+            cfg
+        };
+        assert!(crate::accounts::Pool::load(&pool_config(vec![identity.clone()]), 1).is_ok());
+        assert!(crate::accounts::Pool::load(
+            &pool_config(vec![identity.clone(), identity_file(dir.path(), json!({}))]),
+            1
+        )
+        .is_err());
+        let write = |value: Value| {
+            let path = dir
+                .path()
+                .join(format!("bad-{}.json", uuid::Uuid::new_v4().simple()));
+            write_private(&path, &value);
+            path
+        };
+        let good =
+            json!({"schema": 1, "sdk": {"uid": UID, "access_key": ACCESS_KEY}, "device": device()});
+        assert!(crate::accounts::Pool::load(&pool_config(vec![write(good.clone())]), 1).is_ok());
+        let mut bad = Vec::new();
+        for (pointer, value) in [
+            ("/schema", json!(2)),
+            ("/sdk/access_key", json!("")),
+            ("/sdk/uid", json!(null)),
+            ("/device/udid", json!("")),
+            ("/device/unity_device_id", json!(" ")),
+            ("/device/model", json!("line\nbreak")),
+            ("/players", json!({"jp": {"expected_player_id": "x"}})),
+            ("/extra", json!(1)),
+        ] {
+            let mut value_json = good.clone();
+            if let Some(key) = pointer.strip_prefix('/').filter(|k| !k.contains('/')) {
+                value_json[key] = value;
+            } else {
+                *value_json.pointer_mut(pointer).unwrap_or_else(|| {
+                    panic!("{pointer}");
+                }) = value;
+            }
+            bad.push(write(value_json));
+        }
+        for path in bad {
+            assert!(
+                matches!(
+                    crate::accounts::Pool::load(&pool_config(vec![path.clone()]), 1),
+                    Err(AppError::Config(_))
+                ),
+                "{}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let open = write(good);
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                crate::accounts::Pool::load(&pool_config(vec![open]), 1),
+                Err(AppError::Config(message)) if message.contains("private")
+            ));
+        }
+        // The SDK app key is required once an identity account exists.
+        let mut cfg = base();
+        cfg.global_login.as_mut().unwrap().sdk_app_key_env =
+            format!("SIRIUS_UNSET_{}", uuid::Uuid::new_v4().simple());
+        assert!(GameClient::new(cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn multi_region_jp_hk_en_kr_keep_accounts_and_sessions_isolated() {
+        use crate::deployment::DeploymentConfig;
+        let dir = tempfile::tempdir().unwrap();
+        // One SDK identity, one independent player per Global server.
+        let identity = identity_file(dir.path(), json!({}));
+        let sdk = sdk_mock().await;
+        let mut clients = Vec::new();
+        let mut fixtures = Vec::new();
+        for region in [Region::Hk, Region::En, Region::Kr] {
+            let script = Upstream::new(region.name());
+            let f = upstream(script).await;
+            let c = GameClient::for_test(global_config(region, &f, &sdk, &identity));
+            clients.push(c);
+            fixtures.push(f);
+        }
+        // JP keeps static credentials, Whoami before GetPlayerData and no Global headers.
+        let id = format!("SIRIUS_TEST_ID_{}", uuid::Uuid::new_v4().simple());
+        std::env::set_var(&id, "jp-player");
+        std::env::set_var(format!("{id}_KEY"), "jp-secret");
+        let mut jp_cfg = super::regional_config(Region::Jp);
+        jp_cfg.player_id_env = Some(id.clone());
+        jp_cfg.player_credential_env = Some(format!("{id}_KEY"));
+        let mut data = Reply::version();
+        data.bytes = framed(message("app.player.GetPlayerDataResponse", json!({})));
+        let jp_f = fixture(vec![Reply::version(), whoami_reply("jp-player"), data]).await;
+        let jp = super::client(&jp_f, jp_cfg.clone());
+        jp.call(PLAYER_DATA, json!({})).await.unwrap();
+        let jp_seen = paths(&jp_f);
+        assert_eq!(jp_seen, [V, WHOAMI, PLAYER_DATA]);
+        for (_, headers, _) in jp_f.received.lock().unwrap().iter().skip(1) {
+            assert_eq!(headers["x-player-id"], "jp-player");
+            assert_eq!(headers["x-platform"], "ios");
+            assert!(!headers.contains_key("x-player-bid"));
+            assert!(!headers.contains_key("x-resource-version"));
+        }
+        for (c, f) in clients.iter().zip(&fixtures) {
+            c.call(PLAYER_DATA, json!({})).await.unwrap();
+            assert_eq!(paths(f), [V, PLAYER_LOGIN, PLAYER_DATA]);
+        }
+        assert_eq!(sdk.count(global_sdk::CACHE_LOGIN), 3);
+        for (region, f) in ["hk", "en", "kr"].iter().zip(&fixtures) {
+            let received = f.received.lock().unwrap();
+            assert_eq!(received[2].1["x-player-id"], format!("PLAYERID-{region}"));
+            assert_eq!(
+                received[2].1["x-player-credential"],
+                format!("SECRETCRED-{region}-1")
+            );
+            assert_eq!(received[1].1["x-player-bid"], UID);
+        }
+        // A failure in one region does not touch the others.
+        clients[1].reload_accounts().await.unwrap();
+        assert_eq!(status(&clients[0])["session_state"], "active");
+        assert_eq!(status(&clients[1])["session_state"], "relogin_pending");
+        // The same shapes validate as one four-region deployment.
+        let key = app_key_env();
+        let path = identity.display().to_string().replace('\\', "/");
+        let yaml = format!(
+            r#"listen: 127.0.0.1:0
+regions:
+  jp:
+    region: jp
+    environment: release
+    endpoint: https://api.example
+    client_version: 1.0.3
+    api_token_env: {jp_api}
+    internal_token_env: {jp_internal}
+    player_id_env: {id}
+    player_credential_env: {id}_KEY
+    default_cdn_root: https://cdn.example
+    cdn_credential_env: {{"https://cdn.example": SIRIUS_UNUSED}}
+{globals}"#,
+            jp_api = jp_cfg.api_token_env,
+            jp_internal = jp_cfg.internal_token_env,
+            globals = [("hk", "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com"),
+                       ("en", "https://l14-prod-va-all-gs-sirius.bilibiligame.net"),
+                       ("kr", "https://l14-prod-kr-all-gs-sirius.bilibiligame.net")]
+                .iter()
+                .map(|(r, endpoint)| format!(
+                    "  {r}:\n    region: {r}\n    environment: release\n    endpoint: {endpoint}\n    client_version: 1.0.1\n    api_token_env: SIRIUS_{r}_API\n    internal_token_env: SIRIUS_{r}_INTERNAL\n    default_cdn_root: https://cdn.example/prod/{r}_fixture\n    cdn_credential_env: {{}}\n    accounts:\n      - name: {r}-guest\n        global_identity_file: \"{path}\"\n    global_login:\n      sdk_app_key_env: {key}\n      login_min_interval_seconds: 600\n"
+                ))
+                .collect::<String>()
+        );
+        let deployment = DeploymentConfig::parse(&yaml).unwrap();
+        let DeploymentConfig::Multi(multi) = &deployment else {
+            panic!("multi-region expected");
+        };
+        assert_eq!(multi.regions.len(), 4);
+        assert!(multi.regions["kr"].accounts[0]
+            .global_identity_file
+            .is_some());
+        // Global accounts require the session lock.
+        assert!(DeploymentConfig::parse(&yaml.replacen(
+            "    global_login:",
+            "    session_lock: false\n    global_login:",
+            1
+        ))
+        .is_err());
+        // An identity file on the JP profile is rejected.
+        let jp_static = format!("    player_id_env: {id}\n    player_credential_env: {id}_KEY\n");
+        assert!(yaml.contains(&jp_static));
+        assert!(DeploymentConfig::parse(&yaml.replacen(
+            &jp_static,
+            &format!(
+                "    accounts:\n      - name: jp-guest\n        global_identity_file: \"{path}\"\n"
+            ),
+            1
+        ))
+        .is_err());
     }
 }

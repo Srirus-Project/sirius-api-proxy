@@ -22,10 +22,47 @@ pub const ROUTES: &[&str] = &[
 ];
 
 pub const SERVER_LIST: &str = "/app.playerlogin.PlayerLoginService/GetServerList";
-pub const GLOBAL_ROUTES: &[&str] = &[VERSION, SERVER_LIST];
+/// Global login: exchanges an SDK identity for a game credential. Internal only, never public.
+pub const PLAYER_LOGIN: &str = "/app.playerlogin.PlayerLoginService/PlayerLogin";
+/// Public Global routes. Whoami is disabled on Global production and is never sent; the account
+/// identity comes from the PlayerLogin response instead.
+pub const GLOBAL_ROUTES: &[&str] = &[
+    VERSION,
+    SERVER_LIST,
+    ANNOUNCEMENTS,
+    ANNOUNCEMENT,
+    PROFILE,
+    EVENT_RANKING,
+    EVENT_DECK,
+    MUSIC_RANKING,
+    CHALLENGE_RANKING,
+    PLAYER_DATA,
+];
+const GLOBAL_CONTRACT: &[&str] = &[
+    VERSION,
+    SERVER_LIST,
+    ANNOUNCEMENTS,
+    ANNOUNCEMENT,
+    PROFILE,
+    EVENT_RANKING,
+    EVENT_DECK,
+    MUSIC_RANKING,
+    CHALLENGE_RANKING,
+    PLAYER_DATA,
+    PLAYER_LOGIN,
+];
+/// Routes the proxy exposes for a protocol family.
 pub fn for_family(family: &str) -> &'static [&'static str] {
     if family == "global" {
         GLOBAL_ROUTES
+    } else {
+        ROUTES
+    }
+}
+/// Every RPC a family's bundle must provide: public routes plus internal login.
+pub fn contract_for_family(family: &str) -> &'static [&'static str] {
+    if family == "global" {
+        GLOBAL_CONTRACT
     } else {
         ROUTES
     }

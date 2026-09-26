@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "sdk": {
+    "uid": "REPLACE_WITH_SDK_UID",
+    "access_key": "REPLACE_WITH_SDK_ACCESS_KEY",
+    "id_token": ""
+  },
+  "device": {
+    "udid": "REPLACE_WITH_SDK_UDID",
+    "model": "REPLACE_WITH_BUILD_MODEL",
+    "pf_ver": "12",
+    "dp": "1080*2400",
+    "net": "4",
+    "operators": "5",
+    "adid": "",
+    "lang": "en",
+    "time_zone": "UTC",
+    "isRoot": "0",
+    "unity_device_model": "REPLACE_WITH_UNITY_DEVICE_MODEL",
+    "unity_operating_system": "REPLACE_WITH_UNITY_OPERATING_SYSTEM",
+    "unity_device_id": "REPLACE_WITH_UNITY_DEVICE_UNIQUE_IDENTIFIER"
+  },
+  "players": {}
+}

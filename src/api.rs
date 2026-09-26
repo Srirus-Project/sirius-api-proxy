@@ -210,12 +210,50 @@ async fn master_table(
 ) -> Result<Response, AppError> {
     master_document(c, Some(table)).await
 }
+/// Per-operation status: `live_verified` was exercised against the production service;
+/// `implemented_unverified` uses the verified protocol but was not exercised live.
+fn operations(region: crate::region::Region) -> Value {
+    use crate::region::Region;
+    const OPERATIONS: [&str; 10] = [
+        "version",
+        "announcements",
+        "profile",
+        "event_ranking",
+        "event_deck",
+        "music_ranking",
+        "challenge_ranking",
+        "account_login",
+        "account_identity",
+        "player_data",
+    ];
+    let status = |operation: &str| match region {
+        Region::Cn => "reserved",
+        Region::Jp if operation == "account_login" => "static_credentials",
+        Region::Jp => "live_verified",
+        _ if matches!(operation, "version" | "account_login" | "player_data") => "live_verified",
+        _ => "implemented_unverified",
+    };
+    let mut map = serde_json::Map::new();
+    for operation in OPERATIONS {
+        map.insert(operation.into(), json!(status(operation)));
+    }
+    map.insert(
+        "servers".into(),
+        json!(match region {
+            Region::Cn => "reserved",
+            Region::Jp => "unsupported",
+            _ => "live_verified",
+        }),
+    );
+    Value::Object(map)
+}
 async fn regions(State(c): State<Arc<GameClient>>) -> Json<Value> {
     use crate::region::Region;
     let regions=[Region::Jp,Region::Hk,Region::En,Region::Kr,Region::Cn].map(|region| json!({
         "region":region,"area_id":region.area_id(),"protocol_family":region.family(),"reserved":region==Region::Cn,
         "master_data":region.master_supported(),
-        "capability":if region==Region::Cn {"reserved"} else if region==Region::Jp {"jp_proxy"} else {"discovery_and_version"}
+        "capability":if region==Region::Cn {"reserved"} else if region==Region::Jp {"jp_proxy"} else {"global_proxy"},
+        "operations":operations(region)
     }));
     Json(json!({"selected":c.region(),"regions":regions}))
 }

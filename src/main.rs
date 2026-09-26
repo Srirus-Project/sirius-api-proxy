@@ -67,6 +67,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("sirius-api-proxy {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.first().is_some_and(|a| a == "global-account") {
+        return global_account(&args[1..]).await;
+    }
     if args
         .first()
         .is_some_and(|a| matches!(a.as_str(), "master-db-import" | "master-db-migrate"))
@@ -355,4 +358,109 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+const GLOBAL_ACCOUNT_USAGE: &str = "usage: sirius-api-proxy global-account bootstrap --device DEVICE_FILE --identity IDENTITY_FILE [--sdk-origin ORIGIN] [--sdk-app-key-env NAME] [--create-sdk-guest]\n       sirius-api-proxy global-account verify --account NAME [--region hk|en|kr] [--show-player-id]";
+
+/// One-shot Global account operations. `bootstrap` creates an SDK guest identity only with
+/// `--create-sdk-guest`; `verify` performs SDK cache.login and PlayerLogin once for a configured
+/// account (configuration from SIRIUS_CONFIG_PATH). Neither prints tokens or retries.
+async fn global_account(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let command = args.first().map(String::as_str);
+    let mut values = std::collections::BTreeMap::<&str, &str>::new();
+    let mut flags = std::collections::BTreeSet::<&str>::new();
+    let mut rest = args.iter().skip(1).map(String::as_str);
+    while let Some(arg) = rest.next() {
+        match arg {
+            "--create-sdk-guest" | "--show-player-id" => {
+                if !flags.insert(arg) {
+                    return Err(GLOBAL_ACCOUNT_USAGE.into());
+                }
+            }
+            "--device" | "--identity" | "--sdk-origin" | "--sdk-app-key-env" | "--account"
+            | "--region" => {
+                let value = rest.next().ok_or(GLOBAL_ACCOUNT_USAGE)?;
+                if values.insert(arg, value).is_some() {
+                    return Err(GLOBAL_ACCOUNT_USAGE.into());
+                }
+            }
+            _ => return Err(GLOBAL_ACCOUNT_USAGE.into()),
+        }
+    }
+    use sirius_api_proxy::global_account::BootstrapOptions;
+    match command {
+        Some("bootstrap") => {
+            if flags.contains("--show-player-id")
+                || values.contains_key("--account")
+                || values.contains_key("--region")
+            {
+                return Err(GLOBAL_ACCOUNT_USAGE.into());
+            }
+            let options = BootstrapOptions {
+                device_file: values.get("--device").ok_or(GLOBAL_ACCOUNT_USAGE)?.into(),
+                identity_file: values.get("--identity").ok_or(GLOBAL_ACCOUNT_USAGE)?.into(),
+                sdk_origin: values
+                    .get("--sdk-origin")
+                    .copied()
+                    .unwrap_or(sirius_api_proxy::global_sdk::DEFAULT_SDK_ORIGIN)
+                    .into(),
+                app_key_env: values
+                    .get("--sdk-app-key-env")
+                    .copied()
+                    .unwrap_or("SIRIUS_GLOBAL_SDK_APP_KEY")
+                    .into(),
+                create_sdk_guest: flags.contains("--create-sdk-guest"),
+            };
+            let summary = sirius_api_proxy::global_account::bootstrap(&options).await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            Ok(())
+        }
+        Some("verify") => {
+            if flags.contains("--create-sdk-guest")
+                || [
+                    "--device",
+                    "--identity",
+                    "--sdk-origin",
+                    "--sdk-app-key-env",
+                ]
+                .iter()
+                .any(|k| values.contains_key(k))
+            {
+                return Err(GLOBAL_ACCOUNT_USAGE.into());
+            }
+            let account = values.get("--account").ok_or(GLOBAL_ACCOUNT_USAGE)?;
+            let path = std::env::var("SIRIUS_CONFIG_PATH")
+                .unwrap_or_else(|_| "sirius-api-config.yaml".into());
+            let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
+            sirius_api_proxy::region::warn_deprecated_alias();
+            let config = match (&deployment, values.get("--region")) {
+                (DeploymentConfig::Single(config), None) => config.as_ref(),
+                (DeploymentConfig::Single(config), Some(region))
+                    if sirius_api_proxy::region::Region::from_config_name(region)
+                        == Some(config.region) =>
+                {
+                    config.as_ref()
+                }
+                (DeploymentConfig::Multi(multi), Some(region)) => {
+                    let region = sirius_api_proxy::region::Region::from_config_name(region)
+                        .ok_or("--region must be hk, en or kr")?;
+                    multi
+                        .regions
+                        .get(region.name())
+                        .ok_or("the region is not configured")?
+                }
+                (DeploymentConfig::Multi(_), None) => {
+                    return Err("--region is required for a multi-region configuration".into())
+                }
+                _ => return Err("--region does not match the configuration".into()),
+            };
+            let client = GameClient::new(config.clone())?;
+            let summary = client
+                .verify_global_account(account, flags.contains("--show-player-id"))
+                .await?;
+            println!("{}", serde_json::to_string(&summary)?);
+            Ok(())
+        }
+        _ => Err(GLOBAL_ACCOUNT_USAGE.into()),
+    }
 }

@@ -1,0 +1,28 @@
+syntax = "proto3";
+package entity;
+import "entity/item.proto";
+import "entity/mission.proto";
+import "entity/present.proto";
+message VipPointChange {
+  int32 before = 1;
+  int32 after = 2;
+}
+message ConvertedResource {
+  .entity.PresentResource original_resource = 1;
+  .entity.PresentResource converted_resource = 2;
+}
+message OfflineBonusStartAt {
+  int64 offline_bonus_unit_id = 1;
+  int64 start_at = 2;
+}
+message Notification {
+  repeated .entity.Present posted_presents = 1;
+  repeated .entity.MissionCounter mission_counter_diffs = 2;
+  repeated .entity.MissionCounter mission_counter_updates = 3;
+  repeated .entity.Item item_diffs = 4;
+  .entity.VipPointChange vip_point_change = 5;
+  repeated .entity.ConvertedResource converted_resources = 6;
+  bool has_exceeded_present = 7;
+  repeated .entity.OfflineBonusStartAt offline_bonus_start_ats = 8;
+  repeated .entity.PresentResource discarded_resources = 10;
+}

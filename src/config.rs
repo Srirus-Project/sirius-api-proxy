@@ -52,6 +52,9 @@ pub struct Config {
     pub accounts: Vec<crate::accounts::AccountConfig>,
     #[serde(default)]
     pub account_pool: crate::accounts::PoolPolicy,
+    /// HK/EN/KR only: SDK and login policy for accounts with `global_identity_file`.
+    #[serde(default)]
+    pub global_login: Option<crate::global_account::LoginConfig>,
     pub player_id_env: Option<String>,
     pub player_credential_env: Option<String>,
     /// Optional immutable Master JSON snapshot store written by master-import.

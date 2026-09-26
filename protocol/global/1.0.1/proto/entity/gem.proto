@@ -1,0 +1,9 @@
+syntax = "proto3";
+package entity;
+message Gem {
+  int32 free = 1;
+  int32 paid = 2;
+  int32 platform_android = 3;
+  int32 platform_ios = 4;
+  int32 platform_ex = 5;
+}

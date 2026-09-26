@@ -20,6 +20,8 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
+use crate::accounts::Auth;
+
 pub(crate) fn authenticated(route: &str) -> bool {
     matches!(
         route,
@@ -89,6 +91,8 @@ pub struct GameClient {
     snapshot_http: Option<reqwest::Client>,
     /// Serializes Global snapshot builds so at most one `.hash` request is in flight.
     snapshot_build: Mutex<()>,
+    /// Global SDK client, present when an account uses `global_identity_file`.
+    sdk: Option<crate::global_sdk::SdkClient>,
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
@@ -125,6 +129,7 @@ impl GameClient {
             .http2_only(true)
             .build(connector);
         let accounts = crate::accounts::Pool::load(&config, 1)?;
+        let sdk = sdk_client(&config)?;
         let cdn_secrets = config
             .cdn_credential_env
             .iter()
@@ -193,6 +198,7 @@ impl GameClient {
             reload_lock: Mutex::new(()),
             snapshot_http,
             snapshot_build: Mutex::new(()),
+            sdk,
         }))
     }
     pub(crate) fn client_auth(&self) -> Option<&crate::client_auth::Authenticator> {
@@ -435,10 +441,14 @@ impl GameClient {
                 .map_err(|_| AppError::AccountUnavailable)??;
         // Activation drains logical calls before replacing locks and credentials.
         let _calls = self.protocol_calls.write().await;
-        *self
-            .accounts
-            .lock()
-            .map_err(|_| AppError::AccountUnavailable)? = candidate;
+        {
+            let mut pool = self
+                .accounts
+                .lock()
+                .map_err(|_| AppError::AccountUnavailable)?;
+            candidate.inherit_login_history(&pool);
+            *pool = candidate;
+        }
         self.account_status()
     }
     pub fn node_status(&self) -> Value {
@@ -514,7 +524,11 @@ impl GameClient {
             if !crate::routes::ROUTES.contains(&route) && route != crate::routes::SERVER_LIST {
                 return Err(AppError::InvalidRequest);
             }
-            if !self.supported_routes().contains(&route) {
+            let global = self.config.region.family() == "global";
+            // Global never sends Whoami (disabled in production): the account identity is the
+            // PlayerLogin result, served without an upstream identity RPC.
+            let identity_only = global && route == WHOAMI;
+            if !identity_only && !self.supported_routes().contains(&route) {
                 return Err(AppError::UnsupportedRegionOperation);
             }
             let deadline = tokio::time::Instant::now() + self.timeout;
@@ -558,11 +572,9 @@ impl GameClient {
                         .read()
                         .map_err(|_| AppError::ProtocolDefinition)?
                         .clone();
-                    if authenticated(route)
-                        && self.state.lock().await.observation.master_version.is_none()
-                    {
+                    if authenticated(route) && !identity_only && self.needs_bootstrap().await {
                         let _bootstrap = self.bootstrap_lock.lock().await;
-                        if self.state.lock().await.observation.master_version.is_none() {
+                        if self.needs_bootstrap().await {
                             self.execute(&protocol, VERSION, json!({}), None, deadline)
                                 .await?;
                         }
@@ -643,17 +655,39 @@ impl GameClient {
                             return Err(AppError::ProtocolDefinition);
                         }
                     }
+                    let auth = match account {
+                        Some(a) if authenticated(route) => {
+                            Some(self.account_auth(&protocol, a, deadline).await?)
+                        }
+                        _ => None,
+                    };
+                    if identity_only {
+                        let auth = auth.ok_or(AppError::AccountUnavailable)?;
+                        return Ok(json!({ "playerId": auth.player_id }));
+                    }
                     account_attempted = authenticated(route);
-                    if route == PLAYER_DATA {
-                        self.execute(&protocol, WHOAMI, json!({}), account, deadline)
+                    if route == PLAYER_DATA && !global {
+                        self.execute(&protocol, WHOAMI, json!({}), auth.as_ref(), deadline)
                             .await?;
                     }
-                    let response = self
-                        .execute(&protocol, route, input, account, deadline)
-                        .await;
+                    let (response, code) = if authenticated(route) {
+                        // Authenticated reads are never replayed.
+                        self.execute_once(&protocol, route, input, auth.as_ref(), deadline)
+                            .await
+                    } else {
+                        (
+                            self.execute(&protocol, route, input, None, deadline).await,
+                            None,
+                        )
+                    };
                     if account_attempted {
                         if let Some(lease) = &lease {
-                            lease.report(&response, &self.config.account_pool);
+                            lease.report(
+                                &response,
+                                code.as_deref(),
+                                &self.config.account_pool,
+                                self.config.global_login.as_ref(),
+                            );
                         }
                         account_attempted = false;
                     }
@@ -680,7 +714,12 @@ impl GameClient {
                 .unwrap_or(Err(AppError::Timeout));
                 if account_attempted {
                     if let Some(lease) = &lease {
-                        lease.report(&result, &self.config.account_pool);
+                        lease.report(
+                            &result,
+                            None,
+                            &self.config.account_pool,
+                            self.config.global_login.as_ref(),
+                        );
                     }
                 }
                 result
@@ -697,6 +736,192 @@ impl GameClient {
             }
             result
         })
+    }
+    /// Authenticated calls need the Master version (and, on Global, the resource version).
+    async fn needs_bootstrap(&self) -> bool {
+        let state = self.state.lock().await;
+        state.observation.master_version.is_none()
+            || (self.config.region.family() == "global"
+                && state.observation.resource_version.is_none())
+    }
+    /// Game headers for `account`. A Global account without a session logs in first: SDK
+    /// `cache.login` (first login of the process, or after a TOKEN_* signal) and PlayerLogin,
+    /// bounded by the login interval and daily cap. The caller holds the account's session
+    /// lock, so concurrent calls trigger at most one login. Nothing here is retried.
+    async fn account_auth(
+        &self,
+        protocol: &ProtocolBundle,
+        account: &crate::accounts::Account,
+        deadline: tokio::time::Instant,
+    ) -> Result<Auth, AppError> {
+        if let Some(auth) = account.auth() {
+            return Ok(auth);
+        }
+        let Some(g) = account.global() else {
+            return Err(AppError::AccountUnavailable);
+        };
+        let (Some(login), Some(sdk)) = (&self.config.global_login, &self.sdk) else {
+            return Err(AppError::AccountUnavailable);
+        };
+        let policy = &self.config.account_pool;
+        let region = self.config.region.name();
+        let now = std::time::Instant::now();
+        let (revalidate, base) = {
+            let mut state = g.state();
+            if let Some(until) = state.next_allowed(now, login) {
+                drop(state);
+                account.cool_down(until);
+                tracing::warn!(
+                    error_code = "global_login_rate_limited",
+                    account = %account.name,
+                    region,
+                    "Global login deferred by the login interval or daily cap"
+                );
+                return Err(AppError::AccountUnavailable);
+            }
+            state.attempts.push_back(now);
+            (
+                state.sdk.is_none() || state.sdk_stale,
+                state.sdk.clone().unwrap_or_else(|| g.identity.sdk.clone()),
+            )
+        };
+        let sdk_account = if revalidate {
+            let outcome =
+                tokio::time::timeout_at(deadline, sdk.cache_login(&g.identity.device, &base))
+                    .await
+                    .unwrap_or(Err(crate::global_sdk::SdkError::Transport));
+            match outcome {
+                Ok(refreshed) => {
+                    let mut state = g.state();
+                    state.sdk = Some(refreshed.clone());
+                    state.sdk_stale = false;
+                    refreshed
+                }
+                Err(error) => {
+                    g.state().last_error_code = Some(error.code().into());
+                    if error.transient() {
+                        account.transient_failure(policy);
+                    } else {
+                        account.disable();
+                    }
+                    tracing::warn!(
+                        error_code = error.code(),
+                        account = %account.name,
+                        region,
+                        "Global SDK cache.login failed; no retry"
+                    );
+                    return Err(if tokio::time::Instant::now() >= deadline {
+                        AppError::Timeout
+                    } else {
+                        AppError::AccountUnavailable
+                    });
+                }
+            }
+        } else {
+            base
+        };
+        let request = crate::global_account::login_request(
+            &sdk_account,
+            &g.identity.device,
+            &self.config.client_version,
+        );
+        let login_auth = Auth {
+            player_id: String::new(),
+            credential: String::new(),
+            bid: Some(sdk_account.uid.clone()),
+        };
+        let (result, code) = self
+            .execute_once(protocol, PLAYER_LOGIN, request, Some(&login_auth), deadline)
+            .await;
+        let session = match &result {
+            Ok(value) => crate::global_account::parse_login(value),
+            Err(_) => None,
+        };
+        let Some(session) = session else {
+            let result = result.and(Err(AppError::Protocol));
+            account.global_signal(&result, code.as_deref(), policy, login);
+            tracing::warn!(
+                error_code = code.as_deref().unwrap_or("global_login_failed"),
+                account = %account.name,
+                region,
+                "Global PlayerLogin failed; no retry"
+            );
+            return Err(match result {
+                Err(AppError::Timeout) => AppError::Timeout,
+                _ => AppError::AccountUnavailable,
+            });
+        };
+        if g.expected_player_id
+            .as_ref()
+            .is_some_and(|expected| expected != &session.player_id)
+        {
+            g.state().last_error_code = Some("PLAYER_MISMATCH".into());
+            account.disable();
+            tracing::error!(
+                error_code = "PLAYER_MISMATCH",
+                account = %account.name,
+                region,
+                "Global PlayerLogin returned a different player than the identity file pins; account disabled"
+            );
+            return Err(AppError::AccountUnavailable);
+        }
+        let auth = Auth {
+            player_id: session.player_id.clone(),
+            credential: session.credential.clone(),
+            bid: Some(sdk_account.uid.clone()),
+        };
+        tracing::info!(
+            account = %account.name,
+            region,
+            new_player = session.is_new_user,
+            "Global PlayerLogin succeeded"
+        );
+        let mut state = g.state();
+        state.session = Some(Arc::new(session));
+        state.last_login_at = Some(Utc::now());
+        Ok(auth)
+    }
+    /// One-shot login check for `global-account verify`: SDK `cache.login` and PlayerLogin once
+    /// (the process has no session yet), without Whoami or any other RPC. The summary carries
+    /// no token; the player ID only when `show_player_id` is set.
+    pub async fn verify_global_account(
+        self: &Arc<Self>,
+        name: &str,
+        show_player_id: bool,
+    ) -> Result<Value, AppError> {
+        if self.config.region.family() != "global" {
+            return Err(AppError::UnsupportedRegionOperation);
+        }
+        let identity = self
+            .call_selected(WHOAMI, json!({}), Some(name), None, None)
+            .await?;
+        let account = self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)?
+            .find(name)
+            .ok_or(AppError::NotFound)?;
+        let g = account.global().ok_or(AppError::AccountUnavailable)?;
+        let state = g.state();
+        let session = state.session.as_ref().ok_or(AppError::AccountUnavailable)?;
+        let mut summary = json!({
+            "region": self.config.region,
+            "account": name,
+            "sdk_cache_login": "ok",
+            "player_login": "ok",
+            "credential_received": true,
+            "new_player": session.is_new_user,
+            "cp_server_name": session.cp_server_name,
+            "player_pin": match &g.expected_player_id {
+                None => "unset",
+                Some(expected) if expected == &session.player_id => "match",
+                Some(_) => "mismatch",
+            },
+        });
+        if show_player_id {
+            summary["player_id"] = identity["playerId"].clone();
+        }
+        Ok(summary)
     }
     async fn read_cached(
         &self,
@@ -756,11 +981,8 @@ impl GameClient {
             .map_err(|_| AppError::AccountUnavailable)?
             .generation;
         use sha2::{Digest, Sha256};
-        let account_scope = account.map(|a| {
-            let bytes =
-                serde_json::to_vec(&(&a.player_id, &a.credential)).expect("strings serialize");
-            format!("{:x}", Sha256::digest(bytes))
-        });
+        // Global scopes never include the rotating game credential (see Account::cache_scope).
+        let account_scope = account.map(|a| format!("{:x}", Sha256::digest(a.cache_scope())));
         let scope = json!({"schema":2,"stale_ms":self.response_cache.stale_window(),"region":self.config.region,"environment":self.config.environment,
             "endpoint":self.config.endpoint,"platform":self.config.platform(),"client":self.config.client_version,
             "protocol":protocol.status.sha256,"protocol_generation":protocol.status.generation,
@@ -773,7 +995,7 @@ impl GameClient {
         protocol: &ProtocolBundle,
         route: &str,
         input: Value,
-        account: Option<&crate::accounts::Account>,
+        auth: Option<&Auth>,
         deadline: tokio::time::Instant,
     ) -> Result<Value, AppError> {
         let attempts = if matches!(route, VERSION | ANNOUNCEMENTS | ANNOUNCEMENT | SERVER_LIST) {
@@ -783,8 +1005,8 @@ impl GameClient {
         };
         let mut attempt = 0;
         loop {
-            let result = self
-                .execute_once(protocol, route, input.clone(), account, deadline)
+            let (result, _) = self
+                .execute_once(protocol, route, input.clone(), auth, deadline)
                 .await;
             attempt += 1;
             if attempt >= attempts
@@ -802,13 +1024,29 @@ impl GameClient {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
+    /// One unary call. Also returns the response's `x-sirius-error-code` (only `[A-Z0-9_]`).
     async fn execute_once(
         &self,
         protocol: &ProtocolBundle,
         route: &str,
         input: Value,
-        account: Option<&crate::accounts::Account>,
+        auth: Option<&Auth>,
         deadline: tokio::time::Instant,
+    ) -> (Result<Value, AppError>, Option<String>) {
+        let mut code = None;
+        let result = self
+            .execute_once_inner(protocol, route, input, auth, deadline, &mut code)
+            .await;
+        (result, code)
+    }
+    async fn execute_once_inner(
+        &self,
+        protocol: &ProtocolBundle,
+        route: &str,
+        input: Value,
+        auth: Option<&Auth>,
+        deadline: tokio::time::Instant,
+        code: &mut Option<String>,
     ) -> Result<Value, AppError> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -840,15 +1078,36 @@ impl GameClient {
             .header("x-platform", self.config.platform().header())
             .header("x-client-version", &self.config.client_version)
             .header("x-request-id", uuid::Uuid::new_v4().to_string());
-        if let Some(version) = &self.state.lock().await.observation.master_version {
+        let global = self.config.region.family() == "global";
+        let login = route == PLAYER_LOGIN;
+        let (master_version, resource_version) = {
+            let state = self.state.lock().await;
+            (
+                state.observation.master_version.clone(),
+                state.observation.resource_version.clone(),
+            )
+        };
+        // Global PlayerLogin is sent like the client's login: no version or player headers.
+        if let Some(version) = master_version.filter(|_| !login) {
             request = request.header("x-master-version", version);
         }
         // Anonymous endpoints never receive game credentials.
         if authenticated(route) {
-            let account = account.ok_or(AppError::AccountUnavailable)?;
+            let auth = auth.ok_or(AppError::AccountUnavailable)?;
             request = request
-                .header("x-player-id", &account.player_id)
-                .header("x-player-credential", &account.credential);
+                .header("x-player-id", &auth.player_id)
+                .header("x-player-credential", &auth.credential);
+            if global {
+                if let Some(version) = resource_version {
+                    request = request.header("x-resource-version", version);
+                }
+            }
+        }
+        if global && (login || authenticated(route)) {
+            let bid = auth
+                .and_then(|a| a.bid.as_deref())
+                .ok_or(AppError::AccountUnavailable)?;
+            request = request.header("x-player-bid", bid);
         }
         let response = self
             .http
@@ -881,6 +1140,7 @@ impl GameClient {
         let status = header(&metadata, "grpc-status")
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|s| *s <= 16);
+        *code = application_code(&metadata);
         self.observe(&metadata, status).await;
         if !http_ok || !content_ok {
             return Err(AppError::Protocol);
@@ -900,12 +1160,14 @@ impl GameClient {
         if length != bytes.len() - 5 {
             return Err(AppError::Protocol);
         }
-        let value = protocol.decode(route, &bytes[5..])?;
+        let mut value = protocol.decode(route, &bytes[5..])?;
         if route == WHOAMI
-            && value.get("playerId").and_then(Value::as_str)
-                != account.map(|a| a.player_id.as_str())
+            && value.get("playerId").and_then(Value::as_str) != auth.map(|a| a.player_id.as_str())
         {
             return Err(AppError::Protocol);
+        }
+        if route == SERVER_LIST {
+            protocol::normalize_servers(&protocol.pool, &mut value);
         }
         if route == VERSION {
             let version = value
@@ -958,13 +1220,7 @@ impl GameClient {
         let mut s = self.state.lock().await;
         s.observation.observed_at = Some(Utc::now());
         s.observation.grpc_status = status;
-        s.observation.application_code = header(md, "x-sirius-error-code")
-            .filter(|v| {
-                v.len() <= 64
-                    && v.bytes()
-                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
-            })
-            .map(str::to_owned);
+        s.observation.application_code = application_code(md);
         s.observation.maintenance =
             s.observation.application_code.as_deref() == Some("UNDER_MAINTENANCE");
         s.observation.server_time = header(md, "x-server-time")
@@ -1165,6 +1421,54 @@ impl GameClient {
         });
         s.snapshot_stale = false;
     }
+}
+/// `x-sirius-error-code` when it is a bounded `[A-Z0-9_]` code; anything else is ignored.
+fn application_code(md: &HeaderMap) -> Option<String> {
+    header(md, "x-sirius-error-code")
+        .filter(|v| {
+            !v.is_empty()
+                && v.len() <= 64
+                && v.bytes()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+        })
+        .map(str::to_owned)
+}
+/// SDK client for Global identity accounts. It uses the upstream proxy of game calls, if any.
+fn sdk_client(config: &Config) -> Result<Option<crate::global_sdk::SdkClient>, AppError> {
+    if !config
+        .accounts
+        .iter()
+        .any(|a| a.global_identity_file.is_some())
+    {
+        return Ok(None);
+    }
+    let login = config.global_login.as_ref().ok_or(AppError::Config(
+        "HK/EN/KR accounts require a global_login section",
+    ))?;
+    let key = secret(&login.sdk_app_key_env)?;
+    let proxy = match &config.upstream.proxy_url_env {
+        None => None,
+        Some(name) => {
+            let invalid = || AppError::Config("invalid upstream proxy configuration");
+            let uri = crate::transport::proxy_uri(&secret(name)?).map_err(|_| invalid())?;
+            let mut proxy = reqwest::Proxy::all(uri.to_string()).map_err(|_| invalid())?;
+            if let Some(name) = &config.upstream.proxy_authorization_env {
+                let mut value = reqwest::header::HeaderValue::from_str(&secret(name)?)
+                    .map_err(|_| invalid())?;
+                value.set_sensitive(true);
+                proxy = proxy.custom_http_auth(value);
+            }
+            Some(proxy)
+        }
+    };
+    crate::global_sdk::SdkClient::new(
+        &login.sdk_origin,
+        key,
+        Duration::from_millis(login.sdk_timeout_ms),
+        proxy,
+    )
+    .map(Some)
+    .map_err(|_| AppError::Config("invalid Global SDK configuration"))
 }
 /// A Global resource version usable as a CDN path component; `unknown` means "not reported".
 fn resource_version_component(value: &str) -> bool {
