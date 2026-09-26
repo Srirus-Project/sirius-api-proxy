@@ -201,3 +201,15 @@ and never delete tables from a published snapshot), fixed intervals instead of c
 reload, no free-form upstream headers, per-transport proxies, reserved Global CDN placeholders and
 the argv/env-driven Git CLI. Sirius config structs reject unknown fields, so no field is silently
 ignored. The API configuration audit is complete; the updater audit and other gates remain open.
+
+Made the full test suite pass on Windows and replaced the Windows Git CI job with a full-suite
+`windows-tests` job. Two product defects were Windows-only: files re-synchronized after being
+written (verified owner-sync tables and archived dispatch completions) were reopened read-only,
+which Windows FlushFileBuffers rejects, so they are now reopened writable there without truncation
+(Unix behavior unchanged); and ambient `PG*` rejection refused hosts with PostgreSQL installed
+(GitHub Windows runners set PGUSER/PGPASSWORD/PGDATA/PGBIN/PGROOT). Only libpq variables SQLx
+0.9 would carry into the connection (`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGOPTIONS`) are now
+rejected; every other SQLx-read variable is replaced by explicit configuration, which a test checks
+against the real process environment. The refused-connection transport test gives Windows' SYN retry
+(about two seconds before WSAECONNREFUSED) room within its deadline and still requires `Connect`.
+Master sync, registry, notification and dispatch archive failures were consequences of these.

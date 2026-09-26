@@ -45,8 +45,8 @@ jobs:
       - name: Run tests
         run: cargo test --locked -p sirius-api-proxy
 
-  windows-git:
-    name: Windows Git process containment
+  windows-tests:
+    name: Windows tests
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -58,6 +58,9 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # Job Object containment, output bounds and real Git publication/cancellation.
-      - name: Run Windows Git tests
-        run: cargo test --locked -p sirius-api-proxy --lib -- git_execution master_git_commits master_git_worker_shutdown
+      # The full suite, including Windows Git Job Object containment, output bounds and real Git
+      # publication/cancellation, Windows file persistence semantics and loopback transport errors.
+      # Runners have PostgreSQL installed (PGBIN/PGDATA/PGROOT set), which must not be mistaken for
+      # ambient libpq client configuration.
+      - name: Run tests
+        run: cargo test --locked -p sirius-api-proxy
