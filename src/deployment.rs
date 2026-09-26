@@ -20,7 +20,31 @@ pub struct MultiConfig {
     pub tls: Option<crate::server::TlsConfig>,
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
+    #[serde(deserialize_with = "region_map")]
     pub regions: BTreeMap<String, Config>,
+}
+
+/// Region map keys are canonical names. The deprecated alias of `hk` is accepted as a key and
+/// renamed to `hk`; a map containing both is rejected rather than merged.
+fn region_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Config>, D::Error> {
+    let mut regions = BTreeMap::<String, Config>::deserialize(deserializer)?;
+    if let Some(alias) = regions
+        .keys()
+        .find(|key| crate::region::is_deprecated_alias(key))
+        .cloned()
+    {
+        if regions.contains_key(crate::region::Region::Hk.name()) {
+            return Err(serde::de::Error::custom(
+                "configure the hk region once; its deprecated alias duplicates it",
+            ));
+        }
+        crate::region::note_deprecated_alias();
+        let config = regions.remove(&alias).expect("present");
+        regions.insert(crate::region::Region::Hk.name().into(), config);
+    }
+    Ok(regions)
 }
 
 fn distinct<T: PartialEq>(values: &[T]) -> bool {

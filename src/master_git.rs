@@ -327,6 +327,19 @@ fn verbatim_windows_paths_become_plain_absolute_paths() {
         );
     }
 }
+fn write_marker(
+    directory: &Path,
+    marker: &Path,
+    expected: &serde_json::Value,
+) -> Result<(), Error> {
+    let mut file = tempfile::NamedTempFile::new_in(directory).map_err(|_| Error::Snapshot)?;
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(expected).map_err(|_| Error::Snapshot)?)
+        .map_err(|_| Error::Snapshot)?;
+    file.as_file().sync_all().map_err(|_| Error::Snapshot)?;
+    file.persist(marker).map_err(|_| Error::Snapshot)?;
+    Ok(())
+}
 fn prepare(
     source: &Path,
     destination: &Path,
@@ -360,11 +373,23 @@ fn prepare(
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 4096 {
             return Err(Error::Ownership);
         }
-        let existing: serde_json::Value =
+        let mut existing: serde_json::Value =
             serde_json::from_slice(&fs::read(&marker).map_err(|_| Error::Ownership)?)
                 .map_err(|_| Error::Ownership)?;
+        // State written before 1.2.1 may record the deprecated alias of `hk`: read it as
+        // `hk` and rewrite the marker so the alias is never kept or written.
+        let legacy = existing["scope"]["region"]
+            .as_str()
+            .filter(|name| crate::region::is_deprecated_alias(name))
+            .and_then(crate::region::Region::from_recorded_name);
+        if let Some(region) = legacy {
+            existing["scope"]["region"] = serde_json::json!(region);
+        }
         if existing != expected {
             return Err(Error::Ownership);
+        }
+        if legacy.is_some() {
+            write_marker(&directory, &marker, &expected)?;
         }
     } else {
         if fs::read_dir(&directory)
@@ -373,12 +398,7 @@ fn prepare(
         {
             return Err(Error::Ownership);
         }
-        let mut file = tempfile::NamedTempFile::new_in(&directory).map_err(|_| Error::Snapshot)?;
-        use std::io::Write;
-        file.write_all(&serde_json::to_vec(&expected).map_err(|_| Error::Snapshot)?)
-            .map_err(|_| Error::Snapshot)?;
-        file.as_file().sync_all().map_err(|_| Error::Snapshot)?;
-        file.persist(&marker).map_err(|_| Error::Snapshot)?;
+        write_marker(&directory, &marker, &expected)?;
     }
     let repository = directory.join("repository.git");
     if fs::symlink_metadata(&repository).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {

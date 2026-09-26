@@ -36,7 +36,7 @@ A request contains a UUID `request_id`, an exact `identity` and a typed `operati
 
 The schema fingerprint is the `sha256` from the existing administrative protocol status
 endpoint. It is not a game asset or executable hash. A peer token cannot read that administrative
-endpoint. TW/EN/KR may share a schema fingerprint while remaining distinct identities. CN remains
+endpoint. HK/EN/KR may share a schema fingerprint while remaining distinct identities. CN remains
 reserved. Compatibility requires all identity fields to match; a schema mismatch does not
 silently downgrade or retry against an arbitrary protocol.
 

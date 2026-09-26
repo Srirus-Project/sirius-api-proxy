@@ -67,6 +67,7 @@ fn read_connections() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct Import {
     pub source: PathBuf,
+    #[serde(deserialize_with = "crate::master_registry::config_scope")]
     pub scope: Scope,
     pub database: Config,
 }

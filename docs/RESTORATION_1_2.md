@@ -241,3 +241,10 @@ status, proxy and standalone registry routes, `indented_root` Git with `version.
 remote), same-region sync, cross-region rejection, notifications, CDN-authorization validation,
 region-recording imports and legacy receipts, and a four-region `master_update` + `master_git`
 publisher deployment. Linux and Windows CI.
+
+Post-1.2.0 (1.2.1, unreleased): the Traditional Chinese region identifier is renamed from `tw` to
+`hk`, the name the game uses (CDN `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list). The
+ledger entries above keep the wording of their time. `tw` survives only as a deprecated
+configuration/CLI alias with a startup warning; snapshot receipts and Git state recorded as `tw`
+are read as `hk`, and nothing writes or serves `tw`. See
+[the `hk` identifier](REGIONS.md#the-hk-identifier).

@@ -50,6 +50,24 @@ pub struct PublishedManifest {
     /// Original encrypted-file metadata, without any CDN credentials or keys.
     pub source_manifest: Manifest,
 }
+/// `deserialize_with` for configuration scopes (`registry-serve`, `master-db-*`): like
+/// [`Scope`], but the region also accepts the deprecated alias of `hk`.
+pub fn config_scope<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Scope, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ConfigScope {
+        #[serde(deserialize_with = "crate::region::config_region")]
+        region: Region,
+        environment: String,
+        platform: Platform,
+    }
+    let scope = ConfigScope::deserialize(deserializer)?;
+    Ok(Scope {
+        region: scope.region,
+        environment: scope.environment,
+        platform: scope.platform,
+    })
+}
 impl PublishedManifest {
     pub fn validate(&self, scope: &Scope) -> Result<(), MasterError> {
         if self.schema_version != 1

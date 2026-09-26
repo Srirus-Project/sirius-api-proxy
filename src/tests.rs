@@ -1928,7 +1928,7 @@ fn known_region_endpoints_cannot_be_relabelled() {
         (
             "l14-prod-hk-all-gs-sirius.gamerfusiontech.com",
             "/",
-            Region::Tw,
+            Region::Hk,
         ),
         (
             "l14-prod-va-all-gs-sirius.bilibiligame.net",
@@ -1951,7 +1951,7 @@ fn known_region_endpoints_cannot_be_relabelled() {
             Region::Kr,
         ),
     ] {
-        for candidate in [Region::Jp, Region::Tw, Region::En, Region::Kr, Region::Cn] {
+        for candidate in [Region::Jp, Region::Hk, Region::En, Region::Kr, Region::Cn] {
             assert_eq!(
                 candidate.matches_known_service(host, path),
                 candidate == region
@@ -1959,7 +1959,7 @@ fn known_region_endpoints_cannot_be_relabelled() {
         }
     }
     let mut cfg = config();
-    cfg.region = Region::Tw;
+    cfg.region = Region::Hk;
     assert!(matches!(cfg.validate(), Err(AppError::Config(_))));
 }
 #[tokio::test]
@@ -2090,7 +2090,7 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
     };
     let bundle = copy_protocol_bundle();
     let mut configs = BTreeMap::new();
-    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+    for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let mut c = regional_config(region);
         if region == Region::Jp {
             c.protocol_directory = bundle.path().into();
@@ -2127,7 +2127,7 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         )
     }
     assert_eq!(request(&app, "/health", "", "GET").await.0, 200);
-    for region in [Region::Jp, Region::Tw, Region::En, Region::Kr] {
+    for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let n = region.name();
         let (status, body) = request(
             &app,
@@ -2215,7 +2215,7 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
     assert_eq!(status, 200);
     assert_eq!(body["generation"], 2);
     assert_eq!(body["codec"], "dynamic");
-    for region in ["tw", "en", "kr"] {
+    for region in ["hk", "en", "kr"] {
         let (_, body) = request(
             &app,
             &format!("/internal/v1/{region}/protocol"),
@@ -5115,7 +5115,7 @@ async fn peer_auth_identity_allowlist_and_limits_reject_before_game_calls() {
         .unwrap();
     assert_eq!(admin.status(), 401);
     for (key, value) in [
-        ("region", json!("tw")),
+        ("region", json!("hk")),
         ("region", json!("cn")),
         ("environment", json!("review")),
         ("platform", json!("Android")),
@@ -5209,14 +5209,14 @@ async fn peer_deployment_is_opt_in_and_has_independent_region_credentials() {
         .unwrap()
         .router;
     assert_eq!(peer_send(app, "internal-jp", request).await.status(), 401);
-    let mut tw = regional_config(Region::Tw);
-    tw.peer_token_env = Some(name);
+    let mut hk = regional_config(Region::Hk);
+    hk.peer_token_env = Some(name);
     let multi = crate::deployment::MultiConfig {
         logging: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
-        regions: BTreeMap::from([("jp".into(), cfg), ("tw".into(), tw)]),
+        regions: BTreeMap::from([("jp".into(), cfg), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(multi)).prepare().is_err());
 }
@@ -5225,21 +5225,21 @@ async fn peer_deployment_is_opt_in_and_has_independent_region_credentials() {
 async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
     use crate::region::Region;
     let f = fixture(vec![]).await;
-    let c = client(&f, regional_config(Region::Tw));
-    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "tw-peer".into());
+    let c = client(&f, regional_config(Region::Hk));
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "hk-peer".into());
     for region in [Region::En, Region::Kr] {
         let mut identity = c.peer_identity().unwrap();
         assert_eq!(region.family(), identity.region.family());
         identity.region = region;
         let request = peer_request(identity, json!({"type":"version"}));
-        let reply = body(peer_send(app.clone(), "tw-peer", request).await).await;
+        let reply = body(peer_send(app.clone(), "hk-peer", request).await).await;
         assert_eq!(reply["outcome"]["kind"]["type"], "identity_mismatch");
     }
     let request = peer_request(
         c.peer_identity().unwrap(),
         json!({"type":"profile","profile_id":1}),
     );
-    let reply = body(peer_send(app, "tw-peer", request).await).await;
+    let reply = body(peer_send(app, "hk-peer", request).await).await;
     assert_eq!(reply["outcome"]["kind"]["type"], "unsupported_operation");
     assert!(f.received.lock().unwrap().is_empty());
 }
@@ -5316,7 +5316,7 @@ async fn peer_transport_reaches_real_local_executor_with_exact_scope() {
         .get("authorization")
         .is_none());
     let mut other = outgoing_peer_request();
-    other.identity.region = Region::Tw;
+    other.identity.region = Region::Hk;
     assert!(matches!(
         transport
             .call(&other, tokio::time::Instant::now() + Duration::from_secs(2))
@@ -5915,14 +5915,14 @@ async fn node_routing_configuration_and_admin_scope_are_enforced_at_deployment()
             assert!(!value.to_string().contains("example.invalid"));
         }
     }
-    let mut tw = regional_config(Region::Tw);
-    tw.node_routing = cfg.node_routing.clone();
+    let mut hk = regional_config(Region::Hk);
+    hk.node_routing = cfg.node_routing.clone();
     let deployment = crate::deployment::MultiConfig {
         logging: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
-        regions: BTreeMap::from([("jp".into(), cfg.clone()), ("tw".into(), tw)]),
+        regions: BTreeMap::from([("jp".into(), cfg.clone()), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(deployment))
         .prepare()
@@ -6920,7 +6920,7 @@ async fn master_sync_notifications_are_scoped_coalesced_and_fetch_verified_owner
     for field in ["region", "environment", "platform"] {
         let mut wrong = hint.clone();
         wrong["scope"][field] = json!(match field {
-            "region" => "tw",
+            "region" => "hk",
             "environment" => "review",
             _ => "Android",
         });
@@ -7436,7 +7436,7 @@ fn master_notification_configuration_and_deployment_separate_credentials() {
     bad.region = Region::Cn;
     assert!(bad.validate().is_err());
     let mut scope = crate::master_registry::Scope {
-        region: Region::Tw,
+        region: Region::Hk,
         environment: "release".into(),
         platform: crate::region::Platform::Android,
     };
@@ -7450,8 +7450,8 @@ fn master_notification_configuration_and_deployment_separate_credentials() {
             .is_err());
     }
     // Another profile's credentials are protected, even if unrelated to JP Master.
-    let other = regional_config(Region::Tw);
-    std::env::set_var(&base.targets[0].token_env, "internal-tw");
+    let other = regional_config(Region::Hk);
+    std::env::set_var(&base.targets[0].token_env, "internal-hk");
     assert!(crate::master_notify::validate_tokens(&[&cfg, &other]).is_err());
     std::env::set_var(&base.targets[0].token_env, "consumer-admin");
     let prepared = DeploymentConfig::Single(Box::new(cfg)).prepare().unwrap();
@@ -10486,7 +10486,7 @@ async fn standalone_registry_files_auth_integrity_scope_and_real_consumer() {
     assert!(bad.prepare().is_err());
     // A Global registry is valid, but never serves this JP directory under its own scope.
     for region in [
-        crate::region::Region::Tw,
+        crate::region::Region::Hk,
         crate::region::Region::En,
         crate::region::Region::Kr,
     ] {
@@ -11906,7 +11906,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     DeploymentConfig::parse(&optional).unwrap();
     for (region, source) in [
         ("en", include_str!("../docs/examples/en.yaml")),
-        ("tw", include_str!("../docs/examples/tw.yaml")),
+        ("hk", include_str!("../docs/examples/hk.yaml")),
         ("kr", include_str!("../docs/examples/kr.yaml")),
     ] {
         match DeploymentConfig::parse(source).unwrap() {
@@ -11928,7 +11928,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
             )
             .collect::<Vec<_>>()
             .join("\n");
-        let repository = if region == "tw" {
+        let repository = if region == "hk" {
             "HK"
         } else {
             &region.to_uppercase()
@@ -12236,7 +12236,7 @@ async fn client_tokens_check_credentials_region_grants_and_cache_against_postgre
         "CREATE TABLE sirius_api_users (id TEXT PRIMARY KEY, credential TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '')",
         "CREATE TABLE sirius_api_user_regions (user_id TEXT NOT NULL REFERENCES sirius_api_users(id) ON DELETE CASCADE, region TEXT NOT NULL, PRIMARY KEY (user_id, region))",
         "INSERT INTO sirius_api_users (id, credential) VALUES ('granted', 'secret-a'), ('elsewhere', 'secret-b')",
-        "INSERT INTO sirius_api_user_regions VALUES ('granted', 'jp'), ('elsewhere', 'tw')",
+        "INSERT INTO sirius_api_user_regions VALUES ('granted', 'jp'), ('elsewhere', 'hk')",
     ] {
         sqlx::query(sql).execute(&mut conn).await.unwrap();
     }
@@ -13065,7 +13065,7 @@ async fn master_sync_propagates_owner_asset_version_without_redownloading_tables
 /// Verified public server-list CDN roots (first line) and API origins per Global region.
 const GLOBAL_SERVICES: [(crate::region::Region, &str, &str); 3] = [
     (
-        crate::region::Region::Tw,
+        crate::region::Region::Hk,
         "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com",
         "https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10",
     ),
@@ -13154,7 +13154,7 @@ async fn get_json(app: &axum::Router, path: &str, token: &str) -> (u16, Value) {
 #[tokio::test]
 async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region() {
     use crate::{master, master_git, master_registry as registry, master_sync, region::Region};
-    for (index, region) in [Region::Tw, Region::En, Region::Kr].into_iter().enumerate() {
+    for (index, region) in [Region::Hk, Region::En, Region::Kr].into_iter().enumerate() {
         let n = region.name();
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("master");
@@ -13321,7 +13321,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             format!("Sirius Master {n} master-fixture\n")
         );
         // The Git state is owned by this region; another region's scope is refused.
-        let other = [Region::Jp, Region::Tw, Region::En, Region::Kr][(index + 2) % 4];
+        let other = [Region::Jp, Region::Hk, Region::En, Region::Kr][(index + 2) % 4];
         assert!(matches!(
             master_git::commit_with_options(
                 &directory,
@@ -13586,7 +13586,7 @@ fn master_import_records_region_and_directories_never_mix_regions() {
     let (_, decoder, _) = master_fixture();
     // A JP directory never accepts another region's import.
     assert!(
-        master::import_directory_for_region(&input, &jp_output, &decoder, None, Region::Tw)
+        master::import_directory_for_region(&input, &jp_output, &decoder, None, Region::Hk)
             .is_err()
     );
     assert!(
@@ -13614,7 +13614,7 @@ fn master_import_records_region_and_directories_never_mix_regions() {
     std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let after = registry::manifest(&jp_output, None, registry_scope()).unwrap();
     assert_eq!(before.bytes, after.bytes);
-    assert!(registry::manifest(&jp_output, None, global_scope(Region::Tw)).is_err());
+    assert!(registry::manifest(&jp_output, None, global_scope(Region::Hk)).is_err());
     let status: Value = serde_json::from_slice(
         &master::read_current_in(&jp_output, None, Region::Jp)
             .unwrap()
@@ -13637,8 +13637,8 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
     for (name, value) in [
         ("SIRIUS_JP_API_TOKEN", "publisher-public-jp"),
         ("SIRIUS_JP_INTERNAL_TOKEN", "publisher-internal-jp"),
-        ("SIRIUS_TW_API_TOKEN", "publisher-public-tw"),
-        ("SIRIUS_TW_INTERNAL_TOKEN", "publisher-internal-tw"),
+        ("SIRIUS_HK_API_TOKEN", "publisher-public-hk"),
+        ("SIRIUS_HK_INTERNAL_TOKEN", "publisher-internal-hk"),
         ("SIRIUS_EN_API_TOKEN", "publisher-public-en"),
         ("SIRIUS_EN_INTERNAL_TOKEN", "publisher-internal-en"),
         ("SIRIUS_KR_API_TOKEN", "publisher-public-kr"),
@@ -13681,7 +13681,7 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
         let git = c.master_git.as_ref().unwrap();
         assert_eq!(git.layout, crate::master_git::Layout::IndentedRoot);
         assert_eq!(git.branch, "main");
-        let repository = if name == "tw" { "hk" } else { name.as_str() };
+        let repository = name.as_str();
         assert_eq!(
             git.remote.as_ref().unwrap().url,
             format!("https://github.com/Srirus-Project/sirius-{repository}-master.git")
@@ -13713,7 +13713,7 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
             .state_directory
             .clone();
         m.regions
-            .get_mut("tw")
+            .get_mut("hk")
             .unwrap()
             .master_git
             .as_mut()
@@ -13765,4 +13765,247 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
         jp.cdn_credential_env.clear();
     });
     assert!(anonymous_jp.validate().is_err());
+}
+
+#[test]
+fn hk_is_canonical_and_the_deprecated_alias_is_configuration_input_only() {
+    use crate::{master_registry as registry, region::Region};
+    assert_eq!(Region::Hk.name(), "hk");
+    assert_eq!(Region::Hk.area_id(), Some("2"));
+    assert_eq!(serde_json::to_value(Region::Hk).unwrap(), json!("hk"));
+    assert_eq!(Region::from_name("hk"), Some(Region::Hk));
+    assert_eq!(Region::from_name("tw"), None);
+    // Wire formats (peer identities, hints, manifests, jobs) never accept the alias.
+    assert!(serde_json::from_value::<Region>(json!("tw")).is_err());
+    assert!(serde_json::from_value::<registry::Scope>(
+        json!({"region":"tw","environment":"release","platform":"Android"})
+    )
+    .is_err());
+    // Configuration and CLI input accept it as hk.
+    assert_eq!(Region::from_config_name("tw"), Some(Region::Hk));
+    assert!(crate::region::deprecated_alias_used());
+    let example = include_str!("../docs/examples/hk.yaml");
+    let legacy = example.replacen("\"region\": \"hk\"", "\"region\": \"tw\"", 1);
+    assert_ne!(legacy, example);
+    let parsed = crate::deployment::DeploymentConfig::parse(&legacy).unwrap();
+    assert_eq!(parsed.single().unwrap().region, Region::Hk);
+    let standalone: crate::registry_service::Config = yaml_serde::from_str(
+        "listen: 127.0.0.1:0\ntoken_env: SIRIUS_UNUSED\nscope: {region: tw, environment: release, platform: Android}\nbackend: {kind: files, directory: data/hk/master}\n",
+    )
+    .unwrap();
+    assert!(
+        standalone.scope
+            == registry::Scope {
+                region: Region::Hk,
+                environment: "release".into(),
+                platform: crate::region::Platform::Android,
+            }
+    );
+    assert!(yaml_serde::from_str::<crate::registry_service::Config>(
+        "listen: 127.0.0.1:0\ntoken_env: SIRIUS_UNUSED\nscope: {region: global, environment: release, platform: Android}\nbackend: {kind: files, directory: data/hk/master}\n",
+    )
+    .is_err());
+    // One warning per process, after logging starts, that never spells the alias.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("application.log");
+    let config = crate::application_log::Config {
+        level: crate::application_log::Level::Info,
+        format: crate::access_log::Format::Json,
+        output: crate::access_log::Output::File {
+            path: path.clone(),
+            rotation: crate::access_log::Rotation::Never,
+            max_files: 1,
+        },
+        queue_capacity: 16,
+    };
+    let (subscriber, guard) = config.subscriber().unwrap();
+    let logged = tracing::subscriber::with_default(subscriber, || {
+        [
+            crate::region::warn_deprecated_alias(),
+            crate::region::warn_deprecated_alias(),
+        ]
+    });
+    drop(guard);
+    assert_eq!(logged, [true, false]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("deprecated_region_alias") && text.contains("WARN"));
+    assert!(!text.contains("tw"));
+}
+
+#[test]
+fn multi_region_alias_key_maps_to_hk_and_both_keys_are_rejected() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let source = include_str!("../sirius-multi-region-config.example.yaml");
+    let example: yaml_serde::Value = yaml_serde::from_str(source).unwrap();
+    // Rename the hk entry's key (and optionally its region) to the deprecated alias.
+    let with_alias = |region: &str| {
+        let mut value = example.clone();
+        let regions = value["regions"].as_mapping_mut().unwrap();
+        let mut hk = regions.remove("hk").unwrap();
+        hk["region"] = region.into();
+        regions.insert("tw".into(), hk);
+        yaml_serde::to_string(&value).unwrap()
+    };
+    for text in [with_alias("tw"), with_alias("hk")] {
+        match DeploymentConfig::parse(&text).unwrap() {
+            DeploymentConfig::Multi(m) => {
+                assert!(m.regions.keys().eq(["en", "hk", "jp", "kr"]));
+                assert_eq!(m.regions["hk"].region, Region::Hk);
+            }
+            DeploymentConfig::Single(_) => panic!("multi-region example"),
+        }
+    }
+    assert!(crate::region::deprecated_alias_used());
+    // Both spellings in one map are rejected, never merged.
+    let mut value = example.clone();
+    let hk = value["regions"]["hk"].clone();
+    value["regions"]
+        .as_mapping_mut()
+        .unwrap()
+        .insert("tw".into(), hk);
+    let both = yaml_serde::to_string(&value).unwrap();
+    let error = DeploymentConfig::parse(&both).err().unwrap().to_string();
+    assert!(error.contains("hk"), "{error}");
+    assert!(!error.contains("tw"), "{error}");
+}
+
+#[tokio::test]
+async fn legacy_hk_receipts_and_git_state_are_read_as_hk_and_never_written_back() {
+    use crate::{master, master_git, master_registry as registry, region::Region};
+    let (_fixture_root, input, _, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("hk");
+    master::import_directory_for_region(
+        &input,
+        &directory,
+        &decoder,
+        Some("1.0.0.104"),
+        Region::Hk,
+    )
+    .unwrap();
+    let state = root.path().join("git");
+    master_git::commit(&directory, &state, global_scope(Region::Hk))
+        .await
+        .unwrap();
+    let before = registry::manifest(&directory, None, global_scope(Region::Hk)).unwrap();
+    // Rewrite the receipt and the Git ownership marker as a pre-1.2.1 build recorded them.
+    let snapshot = std::fs::read_to_string(directory.join("CURRENT")).unwrap();
+    let receipt_path = directory.join(&snapshot).join("receipt.json");
+    let mut receipt: Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["region"], "hk");
+    receipt["region"] = json!("tw");
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let marker = state.join("sirius-git.json");
+    let mut owner: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(owner["scope"]["region"], "hk");
+    owner["scope"]["region"] = json!("tw");
+    std::fs::write(&marker, serde_json::to_vec(&owner).unwrap()).unwrap();
+    // Reads treat the legacy receipt as hk, with an unchanged identity.
+    let after = registry::manifest(&directory, None, global_scope(Region::Hk)).unwrap();
+    assert_eq!(before.bytes, after.bytes);
+    assert!(!String::from_utf8(after.bytes).unwrap().contains("\"tw\""));
+    assert!(registry::manifest(&directory, None, registry_scope()).is_err());
+    let status = master::read_current_in(&directory, None, Region::Hk).unwrap();
+    let status: Value = serde_json::from_slice(&status.bytes).unwrap();
+    assert_eq!(status["region"], "hk");
+    assert!(master::read_current_in(&directory, None, Region::Jp).is_err());
+    // A new installation into the directory records hk; the legacy one is left as it was.
+    let next = master::import_directory_for_region(
+        &input,
+        &directory,
+        &decoder,
+        Some("1.0.0.105"),
+        Region::Hk,
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(&next).unwrap()["region"], "hk");
+    // Git state recorded with the alias is accepted and its marker rewritten to hk.
+    let published = master_git::commit(&directory, &state, global_scope(Region::Hk))
+        .await
+        .unwrap();
+    let owner: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(owner["scope"]["region"], "hk");
+    assert!(!serde_json::to_string(&published)
+        .unwrap()
+        .contains("\"tw\""));
+    assert_eq!(
+        git_output(
+            &state.join("repository.git"),
+            &["log", "--format=%s", "master-data"]
+        )
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(2),
+        Some("hk")
+    );
+    // Another region's Git state is still refused.
+    owner_marker_region(&marker, "en");
+    assert!(
+        master_git::commit(&directory, &state, global_scope(Region::Hk))
+            .await
+            .is_err()
+    );
+}
+fn owner_marker_region(marker: &std::path::Path, region: &str) {
+    let mut owner: Value = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+    owner["scope"]["region"] = json!(region);
+    std::fs::write(marker, serde_json::to_vec(&owner).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn hk_routes_serve_hk_and_alias_paths_are_not_found() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        region::Region,
+    };
+    let deployment = DeploymentConfig::Multi(Box::new(MultiConfig {
+        logging: None,
+        tls: None,
+        access_log: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::from([("hk".into(), regional_config(Region::Hk))]),
+    }));
+    let app = deployment.prepare().unwrap().router;
+    let (status, body) = get_json(&app, "/api/v1/hk/regions", "public-hk").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["selected"], "hk");
+    let text = body.to_string();
+    assert!(text.contains("\"hk\"") && !text.contains("tw"), "{text}");
+    let (status, body) = get_json(&app, "/internal/v1/hk/protocol", "internal-hk").await;
+    assert_eq!(status, 200, "{body}");
+    for (path, token) in [
+        ("/api/v1/tw/regions", "public-hk"),
+        ("/api/v1/tw/system", "public-hk"),
+        ("/api/v1/tw/master-data/manifest", "public-hk"),
+        ("/internal/v1/tw/protocol", "internal-hk"),
+    ] {
+        assert_eq!(get_json(&app, path, token).await.0, 404, "{path}");
+    }
+    // The standalone registry's regional paths use hk only.
+    let (_root, input, _, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("hk");
+    crate::master::import_directory_for_region(&input, &master, &decoder, None, Region::Hk)
+        .unwrap();
+    let mut registry_cfg = standalone_registry_config(master);
+    registry_cfg.scope = global_scope(Region::Hk);
+    registry_cfg.regional_paths = true;
+    let registry = registry_cfg.prepare().unwrap().router;
+    let (status, body) = get_json(&registry, "/api/v1/hk/master-data/manifest", "owner-read").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["scope"]["region"], "hk");
+    assert!(!body.to_string().contains("\"tw\""));
+    assert_eq!(
+        get_json(&registry, "/api/v1/tw/master-data/manifest", "owner-read")
+            .await
+            .0,
+        404
+    );
 }

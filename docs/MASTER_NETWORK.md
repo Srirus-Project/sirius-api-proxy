@@ -22,7 +22,7 @@ master_update:
 
 `cdn_authorization` (default `basic`) is independent of the network policy. `basic` requires
 `username_env` and a credential for the CDN root. `none` sends no Authorization header and is
-limited to TW/EN/KR (see [region support](REGIONS.md#cdn-authorization)).
+limited to HK/EN/KR (see [region support](REGIONS.md#cdn-authorization)).
 
 The defaults retain one request attempt and the original connection/request/update timeouts.
 Connection and request timeouts allow 100–300000 ms. Request timeout includes the response body.

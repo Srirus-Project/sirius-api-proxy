@@ -212,7 +212,7 @@ async fn master_table(
 }
 async fn regions(State(c): State<Arc<GameClient>>) -> Json<Value> {
     use crate::region::Region;
-    let regions=[Region::Jp,Region::Tw,Region::En,Region::Kr,Region::Cn].map(|region| json!({
+    let regions=[Region::Jp,Region::Hk,Region::En,Region::Kr,Region::Cn].map(|region| json!({
         "region":region,"area_id":region.area_id(),"protocol_family":region.family(),"reserved":region==Region::Cn,
         "master_data":region.master_supported(),
         "capability":if region==Region::Cn {"reserved"} else if region==Region::Jp {"jp_proxy"} else {"discovery_and_version"}

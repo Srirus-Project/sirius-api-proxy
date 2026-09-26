@@ -7,10 +7,10 @@ background game updater or runtime Protobuf bundle. An optional owner worker fet
 `protocol/`. It shares the normal binary's TLS listener, application/access logging and
 SIGINT/SIGTERM shutdown. Configuration is bounded to 64 KiB and rejects unknown fields.
 
-A process serves one explicit region/environment/platform scope (`jp`, `tw`, `en` or `kr`) using
+A process serves one explicit region/environment/platform scope (`jp`, `hk`, `en` or `kr`) using
 either immutable local file snapshots or the PostgreSQL mirror. Reserved CN is rejected before
 network activity. File snapshots recorded for another region are not served. `regional_paths:
-true` inserts the scope's region after `/api/v1` and `/internal/v1` (for example `/api/v1/tw`);
+true` inserts the scope's region after `/api/v1` and `/internal/v1` (for example `/api/v1/hk`);
 there are no implicit aliases. Use separate instances/listeners for different scopes.
 
 The file backend observes CURRENT on each request. The PostgreSQL backend reads committed

@@ -8,12 +8,16 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy, verified download/export pipeline and Master data |
-| `tw` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
 | `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
 | `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
-`global` is not a region. TW, EN and KR have distinct API roots and Master versions. EN and KR
+The Traditional Chinese (TW/HK/MO) region is `hk`, the identifier the game itself uses (CDN
+path `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list); see
+[the `hk` identifier](#the-hk-identifier).
+
+`global` is not a region. HK, EN and KR have distinct API roots and Master versions. EN and KR
 may share CDN hosts but use distinct base paths. Known production endpoints and CDN paths
 that belong to another region are rejected; custom deployment origins remain configurable.
 The `|`-separated entries returned by discovery are alternate URLs: select exactly one URL,
@@ -42,7 +46,7 @@ Global Master data is supported as described below; nothing else about Global ac
 
 The Master pipeline (`master_directory`, `master_update`, `master-import`, the plaintext
 registry, `master_sync`, `master_notify`, `master_git` and `master_database`, plus the standalone
-`registry-serve`) works for `jp`, `tw`, `en` and `kr`. `cn` is rejected everywhere. Global
+`registry-serve`) works for `jp`, `hk`, `en` and `kr`. `cn` is rejected everywhere. Global
 clients fetch Master data the same way as JP: `{CdnRoot}/master/{version}/MasterManifest.json`
 and `{CdnRoot}/master/{version}/{name}.bin`, with the same manifest shape, encryption and
 compression (the same `SIRIUS_MASTER_KEY_HEX`/`SIRIUS_MASTER_IV_HEX` values). `version` is field 1
@@ -54,7 +58,7 @@ list holds alternate lines). The shipped examples use the first line of each reg
 
 | Region | Master CDN root (first server-list line) |
 | --- | --- |
-| `tw` | `https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10` |
+| `hk` | `https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10` |
 | `en` | `https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0` |
 | `kr` | `https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52` |
 
@@ -65,7 +69,7 @@ list holds alternate lines). The shipped examples use the first line of each reg
 - `basic` (default): HTTP Basic with `username_env` and the credential that `cdn_credential_env`
   references for the effective CDN root. JP always uses this, and a JP profile must reference a
   credential for its `default_cdn_root`.
-- `none`: no Authorization header is sent. This is accepted only for `tw`, `en` and `kr`, only
+- `none`: no Authorization header is sent. This is accepted only for `hk`, `en` and `kr`, only
   without `username_env`, and only when `cdn_credential_env` has **no** entry for
   `default_cdn_root`. Downloads use exactly the configured root. If the game announces a
   different CDN root, the update fails and the installed snapshot is kept.
@@ -93,7 +97,7 @@ Snapshot receipts record `region`. Receipts without one (every snapshot written 
 are JP snapshots, so existing JP directories, content hashes and Git trees are unchanged. A
 directory holds one region's history: reads, registry routes, history, Git and database
 publication, sync and new installations all refuse a snapshot recorded for another region.
-`master-import IN OUT --region tw|en|kr` records a Global import; without `--region` it records
+`master-import IN OUT --region hk|en|kr` records a Global import; without `--region` it records
 JP as before. Content identity, update hints and notifications carry the scope's region.
 Regional routes use `/api/v1/{region}/master-data/...` and `/internal/v1/{region}/...`. Git
 commit messages are `Sirius Master <region> <version>`. In a multi-region deployment, each
@@ -101,10 +105,42 @@ region needs its own `master_directory`, `master_git.state_directory`, Git remot
 See [the multi-region publisher example](examples/master-publisher.yaml) and
 [Master snapshot publication](MASTER_REGISTRY.md).
 
+### The `hk` identifier
+
+Before 1.2.1 this region was named `tw`. Since 1.2.1 the canonical name is `hk` everywhere Sirius
+writes or serves a region: `/api/v1/regions`, `/api/v1/hk` and `/internal/v1/hk` routes
+(including `regional_paths`), scopes, manifests and content identity, receipts, Git commit
+messages (`Sirius Master hk …`), update hints and notifications, sync, asset updater jobs, errors
+and logs. The area ID (2), endpoints and CDN roots are unchanged.
+
+`tw` remains a **deprecated input alias**, accepted only in configuration and CLI arguments: a
+profile's `region`, a multi-region `regions` map key, the `scope.region` of `registry-serve` and
+`master-db-*` configurations, and `master-import --region`. It is read as `hk`, and the process
+logs one `deprecated_region_alias` warning at startup. A `regions` map with both keys is
+rejected. The alias will be removed in a future release; configure `hk`. Paths and wire formats
+never accept it: `/api/v1/tw/...` and `/internal/v1/tw/...` return 404, and peer queries, update
+hints, published manifests and asset updater replies naming it are rejected. Upgrade peers,
+registries and consumers of this region together.
+
+Data written by earlier builds:
+
+- Snapshot receipts recorded as `tw` are read as `hk`, so an existing `master_directory` keeps
+  working. New receipts record `hk`; existing receipts are not rewritten. Because content identity
+  includes the scope, the snapshot's `content_sha256` is now computed for `hk`, so consumers and
+  Git publication see one new content identity for unchanged tables.
+- A `master_git.state_directory` whose ownership marker records `tw` is accepted and its marker is
+  rewritten to `hk`. The next publication commits the new identity as `Sirius Master hk …`; earlier
+  commit messages stay as published.
+- Not migrated: PostgreSQL Master rows keyed by the old scope (the `hk` scope starts empty; run
+  `master-db-migrate` to rebuild its history from the snapshot directory), `client_auth` grant rows
+  (`UPDATE sirius_api_user_regions SET region = 'hk' WHERE region = 'tw'`), asset dispatch state
+  containing jobs for the old name (it fails to open; use a new `state_directory` after the
+  pending jobs finish), and response cache entries (they go cold).
+
 ## Asset updater
 
 Configure the same region, platform, client version and protocol version as the proxy.
-`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for TW/EN/KR; it can be pinned explicitly
+`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR; it can be pinned explicitly
 when deploying a new verified bundle. `cdn_roots` matches the entire HTTPS base URL, including
 its path. Username/password environment references belong only to that configured base URL.
 Redirects remain disabled and unknown roots/references are rejected before CDN requests.

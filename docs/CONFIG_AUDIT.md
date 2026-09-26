@@ -51,7 +51,7 @@ Original: `Config`, `Haruki-Sekai-API@07da6b80:src/config.rs:515-538`.
 | `master_database` | ADAPTED | `master_database: {connection, interval_seconds}` (`src/master_database_worker.rs:9-15`) | See [`master_database`](#master_database). |
 | `apphash_sources[]` (`type`, `dir`, `url`) | IGNORED_BY_ORIGINAL / NOT_APPLICABLE | none | The original marks it deprecated and ignored (`Haruki-Sekai-API@07da6b80:src/config.rs:497-506`) and warns at startup (`:570-587`). Sekai app hash. Sirius client identity is the static `client_version` (`src/config.rs:41`). |
 | `asset_updater_servers[]` | ADAPTED | `asset_dispatch.targets[]` (`src/asset_dispatch.rs:14-37`) | See [`asset_updater_servers`](#asset_updater_servers). |
-| `servers` (map region → `ServerConfig`) | ADAPTED | A single-region file is one region profile (`region`, `src/config.rs:29`). A multi-region file uses `regions: {jp: ..., tw: ...}` (`src/deployment.rs:23`), with 1–4 entries whose keys must equal `region` (`:82-92`), and root-only `listen`/`tls`/`logging`/`access_log` (`:93-101`). | See [`servers.<region>`](#serversregion). |
+| `servers` (map region → `ServerConfig`) | ADAPTED | A single-region file is one region profile (`region`, `src/config.rs:29`). A multi-region file uses `regions: {jp: ..., hk: ...}` (`src/deployment.rs:23`), with 1–4 entries whose keys must equal `region` (a deprecated `tw` key is read as `hk`) (`:82-92`), and root-only `listen`/`tls`/`logging`/`access_log` (`:93-101`). | See [`servers.<region>`](#serversregion). |
 | `registry` | ADAPTED | Separate `registry-serve REGISTRY_CONFIG` file (`src/main.rs:5-10`, `src/registry_service.rs:20-35`) | See [`registry`](#registry). |
 
 ## Regions
@@ -60,8 +60,8 @@ Original: `ServerRegion`, `Haruki-Sekai-API@07da6b80:src/config.rs:8-32`.
 
 | Original value | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `jp` | REUSED | `Region::Jp` (`src/region.rs:3-12`) | The only region with verified game RPCs beyond discovery. Master CDN access always uses Basic with a credential reference (`src/config.rs:297-306`, `:361-367`). |
-| `en`, `tw`, `kr` | ADAPTED | `Region::{En, Tw, Kr}`, protocol family `global` (`src/region.rs:23-29`) | Game RPC is limited to the verified `Version` and `GetServerList` (`src/routes.rs:24-31`). Master storage, update, sync, Git, database and notifications are enabled (1.2.1; `Region::master_supported`, `src/region.rs`, used by `src/config.rs:274`, `src/master_git_worker.rs:46`, `src/master_database_worker.rs:21`, `src/master_notify.rs:151`, `src/registry_service.rs:56`). The Master CDN may be anonymous with explicit `master_update.cdn_authorization: none` (`src/config.rs:307-319`). CN remains rejected. |
+| `jp` | REUSED | `Region::Jp` (`src/region.rs:13-20`) | The only region with verified game RPCs beyond discovery. Master CDN access always uses Basic with a credential reference (`src/config.rs:297-306`, `:361-367`). |
+| `en`, `hk`, `kr` | ADAPTED | `Region::{En, Hk, Kr}`, protocol family `global` (`src/region.rs:16-18`; `tw` is a deprecated configuration alias of `hk`, see [REGIONS.md](REGIONS.md#the-hk-identifier)) | Game RPC is limited to the verified `Version` and `GetServerList` (`src/routes.rs:24-31`). Master storage, update, sync, Git, database and notifications are enabled (1.2.1; `Region::master_supported`, `src/region.rs`, used by `src/config.rs:274`, `src/master_git_worker.rs:46`, `src/master_database_worker.rs:21`, `src/master_notify.rs:151`, `src/registry_service.rs:56`). The Master CDN may be anonymous with explicit `master_update.cdn_authorization: none` (`src/config.rs:307-319`). CN remains rejected. |
 | `cn` | ADAPTED | Parsed, then rejected with "cn is reserved; no verified endpoint or protocol is available" (`src/config.rs:251-255`) | Explicit rejection, exercised by the packaged smoke test (`scripts/smoke-release.py:151-154`). |
 | `is_cp_server()` (JP/EN) | NOT_APPLICABLE | none | Selects Sekai CP versus Nuverse login and master paths (`Haruki-Sekai-API@07da6b80:src/config.rs:29-31`, `Haruki-Sekai-API@07da6b80:src/main.rs:141-177`). Sirius has one gRPC protocol per family. |
 
@@ -103,7 +103,7 @@ Original: `DatabaseConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:102-115`.
 
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `enabled` | ADAPTED | Presence of `master_database` (`src/config.rs:9`), JP/TW/EN/KR (CN rejected) and requires `master_directory` (`src/master_database_worker.rs:20-31`) | Sirius stores the verified generic JSON documents plus JSONB. It does not use the original's Sekai Ent-typed tables, which the restoration objective excludes. |
+| `enabled` | ADAPTED | Presence of `master_database` (`src/config.rs:9`), JP/HK/EN/KR (CN rejected) and requires `master_directory` (`src/master_database_worker.rs:20-31`) | Sirius stores the verified generic JSON documents plus JSONB. It does not use the original's Sekai Ent-typed tables, which the restoration objective excludes. |
 | `dsn` | ADAPTED | `connection.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds, keep_snapshots}` (`src/master_database.rs:32-48`) | The secret moved into an env var; TLS is required unless loopback. |
 | `max_connections` | ADAPTED | `connection.max_read_connections` (default 4, 1–64; `src/master_database.rs:49-52`, `:63-65`, `:96`) sizes the read pool (`:506-513`) | Writers intentionally use one connection (`src/master_database.rs:210-211`, `:378-379`) because publication and migration are single serialized transactions. |
 | `ingest_concurrency` | ADAPTED | none needed | The original knob bounded parallel per-table ingest memory (`Haruki-Sekai-API@07da6b80:src/ingest_engine.rs:25`). Sirius publishes each snapshot in one serial transaction (`src/master_database.rs:210-216`), so there is no parallelism to bound. |
@@ -115,7 +115,7 @@ Original: `GitConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:136-169`.
 
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `enabled` | ADAPTED | Presence of `master_git` (`src/config.rs:11`, `src/master_git_worker.rs:9-18`) | JP/TW/EN/KR (CN rejected) and requires `master_directory` (`src/master_git_worker.rs:44-54`). Multi-region deployments require distinct state directories and remotes (`src/deployment.rs:106-126`). Accepted on Unix and Windows (`cfg!(any(unix, windows))`, `:27`). On Windows, Git runs in a kill-on-close Job Object, and the Windows CI job runs the Git tests. |
+| `enabled` | ADAPTED | Presence of `master_git` (`src/config.rs:11`, `src/master_git_worker.rs:9-18`) | JP/HK/EN/KR (CN rejected) and requires `master_directory` (`src/master_git_worker.rs:44-54`). Multi-region deployments require distinct state directories and remotes (`src/deployment.rs:106-126`). Accepted on Unix and Windows (`cfg!(any(unix, windows))`, `:27`). On Windows, Git runs in a kill-on-close Job Object, and the Windows CI job runs the Git tests. |
 | `username` | ADAPTED | `commit.author.name` / `commit.committer.name` (`src/master_git.rs:37-42`, `:66-73`) | The original used `username` both as the committer name (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:456`) and as the URL credential user (`:476`). A Basic user now goes inside `remote.authorization_env` (`src/master_git_worker.rs:48-70`). |
 | `email` | ADAPTED | `commit.author.email` / `commit.committer.email` (`src/master_git.rs:41`) | |
 | `password` | ADAPTED | `remote.authorization_env`, a full `Authorization: Basic` or `Bearer` header held in env (`src/master_git.rs:524`) | The original injected the credential into the remote URL (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:476`, `:531`). Sirius passes it through Git config-env, never in a URL. |
@@ -180,7 +180,7 @@ Original: `MasterSyncConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:195-244`.
 | `source_url` | ADAPTED | `master_sync.origin`, plus `regional_paths` and `allow_http` (`src/master_sync.rs:13-27`) | Presence enables it. Requires `master_directory` and excludes `master_update` (`src/config.rs:237-247`). |
 | `source_token` | ADAPTED | `master_sync.token_env`, the owner's public read bearer | |
 | `poll_cron` (empty = webhook only) | DECISION | `master_sync.interval_seconds`, 60–86400 (`src/master_sync.rs:22`, `:36`); hints arrive at `POST /internal/v1/master-data/sync` (`src/api.rs:143-146`) | Polling is always on. Sirius adds `timeout_seconds` and `request_timeout_ms` (`src/master_sync.rs:23-26`). See [Decisions](#decisions). |
-| `notify[]` (`MasterSyncPeer`: `url`, `token`) | ADAPTED | `master_notify.targets[].{name, origin, token_env, regional_paths, allow_http}`, `interval_seconds`, `request_timeout_ms` (`src/master_notify.rs:123-148`) | JP/TW/EN/KR, CN rejected (`:150-170`). Adds per-target retry and deduplication. |
+| `notify[]` (`MasterSyncPeer`: `url`, `token`) | ADAPTED | `master_notify.targets[].{name, origin, token_env, regional_paths, allow_http}`, `interval_seconds`, `request_timeout_ms` (`src/master_notify.rs:123-148`) | JP/HK/EN/KR, CN rejected (`:150-170`). Adds per-target retry and deduplication. |
 
 ### `servers.<region>.master_remote_source`
 
@@ -214,7 +214,7 @@ Original: `RegistryConfig` / `MusicMetasConfig`, `Haruki-Sekai-API@07da6b80:src/
 | `subscribers[]` | ADAPTED | `notify`, a `master_notify` config (`src/registry_service.rs:31`) | |
 | `account_nodes[]` | NOT_APPLICABLE | none | Pushes the Sekai appVersion/appHash to `POST /internal/app-identity` (`Haruki-Sekai-API@07da6b80:src/config.rs:424-427`, `Haruki-Sekai-API@07da6b80:src/api/internal.rs:216-257`). Sirius `client_version` is static configuration (`src/config.rs:41`); protocol reload does not change it (`docs/PROTO_RELOAD.md:36`). |
 | `music_metas.{enabled, cron, inject_omakase, sources, proxy}` | NOT_APPLICABLE | none | Pulls Sekai `music_metas*.json` from sekai-data.3-3.dev and injects the synthetic omakase rows (`Haruki-Sekai-API@07da6b80:src/registry/metas.rs:1-42`, `Haruki-Sekai-API@07da6b80:src/config.rs:439-441`). This is a Sekai-specific data feed with no Sirius counterpart. |
-| (implicit) all regions in one registry | ADAPTED | One `scope` per process, JP/TW/EN/KR (`src/registry_service.rs:25`, `:56`) | `regional_paths` uses the scope's region. |
+| (implicit) all regions in one registry | ADAPTED | One `scope` per process, JP/HK/EN/KR (`src/registry_service.rs:25`, `:56`) | `regional_paths` uses the scope's region. |
 
 ## `asset_updater_servers[]`
 
@@ -290,7 +290,7 @@ These generic capabilities are intentionally not restored in their original form
    unrelated traffic. The original needed an empty-string override for exactly that case
    (`Haruki-Sekai-API@07da6b80:src/config.rs:445-451`).
 6. **Global example CDN roots are the verified server-list roots.** Since 1.2.1,
-   `docs/examples/{en,tw,kr}.yaml` and the Global entries of
+   `docs/examples/{en,hk,kr}.yaml` and the Global entries of
    `sirius-multi-region-config.example.yaml` use the first CDN line of each region's public
    server-list entry, with `cdn_credential_env: {}`. The Global Master CDN needs no credential,
    and no Global CDN credential is verified or shipped. Startup never contacts the CDN: the
@@ -333,7 +333,7 @@ Every shipped example is parsed by tests:
 - `sirius-api-config.example.yaml` (`src/tests.rs:2075-2077`).
 - The block-YAML multi-region example, parsed as shipped and again with its commented `tls:` and
   `access_log:` blocks uncommented.
-- `docs/examples/{en,tw,kr}.yaml`, `docs/examples/master-registry.yaml` (also with `notify:`
+- `docs/examples/{en,hk,kr}.yaml`, `docs/examples/master-registry.yaml` (also with `notify:`
   uncommented) and `docs/examples/master-database.yaml`
   (`every_shipped_example_parses_including_documented_optional_blocks`, `src/tests.rs:11751`).
 

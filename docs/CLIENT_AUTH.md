@@ -34,10 +34,14 @@ CREATE TABLE sirius_api_users (
 );
 CREATE TABLE sirius_api_user_regions (
   user_id TEXT NOT NULL REFERENCES sirius_api_users(id) ON DELETE CASCADE,
-  region TEXT NOT NULL,            -- jp, tw, en or kr
+  region TEXT NOT NULL,            -- jp, hk, en or kr
   PRIMARY KEY (user_id, region)
 );
 ```
+
+Grants use canonical region names only. Rows written for the pre-1.2.1 name of `hk` are not
+matched; rename them with `UPDATE sirius_api_user_regions SET region = 'hk' WHERE region = 'tw'`
+([the `hk` identifier](REGIONS.md#the-hk-identifier)).
 
 ## Requests
 

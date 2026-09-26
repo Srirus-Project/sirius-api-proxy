@@ -2,6 +2,21 @@
 
 ## 1.2.1 (unreleased)
 
+- The Traditional Chinese region is renamed from `tw` to `hk`, the identifier the game uses (CDN
+  `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list). `Region::Hk` serializes as `hk` in
+  `/api/v1/regions`, `/api/v1/hk` and `/internal/v1/hk` routes (including `regional_paths`),
+  scopes, manifests, content identity, receipts, Git commit messages, hints, notifications, sync,
+  asset updater jobs, errors and logs. The area ID stays 2. `docs/examples/tw.yaml` is now
+  `docs/examples/hk.yaml`.
+- Deprecated: `tw` is accepted only as a configuration/CLI alias of `hk` (`region`, multi-region
+  map keys, `scope.region` of `registry-serve`/`master-db-*`, `master-import --region`), with one
+  `deprecated_region_alias` warning at startup. A `regions` map with both keys is rejected. Paths
+  and wire formats never accept it (`/api/v1/tw` is 404).
+- Upgrade note: snapshot receipts and Git state markers recorded as `tw` are read as `hk` (the
+  marker is rewritten); `content_sha256` of such snapshots changes with the scope. PostgreSQL
+  Master rows, `client_auth` grant rows and asset dispatch state keyed by the old name are not
+  migrated. Upgrade peers, registries and consumers of this region together. See
+  `docs/REGIONS.md#the-hk-identifier`.
 - Master Git publication gains `master_git.layout: indented_root`: every table re-indented
   (whitespace only, tokens preserved) at the repository root plus `version.json` with
   `dataVersion` and `assetVersion`. `native` remains the default and its tree is unchanged.
@@ -15,27 +30,27 @@
   `asset_version_unavailable`, leaving refs unchanged.
 - Upgrade note: consumers reject unknown manifest fields, so upgrade consumers and registries
   before owners that record provenance.
-- The Master pipeline is enabled for TW, EN and KR: `master_directory`, `master_update`,
+- The Master pipeline is enabled for HK, EN and KR: `master_directory`, `master_update`,
   `master-import`, registry routes, `master_sync`, `master_notify`, `master_git`,
   `master_database` and `registry-serve`. CN stays rejected. Global downloads use the same
   `{CdnRoot}/master/{version}/…` layout and Master key/IV as JP. The asset version comes from the
   Global VersionResponse `resourceVersion`.
 - `master_update.cdn_authorization`: `basic` (default, required for JP) or `none`. `none` sends no
-  Authorization header. It is accepted only for TW/EN/KR, without `username_env`, and when
+  Authorization header. It is accepted only for HK/EN/KR, without `username_env`, and when
   `default_cdn_root` has no credential reference. It never follows a server-announced root. Global
   profiles no longer need a CDN credential reference. `master_update.username_env` is required
   only for `basic`.
 - Snapshot receipts and the Master status record `region`. Receipts without one are legacy JP
   snapshots, so JP content hashes and Git trees are unchanged. Reads, registry and history,
   sync, Git and database publication, and new installations reject a snapshot recorded for
-  another region. `master-import ... --region tw|en|kr` records a Global import.
+  another region. `master-import ... --region hk|en|kr` records a Global import.
 - The standalone registry's `regional_paths` uses the scope's region (`/api/v1/{region}`,
   `/internal/v1/{region}`) instead of always `/jp`. Multi-region deployments reject shared Master
   directories, shared Git state directories and shared Git remotes across regions.
   `GET /api/v1/regions` adds a `master_data` flag.
-- `docs/examples/{tw,en,kr}.yaml` and the multi-region example use the verified server-list CDN
+- `docs/examples/{hk,en,kr}.yaml` and the multi-region example use the verified server-list CDN
   roots instead of placeholders, and ship commented Master blocks.
-  `docs/examples/master-publisher.yaml` shows JP/TW/EN/KR `master_update` plus `indented_root`
+  `docs/examples/master-publisher.yaml` shows JP/HK/EN/KR `master_update` plus `indented_root`
   Git publication.
 
 ## 1.2.0

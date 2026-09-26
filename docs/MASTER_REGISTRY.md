@@ -1,6 +1,6 @@
 # Master snapshot publication
 
-A `master_directory` of a JP, TW, EN or KR profile exposes verifiable plaintext manifests
+A `master_directory` of a JP, HK, EN or KR profile exposes verifiable plaintext manifests
 through the public API bearer scope. No game/CDN credential, encryption key, schema model or
 query to the game is needed to read installed snapshots. These endpoints remain local when node
 routing is enabled. CN is reserved. Global CDN authorization and region identity are described
@@ -17,7 +17,7 @@ For a single-region deployment:
 | `/snapshots/{snapshot}/tables/{table}/{sha256}` | Exact JSON bytes matching the pinned SHA-256 |
 
 Multi-region deployments insert `{region}` after `/api/v1`, for example
-`/api/v1/tw/master-data/manifest`. A snapshot is served only under the region recorded in its
+`/api/v1/hk/master-data/manifest`. A snapshot is served only under the region recorded in its
 receipt (legacy receipts without a region are JP). A table identifier is the existing
 name without `.json`, for example `MasterExample`. Only names listed in the source manifest
 are served. Unsafe paths and linked snapshot/file entries are rejected. Retained snapshots
@@ -35,14 +35,14 @@ into one snapshot while an owner might publish a new version.
 A manifest may also carry an optional `resource_version`: the asset (resource) version recorded
 when that snapshot was installed. The CDN updater takes it from the same game VERSION response
 that supplied the Master version (the response's `resourceVersion` field where the protocol has
-one, which is field 2 of the Global TW/EN/KR VersionResponse; for JP, whose VersionResponse has no such field, the `x-asset-version` header of that same
+one, which is field 2 of the Global HK/EN/KR VersionResponse; for JP, whose VersionResponse has no such field, the `x-asset-version` header of that same
 response, selected for the configured client version and platform exactly like resource
 snapshots). The final pre-publication VERSION check must report the same Master version, asset
 version and CDN credential, otherwise the update fails as changed. The value is stored in the
 snapshot's `receipt.json`, shown as `resource_version` in the local Master status, and omitted
 when absent. Legacy snapshots and plain `master-import` runs have none; `master-import IN OUT
 --resource-version VERSION` records an operator-supplied value. Nothing synthesizes it.
-`--region tw|en|kr` records a Global import (the default is `jp`).
+`--region hk|en|kr` records a Global import (the default is `jp`).
 
 It is installation provenance, not a live asset mirror: a later asset-only change does not
 reinstall an already-provenanced Master version. When an installed snapshot has no recorded
@@ -91,7 +91,7 @@ creates the durable index. Normal existing API paths remain compatible.
 
 ## Consumer synchronization
 
-A JP, TW, EN or KR consumer may configure `master_directory` and `master_sync` instead of
+A JP, HK, EN or KR consumer may configure `master_directory` and `master_sync` instead of
 `master_update`. Owner and consumer must have the same region, environment and platform. The
 consumer verifies the owner manifest's scope, and a consumer never installs onto a directory
 holding another region's snapshots:
@@ -223,7 +223,7 @@ Requests use explicit origins, normal TLS verification, no ambient proxies, no r
 and no implicit retries. Response bodies are bounded to 1 KiB and the request deadline
 covers body consumption. Acceptance does not prove consumer synchronization.
 
-Configure `master_notify` on a JP, TW, EN or KR profile with `master_directory`. Hints carry
+Configure `master_notify` on a JP, HK, EN or KR profile with `master_directory`. Hints carry
 the profile's scope and use `/internal/v1/{region}/master-data/sync` when `regional_paths` is set:
 
 ```yaml
@@ -401,7 +401,7 @@ separate release requirement.
 
 ### Background Git publication
 
-JP, TW, EN and KR profiles may enable `master_git` with a separate `state_directory` and
+JP, HK, EN and KR profiles may enable `master_git` with a separate `state_directory` and
 optional `remote`. The state directory's ownership marker records the scope, so another region
 cannot publish into it. A multi-region deployment rejects shared snapshot or Git state
 directories and shared remotes. Git tokens must be distinct per region.

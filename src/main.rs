@@ -9,6 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config =
             sirius_api_proxy::registry_service::Config::load(std::path::Path::new(&args[1]))?;
         let _logging = config.logging.clone().unwrap_or_default().init()?;
+        sirius_api_proxy::region::warn_deprecated_alias();
         let prepared = config.prepare()?;
         let listener = tokio::net::TcpListener::bind(prepared.listen).await?;
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -87,6 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let import: sirius_api_proxy::master_database::Import =
             yaml_serde::from_slice(&bytes).map_err(|_| "invalid database configuration")?;
+        sirius_api_proxy::region::warn_deprecated_alias();
         let receipt = if args[0] == "master-db-migrate" {
             serde_json::to_value(
                 sirius_api_proxy::master_database::migrate_history(
@@ -172,6 +174,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let path =
             std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
         let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
+        sirius_api_proxy::region::warn_deprecated_alias();
         let config = deployment.single()?;
         let source = config
             .master_directory
@@ -225,7 +228,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if !args.is_empty() && args != ["master-update"] && args != ["master-sync"] {
-        const USAGE: &str = "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY [--resource-version VERSION] [--region jp|tw|en|kr] | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]";
+        const USAGE: &str = "usage: sirius-api-proxy [master-update | master-sync | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY [--resource-version VERSION] [--region jp|hk|en|kr] | asset-dispatch-status STATE_DIRECTORY | asset-dispatch-adopt STATE_DIRECTORY DISPATCH_KEY JOB_UUID]";
         if args.len() < 3 || args[0] != "master-import" || args.len().is_multiple_of(2) {
             return Err(USAGE.into());
         }
@@ -244,11 +247,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Without --region the import is recorded as JP, as before 1.2.1.
         let region = match region {
             None => sirius_api_proxy::region::Region::Jp,
-            Some(name) => yaml_serde::from_str::<sirius_api_proxy::region::Region>(name)
-                .ok()
-                .filter(|r| r.master_supported() && r.name() == name)
-                .ok_or("--region must be jp, tw, en or kr")?,
+            Some(name) => sirius_api_proxy::region::Region::from_config_name(name)
+                .filter(|r| r.master_supported())
+                .ok_or("--region must be jp, hk, en or kr")?,
         };
+        sirius_api_proxy::region::warn_deprecated_alias();
         use sirius_api_proxy::master::{import_directory_for_region, key_from_hex, MasterDecoder};
         let key = key_from_hex(
             &std::env::var("SIRIUS_MASTER_KEY_HEX")
@@ -272,6 +275,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path =
         std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
     let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
+    sirius_api_proxy::region::warn_deprecated_alias();
     if args == ["master-update"] || args == ["master-sync"] {
         let config = deployment.single()?;
         let client = GameClient::new(config.clone())?;

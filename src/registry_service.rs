@@ -22,6 +22,7 @@ use std::{
 pub struct Config {
     pub listen: SocketAddr,
     pub token_env: String,
+    #[serde(deserialize_with = "registry::config_scope")]
     pub scope: registry::Scope,
     #[serde(default)]
     pub regional_paths: bool,

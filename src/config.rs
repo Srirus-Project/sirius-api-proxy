@@ -25,7 +25,7 @@ pub struct Config {
     pub client_auth: Option<crate::client_auth::Config>,
     #[serde(default)]
     pub logging: Option<crate::application_log::Config>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::region::config_region")]
     pub region: crate::region::Region,
     #[serde(default)]
     pub platform: Option<crate::region::Platform>,
@@ -127,7 +127,7 @@ pub struct MasterUpdateConfig {
     pub network: crate::master_update::Network,
     /// `basic` (default) sends HTTP Basic with `username_env` and the credential referenced for
     /// the effective CDN root. `none` sends no Authorization header; it is accepted only for
-    /// TW/EN/KR and only when `cdn_credential_env` has no reference for `default_cdn_root`.
+    /// HK/EN/KR and only when `cdn_credential_env` has no reference for `default_cdn_root`.
     #[serde(default)]
     pub cdn_authorization: CdnAuthorization,
     /// Required for `basic`; must be absent for `none`.
@@ -312,7 +312,7 @@ impl Config {
                         || self.cdn_credential_env.contains_key(&self.default_cdn_root)
                     {
                         return Err(AppError::Config(
-                            "anonymous Master CDN access is only for TW/EN/KR without a credential for the default CDN",
+                            "anonymous Master CDN access is only for HK/EN/KR without a credential for the default CDN",
                         ));
                     }
                 }

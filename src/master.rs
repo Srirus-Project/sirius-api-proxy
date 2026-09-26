@@ -168,12 +168,15 @@ pub(crate) fn recorded_resource_version(
         Some(_) => Err(MasterError::Format),
     }
 }
-/// The region recorded in a snapshot receipt; absent means a legacy JP snapshot.
+/// The region recorded in a snapshot receipt; absent means a legacy JP snapshot, and the
+/// deprecated alias of `hk` is read as `hk`.
 pub(crate) fn recorded_region(receipt: &serde_json::Value) -> Result<Region, MasterError> {
     match receipt.get("region") {
         None => Ok(Region::Jp),
-        Some(value) => serde_json::from_value::<Region>(value.clone())
-            .ok()
+        // Receipts written by pre-1.2.1 builds may record the deprecated alias of `hk`.
+        Some(value) => value
+            .as_str()
+            .and_then(Region::from_recorded_name)
             .filter(|region| region.master_supported())
             .ok_or(MasterError::Format),
     }

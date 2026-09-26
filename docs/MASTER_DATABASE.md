@@ -10,7 +10,7 @@ export SIRIUS_MASTER_DATABASE_PASSWORD='replace-with-a-dedicated-password'
 sirius-api-proxy master-db-import docs/examples/master-database.yaml
 ```
 
-Set `source`, scope and database connection fields in a private copy of the example. JP, TW,
+Set `source`, scope and database connection fields in a private copy of the example. JP, HK,
 EN and KR share the verified Master format; the source must pass existing manifest/table
 verification and be recorded for the scope's region.
 The configured scope must match the source deployment's region/environment/platform.
@@ -63,7 +63,7 @@ cannot represent causes transaction rollback even though exact JSON bytes are al
 
 ## Background publication
 
-Configure `master_database` on a JP, TW, EN or KR single-region configuration or profile of a
+Configure `master_database` on a JP, HK, EN or KR single-region configuration or profile of a
 multi-region deployment. `master_directory` must be set. The connection fields match the CLI example:
 
 ```yaml

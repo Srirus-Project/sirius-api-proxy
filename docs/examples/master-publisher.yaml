@@ -1,4 +1,4 @@
-# Multi-region Master publisher: every operational region (JP, TW, EN, KR) downloads its own
+# Multi-region Master publisher: every operational region (JP, HK, EN, KR) downloads its own
 # Master data from its own CDN and publishes it to its own Git repository in the
 # indented_root layout (re-indented tables at the root plus version.json).
 # Every *_env value names an environment variable; no secret is stored in this file.
@@ -35,17 +35,16 @@ regions:
     default_cdn_root: "https://static.bang-dream-on.jp"
     cdn_credential_env:
       "https://static.bang-dream-on.jp": "SIRIUS_JP_CDN_CREDENTIAL"
-  tw:
-    # Region identifier stays tw; its publication repository is sirius-hk-master.
-    region: "tw"
+  hk:
+    region: "hk"
     platform: "Android"
     environment: "release"
     endpoint: "https://l12-prod-hk-all-gs-sirius.gamerfusiontech.com"
     client_version: "1.0.1"
     protocol_directory: "protocol/global/1.0.1"
-    api_token_env: "SIRIUS_TW_API_TOKEN"
-    internal_token_env: "SIRIUS_TW_INTERNAL_TOKEN"
-    master_directory: "data/tw/master"
+    api_token_env: "SIRIUS_HK_API_TOKEN"
+    internal_token_env: "SIRIUS_HK_INTERNAL_TOKEN"
+    master_directory: "data/hk/master"
     # Global Master CDNs do not require authentication: no Authorization header is sent.
     # Requires that cdn_credential_env has no entry for default_cdn_root.
     master_update:
@@ -54,7 +53,7 @@ regions:
       iv_hex_env: "SIRIUS_MASTER_IV_HEX"
       interval_seconds: 300
     master_git:
-      state_directory: "data/tw/master-git"
+      state_directory: "data/hk/master-git"
       layout: "indented_root"
       branch: "main"
       commit:
