@@ -9295,6 +9295,7 @@ fn master_database_config() -> crate::master_database::Config {
         plaintext_loopback: true,
         timeout_seconds: 10,
         keep_snapshots: 2,
+        max_read_connections: 4,
     }
 }
 #[tokio::test]
@@ -9316,6 +9317,11 @@ async fn master_database_policy_rejects_unsafe_transport_and_source_before_conne
     for n in [0, 10001] {
         let mut c = good.clone();
         c.keep_snapshots = n;
+        assert!(c.validate().is_err());
+    }
+    for n in [0, 65] {
+        let mut c = good.clone();
+        c.max_read_connections = n;
         assert!(c.validate().is_err());
     }
     let mut secure = good.clone();
@@ -11724,4 +11730,51 @@ async fn registry_notifications_never_announce_unpublished_database_content() {
     task.await.unwrap();
     server.abort();
     consumer_server.abort();
+}
+
+/// Remove the leading `# ` from the commented block that starts with `header`.
+fn uncomment_block(source: &str, header: &str) -> String {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in source.lines() {
+        if line == format!("# {header}") {
+            inside = true;
+        } else if inside && !line.starts_with("#   ") {
+            inside = false;
+        }
+        out.push(if inside { &line[2..] } else { line });
+    }
+    out.join("\n")
+}
+#[test]
+fn every_shipped_example_parses_including_documented_optional_blocks() {
+    use crate::deployment::DeploymentConfig;
+    let multi = include_str!("../sirius-multi-region-config.example.yaml");
+    assert!(matches!(
+        DeploymentConfig::parse(multi).unwrap(),
+        DeploymentConfig::Multi(_)
+    ));
+    let optional = uncomment_block(&uncomment_block(multi, "tls:"), "access_log:");
+    assert!(optional.contains("\ntls:\n") && optional.contains("\naccess_log:\n"));
+    DeploymentConfig::parse(&optional).unwrap();
+    for (region, source) in [
+        ("en", include_str!("../docs/examples/en.yaml")),
+        ("tw", include_str!("../docs/examples/tw.yaml")),
+        ("kr", include_str!("../docs/examples/kr.yaml")),
+    ] {
+        match DeploymentConfig::parse(source).unwrap() {
+            DeploymentConfig::Single(c) => assert_eq!(c.region.name(), region),
+            DeploymentConfig::Multi(_) => panic!("{region} example must be single-region"),
+        }
+    }
+    let registry = include_str!("../docs/examples/master-registry.yaml");
+    yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
+    let notify = uncomment_block(registry, "notify:");
+    assert!(notify.contains("\nnotify:\n"));
+    let parsed: crate::registry_service::Config = yaml_serde::from_str(&notify).unwrap();
+    assert_eq!(parsed.notify.unwrap().targets.len(), 1);
+    yaml_serde::from_str::<crate::master_database::Import>(include_str!(
+        "../docs/examples/master-database.yaml"
+    ))
+    .unwrap();
 }

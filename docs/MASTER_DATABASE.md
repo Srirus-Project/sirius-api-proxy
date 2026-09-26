@@ -47,6 +47,9 @@ using content identity; it does not blindly append another publish event. Explic
 older local content can intentionally make that content current again.
 
 `keep_snapshots` defaults to 20 (range 1–10000) per scope, ordered by latest publication.
+`max_read_connections` (default 4, range 1–64) sizes the lazily opened read pool used by HTTP and
+standalone registry reads. Publication, import and migration always use a single connection because
+each runs as one serialized, advisory-locked transaction; a larger writer pool would add nothing.
 Pruning deletes old database documents through foreign keys, preserves current and other scopes,
 and leaves historical event hashes and every local file intact. History is not automatically
 pruned. PostgreSQL JSONB's supported numeric/string range still applies; a value PostgreSQL
@@ -68,6 +71,7 @@ master_database:
     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
     timeout_seconds: 120
     keep_snapshots: 20
+    max_read_connections: 4
 ```
 
 Successful in-process Master installations wake the database worker independently of Git and

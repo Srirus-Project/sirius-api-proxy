@@ -46,6 +46,10 @@ pub struct Config {
     pub timeout_seconds: u64,
     #[serde(default = "retention")]
     pub keep_snapshots: usize,
+    /// Read pool size (registry and HTTP reads). Writers always use one connection:
+    /// publication and migration are single serialized transactions.
+    #[serde(default = "read_connections")]
+    pub max_read_connections: u32,
 }
 fn port() -> u16 {
     5432
@@ -55,6 +59,9 @@ fn timeout() -> u64 {
 }
 fn retention() -> usize {
     20
+}
+fn read_connections() -> u32 {
+    4
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +93,7 @@ impl Config {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
             || !(1..=600).contains(&self.timeout_seconds)
             || !(1..=10000).contains(&self.keep_snapshots)
+            || !(1..=64).contains(&self.max_read_connections)
             || (self.plaintext_loopback
                 && !self
                     .host
@@ -472,6 +480,7 @@ pub struct Reader {
     pool: std::sync::Arc<tokio::sync::OnceCell<PgPool>>,
     options: PgConnectOptions,
     timeout: Duration,
+    connections: u32,
 }
 #[derive(Serialize)]
 pub struct HistoryEntry {
@@ -491,13 +500,14 @@ impl Reader {
             pool: Default::default(),
             options: config.options()?,
             timeout,
+            connections: config.max_read_connections,
         })
     }
     async fn pool(&self) -> &PgPool {
         self.pool
             .get_or_init(|| async {
                 PgPoolOptions::new()
-                    .max_connections(4)
+                    .max_connections(self.connections)
                     .acquire_timeout(self.timeout)
                     .connect_lazy_with(self.options.clone())
             })
