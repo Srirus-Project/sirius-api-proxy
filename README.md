@@ -31,9 +31,10 @@ with `registry-serve`, using the same manifest contract as Master consumers.
 
 Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. Use one instance per region. JP retains its existing functionality; Global
-currently supports verified server discovery/version queries, region-aware asset transport and
-the Master data pipeline (download, registry, sync, Git and database publication), not
-completed SDK login or end-to-end Global asset validation. See [region support and upgrade
+supports verified server discovery/version queries, the Master data pipeline (download,
+registry, sync, Git and database publication) and schema-3 resource snapshots for the asset
+updater (`resource_snapshot`). A production end-to-end Global asset acceptance run is still
+pending. SDK login is not implemented. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start
