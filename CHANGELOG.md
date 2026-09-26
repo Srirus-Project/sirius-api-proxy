@@ -2,6 +2,19 @@
 
 ## 1.2.1 (unreleased)
 
+- Global (HK/EN/KR) resource snapshots, opt-in with `resource_snapshot`. `resource_version` is
+  the Global VersionResponse field 2 `resourceVersion`; `x-asset-version: unknown` is ignored.
+  `platform_hash` is the base catalog's `{default_cdn_root}/asset/{platform}/catalog_{version}.hash`,
+  fetched with one bounded GET (256 bytes, no redirects). The result, including failures, is
+  memoized per root and version for `catalog_hash_ttl_seconds`.
+  `resource_snapshot.cdn_authorization` is `none` (verified for the Global resource CDN) or
+  `basic`, validated like `master_update.cdn_authorization`. It is rejected for JP. A
+  server-announced different root is never followed.
+- Global snapshots use schema 3 with explicit `catalog_layout` (`global`), `catalog_url`,
+  `bundle_base_url` and `cdn_authorization`; anonymous snapshots have an empty
+  `credential_ref`. JP snapshots stay schema 2 without these fields.
+- Upgrade note: updaters before 1.2.1 reject schema-3 snapshots. Upgrade the updater before
+  enabling `resource_snapshot`. JP pairs are unaffected.
 - The Traditional Chinese region is renamed from `tw` to `hk`, the identifier the game uses (CDN
   `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list). `Region::Hk` serializes as `hk` in
   `/api/v1/regions`, `/api/v1/hk` and `/internal/v1/hk` routes (including `regional_paths`),

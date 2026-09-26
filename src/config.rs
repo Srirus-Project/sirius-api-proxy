@@ -57,6 +57,10 @@ pub struct Config {
     /// Optional immutable Master JSON snapshot store written by master-import.
     pub master_directory: Option<std::path::PathBuf>,
     pub master_update: Option<MasterUpdateConfig>,
+    /// Global (HK/EN/KR) resource snapshots built from the VERSION body `resourceVersion` and the
+    /// base catalog `.hash` on the configured CDN root. JP snapshots come from `x-asset-version`.
+    #[serde(default)]
+    pub resource_snapshot: Option<ResourceSnapshotConfig>,
     pub default_cdn_root: String,
     /// Exact HTTPS roots mapped to environment variable references, never secrets.
     pub cdn_credential_env: BTreeMap<String, String>,
@@ -136,6 +140,26 @@ pub struct MasterUpdateConfig {
     pub key_hex_env: String,
     pub iv_hex_env: String,
     pub interval_seconds: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceSnapshotConfig {
+    /// `none` (anonymous) or `basic`, validated like `master_update.cdn_authorization`.
+    #[serde(default)]
+    pub cdn_authorization: CdnAuthorization,
+    /// Required for `basic`; must be absent for `none`.
+    #[serde(default)]
+    pub username_env: Option<String>,
+    /// Reuse a fetched catalog `.hash` for the same root and resource version for this long.
+    #[serde(default = "default_catalog_hash_ttl")]
+    pub catalog_hash_ttl_seconds: u64,
+    /// Connect/request timeouts, attempts and optional proxy for the `.hash` request.
+    #[serde(default)]
+    pub network: crate::master_update::Network,
+}
+fn default_catalog_hash_ttl() -> u64 {
+    60
 }
 
 /// How the Master updater authenticates to the Master CDN.
@@ -316,6 +340,38 @@ impl Config {
                         ));
                     }
                 }
+            }
+        }
+        if let Some(snapshot) = &self.resource_snapshot {
+            if self.region.family() != "global" {
+                return Err(AppError::Config(
+                    "resource_snapshot is only for HK/EN/KR; JP resource snapshots come from x-asset-version",
+                ));
+            }
+            snapshot
+                .network
+                .validate()
+                .map_err(|_| AppError::Config("invalid resource snapshot network configuration"))?;
+            if !(10..=300).contains(&snapshot.catalog_hash_ttl_seconds) {
+                return Err(AppError::Config(
+                    "resource_snapshot.catalog_hash_ttl_seconds must be 10..300",
+                ));
+            }
+            let credential = self.cdn_credential_env.contains_key(&self.default_cdn_root);
+            let valid = match snapshot.cdn_authorization {
+                CdnAuthorization::Basic => {
+                    snapshot
+                        .username_env
+                        .as_ref()
+                        .is_some_and(|s| !s.is_empty())
+                        && credential
+                }
+                CdnAuthorization::None => snapshot.username_env.is_none() && !credential,
+            };
+            if !valid {
+                return Err(AppError::Config(
+                    "resource CDN authorization: basic needs username_env and a credential for the default CDN; none needs neither",
+                ));
             }
         }
         for value in std::iter::once(&self.endpoint)

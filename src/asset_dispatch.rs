@@ -83,6 +83,10 @@ impl Config {
                     credential_ref: String::new(),
                     observed_at: chrono::Utc::now(),
                     source: "remote",
+                    catalog_layout: None,
+                    catalog_url: None,
+                    bundle_base_url: None,
+                    cdn_authorization: None,
                 },
             )?
             .key()

@@ -1,6 +1,7 @@
 # Multi-region deployment. Global CDN roots are the first CDN line of each region's server-list
 # entry. Global Master CDNs need no credential; see docs/examples/master-publisher.yaml for
-# master_update/master_git in every region.
+# master_update/master_git in every region. Add `resource_snapshot: {cdn_authorization: none}`
+# to a Global region to serve schema-3 resource snapshots (docs/REGIONS.md#resource-snapshots).
 listen: 127.0.0.1:9999
 regions:
   jp:

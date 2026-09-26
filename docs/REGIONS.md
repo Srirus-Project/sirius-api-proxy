@@ -8,9 +8,9 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy, verified download/export pipeline and Master data |
-| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query and Master data |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
+| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
+| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 The Traditional Chinese (TW/HK/MO) region is `hk`, the identifier the game itself uses (CDN
@@ -76,8 +76,8 @@ list holds alternate lines). The shipped examples use the first line of each reg
 
 The Global Master CDNs were verified to serve Master data without authentication. No Global CDN
 credential is verified or shipped; do not reuse the JP credential. A Global profile may omit
-`cdn_credential_env` entries (`cdn_credential_env: {}`). Global resource snapshots then stay
-unavailable, as they already were.
+`cdn_credential_env` entries (`cdn_credential_env: {}`). Resource snapshots are configured
+separately; see [Resource snapshots](#resource-snapshots).
 
 ```yaml
 region: en
@@ -90,6 +90,69 @@ master_update:
 default_cdn_root: https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_3e8a72c5f1d9066b9a37c2e85f619db0
 cdn_credential_env: {}
 ```
+
+## Resource snapshots
+
+`GET /internal/v1/resources/snapshot` tells the asset updater which catalog to download.
+
+**JP** is unchanged: the snapshot comes from the `x-asset-version` header and the `x-sirius-*`
+CDN headers, uses schema version 2 and carries no layout fields.
+
+**HK/EN/KR** snapshots are opt-in with `resource_snapshot` and use schema version 3. Global
+responses carry `x-asset-version: unknown`, so the header is ignored there. The proxy builds the
+snapshot from:
+
+- `resource_version`: field 2 `resourceVersion` of the latest successful VERSION response
+  (for example `1.0.0.104`). An empty, unsafe or `unknown` value produces no snapshot.
+- `platform_hash`: the trimmed body of `{default_cdn_root}/asset/{platform}/catalog_{resource_version}.hash`,
+  the base (Japanese) catalog's version token. It must be exactly 32 hex digits, and it is
+  stored in lower case.
+- `effective_cdn_root`: exactly `default_cdn_root`. A server-announced different root is
+  never followed.
+
+Schema 3 adds four explicit fields. Consumers must recompute them from the layout and reject
+any difference:
+
+| Field | Global value |
+| --- | --- |
+| `catalog_layout` | `global` |
+| `catalog_url` | `{root}/asset/{platform}/catalog_{resource_version}.bin` |
+| `bundle_base_url` | `{root}/asset/{platform}` (no version directory; bundle names are content-addressed) |
+| `cdn_authorization` | `none` (with an empty `credential_ref`) or `basic` (with the credential's environment reference) |
+
+The `.hash` request is one bounded GET: at most 256 bytes, no redirects, and the timeouts,
+attempts and optional proxy of `resource_snapshot.network`. The same fields as
+[`master_update.network`](MASTER_NETWORK.md) apply. The result, including a failure, is reused
+for the same root and resource version for `catalog_hash_ttl_seconds` (default 60, 10–300).
+Builds are serialized, so repeated snapshot reads or dispatch polls never multiply CDN
+requests. No request is made until a snapshot is read or the [asset dispatch](ASSET_DISPATCH.md)
+worker refreshes one.
+
+`resource_snapshot.cdn_authorization` follows the rules of `master_update.cdn_authorization`:
+
+- `none`: no `username_env`, and no `cdn_credential_env` entry for `default_cdn_root`.
+- `basic`: needs `username_env` and a credential reference for `default_cdn_root`.
+
+The Global resource CDN was verified to serve `.hash`, catalogs and bundles without
+authorization. `resource_snapshot` is rejected for JP.
+
+```yaml
+region: hk
+resource_snapshot:
+  cdn_authorization: none
+  catalog_hash_ttl_seconds: 60   # optional
+  network: {request_timeout_ms: 10000, attempts: 2}   # optional
+default_cdn_root: https://l14-prod-hk-patch-sirius.gamerfusiontech.com/prod/hk_27f3c91e8b62d6056c7a19f2e83b6d10
+cdn_credential_env: {}
+```
+
+Localized catalogs (`catalog_{version}_{locale}.bin`) are chosen per updater profile. The
+snapshot always describes the base catalog. Dispatch identities already include the profile,
+so give each locale its own updater profile.
+
+Upgrade note: asset updaters older than 1.2.1 reject schema-3 snapshots, which carry unknown
+fields. Such updaters could not download Global assets anyway, so they fail closed. JP
+snapshots stay at schema 2, so JP consumers can be upgraded in either order.
 
 ### Region identity
 
@@ -152,12 +215,12 @@ Publication names contain region and platform; receipts and export summaries ret
 Cache keys additionally include region, environment and platform, even for shared CDN URLs.
 Old ciphertext caches are not deleted but use a different namespace and may be downloaded again.
 
-Global transport supports HTTPS CDN prefixes and Android paths, but end-to-end Global asset
-acquisition/decryption has not been verified. A successful version query does not imply a
-ready resource snapshot: `x-asset-version: unknown` or a missing Android hash produces no ready
-snapshot. The updater refuses to manufacture hashes or substitute an iOS/JP snapshot. Keep
-separate output, cache and export directories for each region. Real credentials and keys are
-never shipped; do not reuse JP credentials for Global.
+Global asset downloads use the schema-3 snapshots described in
+[Resource snapshots](#resource-snapshots). A Global updater never accepts a schema-2 (JP layout)
+snapshot, and JP never accepts a Global layout. See the updater's `docs/REGIONS.md` for
+`catalog_locale`, the `dummy.net` bundle placeholder and anonymous CDN roots. Keep separate
+output, cache and export directories for each region. Real credentials and keys are never
+shipped; do not reuse JP credentials for Global.
 
 ## Upgrade from v1.0.0
 

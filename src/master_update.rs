@@ -94,7 +94,7 @@ impl Network {
         }
         Ok(())
     }
-    fn client(&self) -> Result<reqwest::Client, UpdateError> {
+    pub(crate) fn client(&self) -> Result<reqwest::Client, UpdateError> {
         self.validate()?;
         let mut builder = reqwest::Client::builder()
             .no_proxy()
@@ -125,14 +125,14 @@ impl Network {
         }
         builder.build().map_err(|_| UpdateError::Config)
     }
-    fn retry(&self, error: &UpdateError, attempt: usize) -> bool {
+    pub(crate) fn retry(&self, error: &UpdateError, attempt: usize) -> bool {
         attempt + 1 < self.attempts
             && matches!(
                 error,
                 UpdateError::Download | UpdateError::Http(429 | 500..=599)
             )
     }
-    fn delay(&self, attempt: usize) -> Duration {
+    pub(crate) fn delay(&self, attempt: usize) -> Duration {
         Duration::from_millis((self.retry_delay_ms * (1 << attempt)).min(self.max_retry_delay_ms))
     }
 }

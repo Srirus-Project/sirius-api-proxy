@@ -1,6 +1,8 @@
 # JSON is valid YAML. default_cdn_root is the first CDN line of the Korea server-list entry.
 # Optional Master pipeline (docs/REGIONS.md#master-data): remove the leading "# " from the
 # commented lines to download Master data without CDN authorization and publish it to Git.
+# Optional resource snapshots for the asset updater (docs/REGIONS.md#resource-snapshots): the
+# resource_snapshot line serves schema-3 snapshots from the anonymous catalog .hash.
 {
   "region": "kr",
   "platform": "Android",
@@ -17,5 +19,6 @@
   # "master_update": {"cdn_authorization": "none", "key_hex_env": "SIRIUS_MASTER_KEY_HEX", "iv_hex_env": "SIRIUS_MASTER_IV_HEX", "interval_seconds": 300},
   # "master_git": {"state_directory": "data/kr/master-git", "layout": "indented_root", "branch": "main",
   #   "remote": {"url": "https://github.com/Srirus-Project/sirius-kr-master.git", "authorization_env": "SIRIUS_MASTER_GIT_KR_AUTHORIZATION"}},
+  # "resource_snapshot": {"cdn_authorization": "none", "catalog_hash_ttl_seconds": 60},
   "cdn_credential_env": {}
 }

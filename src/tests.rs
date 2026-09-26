@@ -58,6 +58,7 @@ fn config() -> Config {
         player_credential_env: None,
         master_directory: None,
         master_update: None,
+        resource_snapshot: None,
         default_cdn_root: "https://static.bang-dream-on.jp".into(),
         cdn_credential_env: BTreeMap::from([("https://static.bang-dream-on.jp".into(), key)]),
     }
@@ -4704,6 +4705,10 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
         credential_ref: String::new(),
         observed_at: chrono::Utc::now(),
         source: "remote",
+        catalog_layout: None,
+        catalog_url: None,
+        bundle_base_url: None,
+        cdn_authorization: None,
     };
     restarted.observe(&newer).unwrap();
     restarted.reconcile().await.unwrap();
@@ -11913,6 +11918,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
             DeploymentConfig::Single(c) => {
                 assert_eq!(c.region.name(), region);
                 assert!(c.master_update.is_none() && c.cdn_credential_env.is_empty());
+                assert!(c.resource_snapshot.is_none());
                 assert!(!c.default_cdn_root.contains("example.invalid"));
             }
             DeploymentConfig::Multi(_) => panic!("{region} example must be single-region"),
@@ -11943,6 +11949,10 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         let update = c.master_update.as_ref().unwrap();
         assert_eq!(
             update.cdn_authorization,
+            crate::config::CdnAuthorization::None
+        );
+        assert_eq!(
+            c.resource_snapshot.as_ref().unwrap().cdn_authorization,
             crate::config::CdnAuthorization::None
         );
         assert_eq!(
@@ -14008,4 +14018,238 @@ async fn hk_routes_serve_hk_and_alias_paths_are_not_found() {
             .0,
         404
     );
+}
+
+/// Anonymous Global resource snapshots against a local mock CDN root.
+fn global_snapshot_config(region: crate::region::Region, cdn_root: &str) -> Config {
+    let mut cfg = regional_config(region);
+    cfg.default_cdn_root = cdn_root.into();
+    cfg.cdn_credential_env = BTreeMap::new();
+    cfg.resource_snapshot = Some(crate::config::ResourceSnapshotConfig {
+        cdn_authorization: crate::config::CdnAuthorization::None,
+        username_env: None,
+        catalog_hash_ttl_seconds: 60,
+        network: Default::default(),
+    });
+    cfg
+}
+const SYNTHETIC_CATALOG_HASH: &str = "0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn global_resource_snapshot_uses_version_body_and_anonymous_catalog_hash() {
+    use crate::region::Region;
+    for region in [Region::Hk, Region::En, Region::Kr] {
+        let n = region.name();
+        // The client trims the body; case is normalized.
+        let cdn = cdn_fixture(vec![
+            cdn_reply(format!(" {}\r\n", SYNTHETIC_CATALOG_HASH.to_uppercase()).into_bytes()),
+            cdn_reply(b"fedcba9876543210fedcba9876543210".to_vec()),
+        ])
+        .await;
+        let reply = |rv: &str| {
+            global_version_reply("master-fixture", rv).header("x-asset-version", "unknown")
+        };
+        let game = fixture(vec![
+            reply("1.0.0.104"),
+            reply("1.0.0.104"),
+            reply("1.0.0.105"),
+        ])
+        .await;
+        let c = client(&game, global_snapshot_config(region, &cdn.url));
+        let snapshot = c.refresh_resource_snapshot().await.unwrap();
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["schema_version"], 3, "{n}");
+        assert_eq!(value["region"], n);
+        assert_eq!(value["platform"], "Android");
+        assert_eq!(value["protocol_version"], "1.0.1");
+        assert_eq!(value["master_version"], "master-fixture");
+        assert_eq!(value["resource_version"], "1.0.0.104");
+        assert_eq!(value["platform_hash"], SYNTHETIC_CATALOG_HASH);
+        assert_eq!(value["effective_cdn_root"], cdn.url);
+        assert_eq!(value["credential_ref"], "");
+        assert_eq!(value["cdn_authorization"], "none");
+        assert_eq!(value["catalog_layout"], "global");
+        assert_eq!(
+            value["catalog_url"],
+            format!("{}/asset/Android/catalog_1.0.0.104.bin", cdn.url)
+        );
+        assert_eq!(
+            value["bundle_base_url"],
+            format!("{}/asset/Android", cdn.url)
+        );
+        // The internal snapshot route reuses the build; the hash is memoized per version.
+        let served = c.snapshot().await.unwrap();
+        assert_eq!(served["stale"], false);
+        assert_eq!(served["snapshot"], value);
+        let again = c.refresh_resource_snapshot().await.unwrap();
+        assert_eq!(again.platform_hash, SYNTHETIC_CATALOG_HASH);
+        assert!(again.observed_at >= snapshot.observed_at);
+        assert_eq!(cdn.received.lock().unwrap().len(), 1);
+        // A new resource version fetches its own catalog hash.
+        let newer = c.refresh_resource_snapshot().await.unwrap();
+        assert_eq!(newer.resource_version, "1.0.0.105");
+        assert_eq!(newer.platform_hash, "fedcba9876543210fedcba9876543210");
+        let seen = cdn.received.lock().unwrap();
+        assert_eq!(
+            seen.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            [
+                "/asset/Android/catalog_1.0.0.104.hash",
+                "/asset/Android/catalog_1.0.0.105.hash"
+            ]
+        );
+        assert!(seen
+            .iter()
+            .all(|(_, headers, _)| !headers.contains_key("authorization")));
+    }
+}
+
+#[tokio::test]
+async fn global_resource_snapshot_rejects_unknown_versions_bad_hashes_and_other_roots() {
+    use crate::region::Region;
+    // `unknown`, a missing body field and unsafe values never reach the CDN.
+    for resource in ["unknown", "", "../1"] {
+        let cdn = cdn_fixture(vec![]).await;
+        let game = fixture(vec![global_version_reply("master-fixture", resource)]).await;
+        let c = client(&game, global_snapshot_config(Region::En, &cdn.url));
+        assert!(matches!(
+            c.refresh_resource_snapshot().await,
+            Err(AppError::SnapshotUnavailable)
+        ));
+        assert!(c.snapshot().await.is_err());
+        assert!(cdn.received.lock().unwrap().is_empty(), "{resource}");
+    }
+    // Invalid, oversized or missing `.hash` bodies produce no snapshot.
+    let mut not_found = cdn_reply(Vec::new());
+    not_found.http_status = 404;
+    let mut redirect = cdn_reply(Vec::new());
+    redirect.http_status = 302;
+    redirect = redirect.header("location", "https://elsewhere.example/catalog.hash");
+    for reply in [
+        cdn_reply(b"not-a-hash".to_vec()),
+        cdn_reply(format!("{SYNTHETIC_CATALOG_HASH}0").into_bytes()),
+        cdn_reply(vec![b'a'; 300]),
+        not_found,
+        redirect,
+    ] {
+        let cdn = cdn_fixture(vec![reply]).await;
+        let game = fixture(vec![global_version_reply("master-fixture", "1.0.0.104")]).await;
+        let c = client(&game, global_snapshot_config(Region::Kr, &cdn.url));
+        assert!(matches!(
+            c.refresh_resource_snapshot().await,
+            Err(AppError::SnapshotUnavailable)
+        ));
+        assert!(c.snapshot().await.is_err());
+        assert_eq!(cdn.received.lock().unwrap().len(), 1);
+    }
+    // A server-announced root is never followed.
+    let cdn = cdn_fixture(vec![]).await;
+    let game = fixture(vec![global_version_reply("master-fixture", "1.0.0.104")
+        .header("x-sirius-env", "https://other.example/prod/hk_other")])
+    .await;
+    let c = client(&game, global_snapshot_config(Region::Hk, &cdn.url));
+    assert!(c.refresh_resource_snapshot().await.is_err());
+    assert!(cdn.received.lock().unwrap().is_empty());
+    // Without `resource_snapshot`, Global keeps reporting no snapshot and never calls the CDN.
+    let game = fixture(vec![global_version_reply("master-fixture", "1.0.0.104")]).await;
+    let mut cfg = global_snapshot_config(Region::Hk, "https://cdn.example");
+    cfg.resource_snapshot = None;
+    let c = client(&game, cfg);
+    assert!(c.refresh_resource_snapshot().await.is_err());
+    assert!(c.snapshot().await.is_err());
+}
+
+#[tokio::test]
+async fn global_basic_resource_snapshot_uses_only_the_configured_credential() {
+    let cdn = cdn_fixture(vec![cdn_reply(SYNTHETIC_CATALOG_HASH.as_bytes().to_vec())]).await;
+    let game = fixture(vec![global_version_reply("master-fixture", "1.0.0.104")]).await;
+    let mut cfg = global_snapshot_config(crate::region::Region::Hk, &cdn.url);
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let (user, pass) = (
+        format!("SIRIUS_RS_USER_{id}"),
+        format!("SIRIUS_RS_PASS_{id}"),
+    );
+    std::env::set_var(&user, "fixture-user");
+    std::env::set_var(&pass, "fixture-global-secret");
+    cfg.cdn_credential_env = BTreeMap::from([(cdn.url.clone(), pass.clone())]);
+    let snapshot_config = cfg.resource_snapshot.as_mut().unwrap();
+    snapshot_config.cdn_authorization = crate::config::CdnAuthorization::Basic;
+    snapshot_config.username_env = Some(user);
+    let c = client(&game, cfg);
+    let snapshot = c.refresh_resource_snapshot().await.unwrap();
+    assert_eq!(snapshot.cdn_authorization, Some("basic"));
+    assert_eq!(snapshot.credential_ref, pass);
+    let text = serde_json::to_string(&snapshot).unwrap();
+    assert!(!text.contains("fixture-global-secret") && !text.contains("fixture-user"));
+    let seen = cdn.received.lock().unwrap();
+    assert_eq!(
+        seen[0].1["authorization"],
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "fixture-user:fixture-global-secret"
+            )
+        )
+    );
+}
+
+#[test]
+fn resource_snapshot_authorization_is_explicit_and_jp_keeps_schema_2() {
+    use crate::{config::CdnAuthorization, region::Region};
+    let root = "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/en_fixture";
+    let valid = global_snapshot_config(Region::En, root);
+    assert!(valid.validate().is_ok());
+    // none + a credential reference for the root is ambiguous.
+    let mut cfg = valid.clone();
+    cfg.cdn_credential_env = BTreeMap::from([(root.into(), "SIRIUS_X".into())]);
+    assert!(cfg.validate().is_err());
+    // basic needs username_env and a credential reference.
+    cfg.resource_snapshot.as_mut().unwrap().cdn_authorization = CdnAuthorization::Basic;
+    assert!(cfg.validate().is_err());
+    cfg.resource_snapshot.as_mut().unwrap().username_env = Some("SIRIUS_U".into());
+    assert!(cfg.validate().is_ok());
+    cfg.cdn_credential_env.clear();
+    assert!(cfg.validate().is_err());
+    // none rejects username_env; TTL is bounded.
+    let mut cfg = valid.clone();
+    cfg.resource_snapshot.as_mut().unwrap().username_env = Some("SIRIUS_U".into());
+    assert!(cfg.validate().is_err());
+    for ttl in [0, 9, 301] {
+        let mut cfg = valid.clone();
+        cfg.resource_snapshot
+            .as_mut()
+            .unwrap()
+            .catalog_hash_ttl_seconds = ttl;
+        assert!(cfg.validate().is_err(), "{ttl}");
+    }
+    // JP keeps its x-asset-version snapshots; the Global section is refused there.
+    let mut jp = config();
+    jp.resource_snapshot = valid.resource_snapshot.clone();
+    assert!(jp.validate().is_err());
+    let parsed: crate::config::ResourceSnapshotConfig =
+        yaml_serde::from_str("cdn_authorization: none\n").unwrap();
+    assert_eq!(parsed.cdn_authorization, CdnAuthorization::None);
+    assert_eq!(parsed.catalog_hash_ttl_seconds, 60);
+    assert!(yaml_serde::from_str::<crate::config::ResourceSnapshotConfig>("layout: x\n").is_err());
+}
+
+#[tokio::test]
+async fn jp_snapshot_stays_schema_2_without_layout_fields() {
+    let f = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let c = client(&f, config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let v = c.snapshot().await.unwrap();
+    let snapshot = v["snapshot"].as_object().unwrap();
+    assert_eq!(snapshot["schema_version"], 2);
+    for field in [
+        "catalog_layout",
+        "catalog_url",
+        "bundle_base_url",
+        "cdn_authorization",
+    ] {
+        assert!(!snapshot.contains_key(field), "{field}");
+    }
 }

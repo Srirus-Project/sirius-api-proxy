@@ -55,6 +55,12 @@ struct State {
     snapshot_stale: bool,
     cdn_root: String,
     credential_valid: bool,
+    /// Global only: body `resourceVersion` of the last successful VERSION response and when it
+    /// was observed. `unknown` or unsafe values are never recorded.
+    global_version: Option<(String, DateTime<Utc>)>,
+    /// Global only: last catalog `.hash` attempt as (root, resource version, hash or failure,
+    /// attempted at). Failures are remembered too, so polling cannot multiply CDN requests.
+    catalog_hash: Option<(String, String, Option<String>, tokio::time::Instant)>,
 }
 
 pub struct GameClient {
@@ -79,6 +85,10 @@ pub struct GameClient {
     timeout: Duration,
     inflight: tokio::sync::Semaphore,
     response_cache: crate::response_cache::Cache,
+    /// Global resource snapshot CDN client (`resource_snapshot`); no redirects.
+    snapshot_http: Option<reqwest::Client>,
+    /// Serializes Global snapshot builds so at most one `.hash` request is in flight.
+    snapshot_build: Mutex<()>,
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
@@ -130,7 +140,15 @@ impl GameClient {
             snapshot_stale: true,
             cdn_root: config.default_cdn_root.clone(),
             credential_valid: cdn_secrets.contains_key(&config.default_cdn_root),
+            global_version: None,
+            catalog_hash: None,
         };
+        let snapshot_http = config
+            .resource_snapshot
+            .as_ref()
+            .map(|c| c.network.client())
+            .transpose()
+            .map_err(|_| AppError::Config("invalid resource snapshot network configuration"))?;
         let timeout = Duration::from_millis(config.upstream.timeout_ms);
         let inflight = tokio::sync::Semaphore::new(config.upstream.max_inflight);
         let response_cache = crate::response_cache::Cache::new(config.response_cache.clone())?;
@@ -173,6 +191,8 @@ impl GameClient {
             response_cache,
             protocol: RwLock::new(Arc::new(protocol)),
             reload_lock: Mutex::new(()),
+            snapshot_http,
+            snapshot_build: Mutex::new(()),
         }))
     }
     pub(crate) fn client_auth(&self) -> Option<&crate::client_auth::Authenticator> {
@@ -229,6 +249,7 @@ impl GameClient {
             .map_err(|_| AppError::ProtocolDefinition)? = Arc::new(candidate);
         state.observation = Observation::default();
         state.master_pair = None;
+        state.global_version = None;
         state.snapshot_stale = true;
         Ok(status)
     }
@@ -360,6 +381,9 @@ impl GameClient {
     pub async fn refresh_resource_snapshot(self: &Arc<Self>) -> Result<ResourceSnapshot, AppError> {
         let started = Utc::now();
         self.call(VERSION, json!({})).await?;
+        if self.config.region.family() == "global" {
+            self.ensure_global_snapshot().await?;
+        }
         let state = self.state.lock().await;
         if state.snapshot_stale
             || state.observation.maintenance
@@ -379,6 +403,10 @@ impl GameClient {
         Ok(snapshot)
     }
     pub async fn snapshot(&self) -> Result<Value, AppError> {
+        if self.config.region.family() == "global" && self.config.resource_snapshot.is_some() {
+            // Failures leave the previous snapshot (reported stale) or none; they are logged.
+            let _ = self.ensure_global_snapshot().await;
+        }
         let s = self.state.lock().await;
         let snapshot = s.snapshot.as_ref().ok_or(AppError::SnapshotUnavailable)?;
         let stale = s.snapshot_stale || (Utc::now() - snapshot.observed_at).num_seconds() > 300;
@@ -911,6 +939,14 @@ impl GameClient {
             });
             let mut state = self.state.lock().await;
             state.observation.master_version = Some(version.to_string());
+            if self.config.region.family() == "global" {
+                // Global responses carry `x-asset-version: unknown`; only the body counts.
+                state.global_version = body_resource
+                    .clone()
+                    .filter(|v| resource_version_component(v))
+                    .map(|v| (v, Utc::now()));
+                state.snapshot_stale = true;
+            }
             state.observation.resource_version = body_resource;
             state.master_pair = Some((version.to_string(), asset));
         }
@@ -954,7 +990,144 @@ impl GameClient {
             }
         }
     }
+    /// Builds the Global (schema 3) snapshot for the latest VERSION observation. The catalog
+    /// `.hash` is fetched from exactly the configured root, outside the state lock, at most once
+    /// per root/version per `catalog_hash_ttl_seconds`; concurrent builds share one request.
+    async fn ensure_global_snapshot(&self) -> Result<(), AppError> {
+        use crate::config::CdnAuthorization;
+        let (Some(config), Some(http)) = (&self.config.resource_snapshot, &self.snapshot_http)
+        else {
+            return Err(AppError::SnapshotUnavailable);
+        };
+        let _build = self.snapshot_build.lock().await;
+        let platform = self.config.platform().name();
+        let ttl = Duration::from_secs(config.catalog_hash_ttl_seconds);
+        let (version, root, cached, basic) = {
+            let s = self.state.lock().await;
+            if s.observation.maintenance || s.observation.grpc_status != Some(0) {
+                return Err(AppError::SnapshotUnavailable);
+            }
+            let (version, observed_at) = s
+                .global_version
+                .clone()
+                .ok_or(AppError::SnapshotUnavailable)?;
+            // Never follow a server-announced root; only the configured root is fetched.
+            if s.cdn_root != self.config.default_cdn_root
+                || !(0..=300).contains(&(Utc::now() - observed_at).num_seconds())
+            {
+                return Err(AppError::SnapshotUnavailable);
+            }
+            if !s.snapshot_stale
+                && s.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.observed_at == observed_at && snapshot.resource_version == version
+                })
+            {
+                return Ok(());
+            }
+            let basic = match config.cdn_authorization {
+                CdnAuthorization::None => {
+                    if self.config.cdn_credential_env.contains_key(&s.cdn_root) {
+                        return Err(AppError::SnapshotUnavailable);
+                    }
+                    None
+                }
+                CdnAuthorization::Basic => {
+                    let name = config
+                        .username_env
+                        .as_ref()
+                        .ok_or(AppError::SnapshotUnavailable)?;
+                    let username = secret(name).map_err(|_| AppError::SnapshotUnavailable)?;
+                    let password = self
+                        .cdn_secrets
+                        .get(&s.cdn_root)
+                        .filter(|_| s.credential_valid && !username.contains(':'))
+                        .ok_or(AppError::SnapshotUnavailable)?;
+                    Some((username, password.clone()))
+                }
+            };
+            let cached = s
+                .catalog_hash
+                .as_ref()
+                .filter(|(r, v, _, at)| r == &s.cdn_root && v == &version && at.elapsed() < ttl)
+                .map(|(_, _, hash, _)| hash.clone());
+            (version, s.cdn_root.clone(), cached, basic)
+        };
+        let (catalog_url, hash_url, bundle_base_url) =
+            resources::global_catalog_urls(&root, platform, &version);
+        let hash = match cached {
+            Some(hash) => hash.ok_or(AppError::SnapshotUnavailable)?,
+            None => {
+                let hash = resources::fetch_catalog_hash(
+                    http,
+                    &config.network,
+                    &hash_url,
+                    basic.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                )
+                .await
+                .ok();
+                self.state.lock().await.catalog_hash = Some((
+                    root.clone(),
+                    version.clone(),
+                    hash.clone(),
+                    tokio::time::Instant::now(),
+                ));
+                hash.ok_or(AppError::SnapshotUnavailable)?
+            }
+        };
+        let protocol_version = self.protocol_status()?.version;
+        let mut s = self.state.lock().await;
+        // The observation may have moved on while the hash was fetched: publish only if the
+        // latest successful VERSION still reports this resource version on this root.
+        let observed_at = match &s.global_version {
+            Some((current, at)) if current == &version => *at,
+            _ => return Err(AppError::SnapshotUnavailable),
+        };
+        if s.cdn_root != root
+            || s.observation.maintenance
+            || s.observation.grpc_status != Some(0)
+            || (basic.is_some() && !s.credential_valid)
+        {
+            return Err(AppError::SnapshotUnavailable);
+        }
+        let (credential_ref, authorization) = match config.cdn_authorization {
+            CdnAuthorization::None => (String::new(), "none"),
+            CdnAuthorization::Basic => (
+                self.config
+                    .cdn_credential_env
+                    .get(&root)
+                    .ok_or(AppError::SnapshotUnavailable)?
+                    .clone(),
+                "basic",
+            ),
+        };
+        s.snapshot = Some(ResourceSnapshot {
+            schema_version: 3,
+            region: self.config.region,
+            environment: self.config.environment.clone(),
+            platform,
+            client_version: self.config.client_version.clone(),
+            protocol_version,
+            master_version: s.observation.master_version.clone(),
+            resource_version: version,
+            platform_hash: hash,
+            effective_cdn_root: root,
+            credential_ref,
+            observed_at,
+            source: "remote",
+            catalog_layout: Some("global"),
+            catalog_url: Some(catalog_url),
+            bundle_base_url: Some(bundle_base_url),
+            cdn_authorization: Some(authorization),
+        });
+        s.snapshot_stale = false;
+        Ok(())
+    }
     async fn promote_snapshot(&self, md: &HeaderMap, protocol_version: &str) {
+        // Global snapshots come from the VERSION body and the catalog `.hash`, never from the
+        // `x-asset-version` header (always `unknown` on Global).
+        if self.config.region.family() == "global" {
+            return;
+        }
         let Some(raw) = header(md, "x-asset-version") else {
             return;
         };
@@ -985,7 +1158,20 @@ impl GameClient {
             credential_ref: reference.clone(),
             observed_at: Utc::now(),
             source: "remote",
+            catalog_layout: None,
+            catalog_url: None,
+            bundle_base_url: None,
+            cdn_authorization: None,
         });
         s.snapshot_stale = false;
     }
+}
+/// A Global resource version usable as a CDN path component; `unknown` means "not reported".
+fn resource_version_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !matches!(value, "." | ".." | "unknown")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }

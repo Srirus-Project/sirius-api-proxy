@@ -248,3 +248,12 @@ ledger entries above keep the wording of their time. `tw` survives only as a dep
 configuration/CLI alias with a startup warning; snapshot receipts and Git state recorded as `tw`
 are read as `hk`, and nothing writes or serves `tw`. See
 [the `hk` identifier](REGIONS.md#the-hk-identifier).
+
+Post-1.2.0 (1.2.1, unreleased): Global resource snapshots (schema 3) from the VERSION body
+`resourceVersion` plus the base catalog `.hash`. The Global asset CDN layout
+(`{CdnRoot}/asset/Android/catalog_{rv}[_{locale}].bin|.hash`, bundles in `{CdnRoot}/asset/Android`)
+and its unauthenticated access were verified live on 2026-09-26 with the user's approval; tests
+use only local mocks. The tests cover snapshot creation for each Global region, the anonymous
+`.hash` request, per-version memoization, `unknown`/unsafe versions, malformed, oversized,
+missing and redirected `.hash` responses, refusal of server-announced roots, Basic credential
+scope, configuration validation, and JP schema-2 stability. JP snapshots are unchanged.
