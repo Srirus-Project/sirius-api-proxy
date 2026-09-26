@@ -49,5 +49,8 @@ Library embedders own their tracing subscriber; parsing a library configuration 
 not install a process-global logger. The shipped command-line entry points initialize it.
 
 For API deployments, place logging beside listen/tls/access_log at the deployment root.
-A multi-region deployment rejects logging inside individual regions. `master-update` uses
-the single-region configuration; `master-import` and `--version` use default logging.
+A multi-region deployment rejects logging inside individual regions. `master-update` and
+`master-sync` use the single-region configuration and `registry-serve` uses its own file.
+Every other one-shot command (`master-import`, `master-git-commit`, `master-git-push`,
+`master-db-import`, `master-db-migrate`, `asset-dispatch-*`, `global-account`) and `--version`
+use default logging, even when it reads `SIRIUS_CONFIG_PATH`.

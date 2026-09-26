@@ -53,8 +53,9 @@ Operations and parameters mirror the existing public API validation:
 | `music_ranking` | Positive integer `music_id` |
 | `challenge_ranking` | Positive integer `challenge_music_id` |
 
-JP supports the verified JP public query operations; Global currently supports only version
-and server discovery. There is no arbitrary URL, RPC name, account name, credential, login or
+JP supports the JP public query operations. HK/EN/KR support version, server discovery and
+the same query operations as JP (their [Global operations](REGIONS.md#global-operations)
+status applies); authenticated ones use the executing node's Global SDK guest accounts. There is no arbitrary URL, RPC name, account name, credential, login or
 mutation field. Unknown fields/operations fail validation. Request bodies are limited to 16 KiB.
 Each accepted query executes on this node's local GameClient, under its normal admission,
 timeout, account serialization and response-cache policies. It never invokes another node.

@@ -32,8 +32,9 @@ contract; no fabricated account or protocol is required. An empty target set wit
 is an error. Restart after changing routing configuration or token environment values.
 
 Every peer request carries the selected region, environment, platform, client version and exact
-semantic protocol fingerprint. Global operations remain limited to verified version/server
-queries; shared HK/EN/KR schemas do not merge their identities. CN is reserved. Outgoing peer
+semantic protocol fingerprint. Global nodes route the same operations as JP plus server
+discovery (see [Global operations](REGIONS.md#global-operations)); shared HK/EN/KR schemas do
+not merge their identities. CN is reserved. Outgoing peer
 credentials cannot reuse public/admin/game/CDN/updater credentials or credentials for another
 region. A region's dedicated peer credential may be shared among its cooperating nodes.
 

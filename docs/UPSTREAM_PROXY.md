@@ -51,9 +51,12 @@ and malformed/refused CONNECT responses produce a sanitized proxy error (502),
 are not retried, and do not penalize individual account health. Proxy response bodies
 and credentials are never echoed in errors.
 
-This setting applies to game gRPC only. Master CDN download transport, other HTTP
-clients, inbound TLS and trusted forwarding have separate configuration/restoration
-work; this setting does not silently reroute them. Local tests exercise HTTP/2 RPCs
+This setting applies to game gRPC and, for HK/EN/KR accounts, to the Global SDK login
+requests of the same profile ([Global accounts](ACCOUNTS.md#global-accounts)). The Master CDN
+(`master_update.network`), the Global catalog `.hash` (`resource_snapshot.network`), Git,
+peer and other HTTP clients, inbound TLS and trusted forwarding have separate configuration;
+this setting does not silently reroute them. The one-shot `global-account bootstrap` command
+reads no configuration and connects directly. Local tests exercise HTTP/2 RPCs
 and trailers over CONNECT, header separation, connection reuse, direct/proxy client
 isolation, refusal/no-fallback, deadlines, remote DNS/IPv6 and exact tunnel bytes.
 Self-signed fixtures verify rejection at both proxy and origin TLS layers.
