@@ -8665,7 +8665,10 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
     let worker = crate::master_git_worker::Worker::new(&cfg, game.clone()).unwrap();
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(worker.run(receiver));
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+    // Reaching the stalled remote spawns several Git processes (init, refs, git-remote-http);
+    // Windows process startup under the parallel release suite can exceed 5 s. Only the
+    // shutdown bound below is the property under test.
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
         .await
         .unwrap();
     stop.send(true).unwrap();
