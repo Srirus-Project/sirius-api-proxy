@@ -247,6 +247,16 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), MasterError> {
     file.sync_all()?;
     Ok(())
 }
+/// Flush an existing, already-written file to stable storage. Unix can fsync a read-only
+/// descriptor. Windows FlushFileBuffers requires a handle with write access and fails with
+/// ERROR_ACCESS_DENIED on a read-only one, so open it writable there (never created or truncated).
+pub(crate) fn sync_existing_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = fs::File::open(path)?;
+    file.sync_all()
+}
 // Unix supports fsync on directory handles. Windows File::open cannot open a
 // directory as a normal file. Every data file and CURRENT is still synced
 // through its writable handle before atomic publication on all platforms.
@@ -377,7 +387,7 @@ pub(crate) fn prepare_registry(
             return Err(MasterError::Integrity);
         }
         serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
-        fs::File::open(path)?.sync_all()?;
+        sync_existing_file(&path)?;
         total += entry.size;
     }
     let index = crate::master_registry::Inventory {

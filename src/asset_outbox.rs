@@ -223,9 +223,7 @@ impl Outbox {
                 .map_err(|_| Error::Storage)?;
         }
         // Also synchronize an existing archive on retry after interrupted persistence.
-        File::open(directory.join(format!("{key}.json")))
-            .map_err(|_| Error::Storage)?
-            .sync_all()
+        crate::master::sync_existing_file(&directory.join(format!("{key}.json")))
             .map_err(|_| Error::Storage)?;
         #[cfg(unix)]
         {
