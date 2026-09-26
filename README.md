@@ -164,3 +164,6 @@ For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
 Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
 
 See [application logging](docs/APPLICATION_LOG.md) for process logs, separate from HTTP access logs.
+
+Every configuration field of the original Haruki-Sekai-API is mapped, adapted or excluded with
+evidence in the [configuration audit](docs/CONFIG_AUDIT.md).

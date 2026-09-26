@@ -28,7 +28,7 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 
 ## Release gates (all pending)
 
-- Audit each feature against original code/config; no placeholders or silent ignored config fields; record any game-specific non-applicability with evidence.
+- Audit each feature against original code/config; no placeholders or silent ignored config fields; record any game-specific non-applicability with evidence. API configuration: [CONFIG_AUDIT.md](CONFIG_AUDIT.md).
 - Both repositories fmt/check/Clippy/tests and release packaging smoke pass.
 - yhm01 official candidate full JP download/decrypt/export through restored service; retain and independently hash every exported file.
 - yhm01 verify incremental second run, job API/auth/cancel, resource limits, restart and configured storage path; existing Haruki services unchanged.
@@ -192,3 +192,12 @@ keys the in-process cache by credential digest instead of storing raw credential
 applies to internal routes. Tests cover RFC 4231 HMAC vectors, forged/none/HS512/expired tokens,
 routing without a reachable database (static bearer unaffected, 503 for valid tokens, nothing
 cached), secret independence and, on PostgreSQL, credentials, grants, revocation and cache disabling.
+
+Recorded the API configuration audit (CONFIG_AUDIT.md). Every original configuration field and
+environment variable is mapped to Sirius, marked ignored by the original, or excluded as
+Sekai-specific with original and Sirius file references. Unrestored generic behavior is recorded
+as explicit decisions: no prune ratio guard (imports are all-or-nothing from a verified manifest
+and never delete tables from a published snapshot), fixed intervals instead of cron, explicit account
+reload, no free-form upstream headers, per-transport proxies, reserved Global CDN placeholders and
+the argv/env-driven Git CLI. Sirius config structs reject unknown fields, so no field is silently
+ignored. The API configuration audit is complete; the updater audit and other gates remain open.
