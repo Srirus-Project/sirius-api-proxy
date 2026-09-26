@@ -145,7 +145,9 @@ and emits an error while the HTTP proxy remains available. Monitor these errors 
 state ledger. The online endpoint returns 503 once the worker has stopped; it does not restart
 a worker or erase its failure state.
 
-Full production acceptance, completion notifications and the 1.2.0 release remain pending.
+Released in 1.2.0 with local integration tests. The yhm01 production acceptance runs submit jobs
+directly to the asset updater, so this automatic dispatch path has not itself been exercised in a
+production deployment.
 
 Targets may set `user_agent` to 1–256 printable ASCII characters (not whitespace-only).
 It is sent on both job submissions and polling, including after restart, and supports the

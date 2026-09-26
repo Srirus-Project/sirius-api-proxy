@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.1 (unreleased)
+## 1.2.1
 
 - Global (HK/EN/KR) player accounts. An account references a private SDK guest identity file
   (`global_identity_file`, schema 1, mode 0600) and a `global_login` policy. The first

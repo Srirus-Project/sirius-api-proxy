@@ -60,8 +60,8 @@ not pretend that file installation chronology and database publication chronolog
 The service can serve files or database state written externally or by the optional publication worker
 below, and can notify consumers after the served state changes (see
 [outbound consumer notifications](#outbound-consumer-notifications)). No Sekai-specific music metadata
-or app-identity overrides are introduced. Final candidate and packaged cross-platform acceptance are
-still required for 1.2.0.
+or app-identity overrides are introduced. The standalone registry is covered by local tests and
+packaged-CLI smoke tests; it is not part of the yhm01 production acceptance runs.
 
 
 ## Verified snapshot bundles

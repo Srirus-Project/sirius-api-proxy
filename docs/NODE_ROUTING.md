@@ -75,6 +75,6 @@ there is no new shared cross-node cache. Ranking account-relative fields remain 
 public boundary. Schema reload changes the identity used for subsequent peer requests; an old
 identity queued at the executor is rejected before dispatch.
 
-This restores service routing locally; yhm01 multi-node/failure acceptance and the complete 1.2.0
-production/release gates remain required. Library callers using `GameClient::call` deliberately
+Service routing is covered by local integration tests; multi-node failover has not been exercised
+in a production deployment. Library callers using `GameClient::call` deliberately
 retain local execution; public route handlers use `public_call`/`public_query`.

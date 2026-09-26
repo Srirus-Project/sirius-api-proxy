@@ -188,9 +188,8 @@ Existing snapshot directories are not pruned.
 ## Remaining restoration
 
 Producer reads and consumer synchronization operate over atomic local snapshots.
-Central registry persistence, general completion notifications and the remaining Git
-platform capabilities remain restoration work. Local manifest/file tests do not replace yhm01
-full candidate acceptance, source/artifact audits or the 1.2.0 release gates.
+PostgreSQL persistence, consumer notifications and Git publication are documented below. Git
+publication with the `indented_root` layout runs in production for JP/HK/EN/KR.
 
 ## Consumer update notifications
 
