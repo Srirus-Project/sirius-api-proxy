@@ -213,3 +213,11 @@ rejected; every other SQLx-read variable is replaced by explicit configuration, 
 against the real process environment. The refused-connection transport test gives Windows' SYN retry
 (about two seconds before WSAECONNREFUSED) room within its deadline and still requires `Connect`.
 Master sync, registry, notification and dispatch archive failures were consequences of these.
+
+Release 1.2.0 acceptance (tag v1.2.0 = 2d7899c, paired with updater v1.2.0 = cb6c54a): release
+workflows built, tested (including the full Windows suite), packaged and smoke-tested linux-x64,
+macos-arm64 and windows-x64 archives; CI passed Linux and Windows jobs. On the production-like JP
+host the exact Linux binary passed authorization and scope checks, native protocol loading and a
+live game system query, and served as the game API for the paired updater's full and
+incremental end-to-end runs. Published archives were re-downloaded, checksum-verified and
+startup-tested. Global remains limited to verified discovery/version capabilities; CN is reserved.
