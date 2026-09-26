@@ -11890,13 +11890,21 @@ async fn registry_notifications_never_announce_unpublished_database_content() {
     consumer_server.abort();
 }
 
-/// Remove the leading `# ` from the commented block that starts with `header`.
+/// Remove the leading `# ` from every commented block that starts with `header`.
 fn uncomment_block(source: &str, header: &str) -> String {
+    uncomment_blocks(source, header, None)
+}
+
+/// Remove the leading `# ` from the commented block that starts with `header`: every such block,
+/// or only the `occurrence`-th one (0-based) when an example documents alternatives.
+fn uncomment_blocks(source: &str, header: &str, occurrence: Option<usize>) -> String {
     let mut out = Vec::new();
     let mut inside = false;
+    let mut seen = 0;
     for line in source.lines() {
         if line == format!("# {header}") {
-            inside = true;
+            inside = occurrence.is_none_or(|n| n == seen);
+            seen += 1;
         } else if inside && !line.starts_with("#   ") {
             inside = false;
         }
@@ -11973,22 +11981,71 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     ))
     .unwrap();
     assert!(identity.sdk.uid.starts_with("REPLACE_WITH_"));
+    // Every commented optional block of the single-region example parses once uncommented, so
+    // a misspelled documented key fails here (unknown fields are rejected). master_update and
+    // master_sync are alternatives and are checked one at a time.
     let single = include_str!("../sirius-api-config.example.yaml");
-    for block in ["master_database:", "client_auth:"] {
+    for block in [
+        "master_update:",
+        "master_sync:",
+        "accounts:",
+        "tls:",
+        "access_log:",
+        "logging:",
+        "asset_dispatch:",
+        "node_routing:",
+        "master_notify:",
+        "master_git:",
+        "master_database:",
+        "client_auth:",
+    ] {
         let uncommented = uncomment_block(single, block);
         assert!(uncommented.contains(&format!("\n{block}\n")), "{block}");
         yaml_serde::from_str::<Config>(&uncommented).unwrap();
     }
+    // The nested commented signing block of master_git parses as well.
+    let git = uncomment_block(single, "master_git:")
+        .replace("\n    # signing:\n", "\n    signing:\n")
+        .replace("\n    #   ", "\n      ");
+    let git = yaml_serde::from_str::<Config>(&git)
+        .unwrap()
+        .master_git
+        .unwrap();
+    assert!(git.commit.signing.is_some() && git.remote.is_some());
     let registry = include_str!("../docs/examples/master-registry.yaml");
     yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
+    for block in ["tls:", "access_log:"] {
+        let uncommented = uncomment_block(registry, block);
+        assert!(uncommented.contains(&format!("\n{block}\n")), "{block}");
+        yaml_serde::from_str::<crate::registry_service::Config>(&uncommented).unwrap();
+    }
     let notify = uncomment_block(registry, "notify:");
     assert!(notify.contains("\nnotify:\n"));
     let parsed: crate::registry_service::Config = yaml_serde::from_str(&notify).unwrap();
     assert_eq!(parsed.notify.unwrap().targets.len(), 1);
-    yaml_serde::from_str::<crate::master_database::Import>(include_str!(
-        "../docs/examples/master-database.yaml"
-    ))
-    .unwrap();
+    // The two documented owner variants (synchronizing and local-only) parse one at a time.
+    for (occurrence, synchronizing) in [(0, true), (1, false)] {
+        let owner = uncomment_blocks(registry, "owner:", Some(occurrence));
+        let parsed: crate::registry_service::Config = yaml_serde::from_str(&owner).unwrap();
+        let owner = parsed.owner.unwrap();
+        assert_eq!(owner.source.is_some(), synchronizing);
+        assert_eq!(owner.local_interval_seconds.is_some(), !synchronizing);
+    }
+    // The documented PostgreSQL backend replaces the files backend.
+    let files = "backend:\n  kind: files\n  directory: ./master\n";
+    assert!(registry.contains(files));
+    let postgres = uncomment_block(&registry.replace(files, ""), "backend:");
+    let parsed: crate::registry_service::Config = yaml_serde::from_str(&postgres).unwrap();
+    assert!(matches!(
+        parsed.backend,
+        crate::registry_service::Backend::Postgres { .. }
+    ));
+    let database = include_str!("../docs/examples/master-database.yaml");
+    yaml_serde::from_str::<crate::master_database::Import>(database).unwrap();
+    let certificate = database.replace("  # root_certificate:", "  root_certificate:");
+    assert_ne!(certificate, database);
+    let parsed: crate::master_database::Import = yaml_serde::from_str(&certificate).unwrap();
+    assert!(parsed.database.root_certificate.is_some());
 }
 
 fn client_token(key: &[u8], header: Value, claims: Value) -> String {
