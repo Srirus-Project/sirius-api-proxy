@@ -11891,6 +11891,10 @@ async fn registry_notifications_never_announce_unpublished_database_content() {
 }
 
 /// Remove the leading `# ` from every commented block that starts with `header`.
+/// Checked-in examples are CRLF on Windows checkouts; compare them with LF expectations.
+fn lf(source: &str) -> String {
+    source.replace("\r\n", "\n")
+}
 fn uncomment_block(source: &str, header: &str) -> String {
     uncomment_blocks(source, header, None)
 }
@@ -11915,7 +11919,7 @@ fn uncomment_blocks(source: &str, header: &str, occurrence: Option<usize>) -> St
 #[test]
 fn every_shipped_example_parses_including_documented_optional_blocks() {
     use crate::deployment::DeploymentConfig;
-    let multi = include_str!("../sirius-multi-region-config.example.yaml");
+    let multi = &lf(include_str!("../sirius-multi-region-config.example.yaml"));
     assert!(matches!(
         DeploymentConfig::parse(multi).unwrap(),
         DeploymentConfig::Multi(_)
@@ -11928,6 +11932,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         ("hk", include_str!("../docs/examples/hk.yaml")),
         ("kr", include_str!("../docs/examples/kr.yaml")),
     ] {
+        let source = &lf(source);
         match DeploymentConfig::parse(source).unwrap() {
             DeploymentConfig::Single(c) => {
                 assert_eq!(c.region.name(), region);
@@ -11984,7 +11989,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     // Every commented optional block of the single-region example parses once uncommented, so
     // a misspelled documented key fails here (unknown fields are rejected). master_update and
     // master_sync are alternatives and are checked one at a time.
-    let single = include_str!("../sirius-api-config.example.yaml");
+    let single = &lf(include_str!("../sirius-api-config.example.yaml"));
     for block in [
         "master_update:",
         "master_sync:",
@@ -12012,7 +12017,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         .master_git
         .unwrap();
     assert!(git.commit.signing.is_some() && git.remote.is_some());
-    let registry = include_str!("../docs/examples/master-registry.yaml");
+    let registry = &lf(include_str!("../docs/examples/master-registry.yaml"));
     yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
     for block in ["tls:", "access_log:"] {
         let uncommented = uncomment_block(registry, block);
@@ -12040,10 +12045,10 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         parsed.backend,
         crate::registry_service::Backend::Postgres { .. }
     ));
-    let database = include_str!("../docs/examples/master-database.yaml");
+    let database = &lf(include_str!("../docs/examples/master-database.yaml"));
     yaml_serde::from_str::<crate::master_database::Import>(database).unwrap();
     let certificate = database.replace("  # root_certificate:", "  root_certificate:");
-    assert_ne!(certificate, database);
+    assert_ne!(certificate, *database);
     let parsed: crate::master_database::Import = yaml_serde::from_str(&certificate).unwrap();
     assert!(parsed.database.root_certificate.is_some());
 }
