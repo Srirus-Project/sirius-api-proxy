@@ -20,7 +20,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
-The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has a separate discovery/version bundle. The application release version **1.1.0** is
+The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has a separate discovery/version bundle. The application release version **1.2.0** is
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 
@@ -33,7 +33,7 @@ Configure `region: jp`, `tw`, `en` or `kr`; `cn` is reserved and currently rejec
 network activity. Use one instance per region. JP retains its existing functionality; Global
 currently supports verified server discovery/version queries and region-aware asset transport,
 not completed SDK login or end-to-end Global asset validation. See [region support and upgrade
-instructions](docs/REGIONS.md) before deploying paired v1.1.0 services.
+instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start
 

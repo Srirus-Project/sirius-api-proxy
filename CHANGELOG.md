@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.0
+
+Restores the reusable service capabilities of the original Haruki API for Sirius. Sekai-specific
+models, Ent code, CP/Nuverse login and unverified Global login are not restored; see
+`docs/CONFIG_AUDIT.md` for the field-by-field audit and `docs/RESTORATION_1_2.md` for the ledger.
+
+- Multi-region deployments with per-region protocol, credentials and isolated state; v1.1
+  single-region configuration remains valid and CN stays reserved.
+- Account pool with per-account session locking, health/cooldown and live credential reload.
+- Scoped response cache with optional Redis backend and stale-while-revalidate; private data
+  never enters public cache entries.
+- Upstream proxies, deadlines, bounded retries, listener TLS, application and access logs,
+  trusted forwarding and remote node routing with priorities and failover.
+- Master registry: verified manifests, pinned tables, history, content-hash lookup, snapshot
+  tar bundles, owner/consumer synchronization and update notifications.
+- Optional PostgreSQL Master mirror (exact JSON bytes plus JSONB), history migration and
+  configurable read pool; optional Git publication with signing, proxies and background retry,
+  including Windows process-tree containment.
+- Standalone `registry-serve` without game configuration: file or PostgreSQL backends,
+  owner pull, local publication and outbound consumer notifications.
+- Optional per-client API tokens (`client_auth`) with PostgreSQL users and region grants,
+  failing closed unlike the original open mode.
+- Durable asset-updater job dispatch with idempotent submission and completion tracking.
+- All configuration structures reject unknown fields; every shipped example is parse-tested.
+
 ## 1.1.0
 
 - Add explicit JP/TW/EN/KR identities and reserve CN without enabling unverified networking.
