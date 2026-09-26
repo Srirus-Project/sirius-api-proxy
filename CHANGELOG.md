@@ -2,6 +2,33 @@
 
 ## 1.2.1 (unreleased)
 
+- Global (HK/EN/KR) player accounts. An account references a private SDK guest identity file
+  (`global_identity_file`, schema 1, mode 0600) and a `global_login` policy. The first
+  authenticated request logs in under the account's session lock: SDK `cache.login` (signed like
+  the Android SDK, official `l11`/`l12`/`l13-sdk-login-intl.biligame.net` HTTPS origins only, no
+  redirects or retries) then `PlayerLoginService/PlayerLogin` (area 6, channel 2001, brand 5).
+  The credential stays in memory. `TOKEN_*`/`PLAYER_NOT_*`/`CONCURRENT_DEVICE` drop the session,
+  `BAN_*` and SDK CAPTCHA/refusals disable the account, `AEGIS_*` cools it down; logins are bounded
+  by `login_min_interval_seconds` and `max_logins_per_day`. Failed requests are never replayed.
+- Global offers the JP operations: profile by profile ID, event ranking and deck, song and
+  challenge rankings, announcements, player data and account identity. Authenticated Global calls
+  add `x-player-bid` and `x-resource-version`. Whoami is never sent on Global (production rejects
+  it); the account identity is the PlayerLogin result. Login and player data are live-verified;
+  the other reads are implemented but not yet exercised live. `/api/v1/regions` reports
+  per-operation `operations` status and `capability: global_proxy`.
+- New one-shot commands: `global-account bootstrap` (creates one SDK guest only with
+  `--create-sdk-guest`, refuses to repeat an attempt) and `global-account verify` (one
+  `cache.login` and one PlayerLogin for a configured account).
+- `protocol/global/1.0.1` is now the client's own descriptor subset for these RPCs plus
+  `PlayerLogin` (47 files), without Whoami. `ServerInfo` field 8 is validated by number; the client
+  names it `areaID`, and `/api/v1/servers` keeps publishing `areaId`. The previous two-RPC bundle
+  cannot be hot-reloaded into the new one; restart.
+- Global account status adds `session_state`, `last_login_at`, `logins_24h` and
+  `last_error_code`. Response cache account scopes for Global use the account name and SDK uid,
+  never the rotating credential. JP accounts and cache keys are unchanged.
+- Upgrade note: Global profiles now reject static game credentials (`player_id_env`,
+  `credentials_file`); Global authenticated operations answer 503 instead of 501 when no
+  account is configured.
 - Global (HK/EN/KR) resource snapshots, opt-in with `resource_snapshot`. `resource_version` is
   the Global VersionResponse field 2 `resourceVersion`; `x-asset-version: unknown` is ignored.
   `platform_hash` is the base catalog's `{default_cdn_root}/asset/{platform}/catalog_{version}.hash`,

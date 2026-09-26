@@ -20,8 +20,8 @@ Paths remain relative to the process working directory, as in single-region mode
 | Protocol status/reload | `GET /internal/v1/kr/protocol`, `POST /internal/v1/kr/protocol/reload` |
 | Process liveness | `GET /health` |
 
-All existing resource suffixes are available under each region's prefix. Unsupported
-Global RPCs still return 501 without an upstream call. There is no implicit default
+All existing resource suffixes are available under each region's prefix. Operations a
+region does not support (for example `servers` on JP) return 501 without an upstream call. There is no implicit default
 region route in this mode: `/api/v1/system` and unconfigured regions return 404.
 Health is unauthenticated process liveness, not proof that every game server is ready.
 
@@ -30,7 +30,9 @@ and session lock. Protocol reload affects only the selected region. Master worke
 are created per region (JP, HK, EN, KR) and share graceful service shutdown. Each region needs
 distinct Master directories, Git state directories, Git remotes and Git tokens; see
 [the publisher example](examples/master-publisher.yaml). Configure game credentials
-only for their owning region. Never copy JP credentials into Global settings.
+only for their owning region. Never copy JP credentials into Global settings. HK, EN and KR
+profiles may reference the same Global identity file: each server keeps its own player and
+session ([Global accounts](ACCOUNTS.md#global-accounts)).
 
 Each route uses that region's API or internal token. Use distinct tokens across regions
 for independent authorization; deliberately reusing a token grants access to all

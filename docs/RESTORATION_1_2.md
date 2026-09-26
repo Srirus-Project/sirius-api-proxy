@@ -257,3 +257,16 @@ use only local mocks. The tests cover snapshot creation for each Global region, 
 `.hash` request, per-version memoization, `unknown`/unsafe versions, malformed, oversized,
 missing and redirected `.hash` responses, refusal of server-announced roots, Basic credential
 scope, configuration validation, and JP schema-2 stability. JP snapshots are unchanged.
+
+Post-1.2.0 (1.2.1, unreleased): Global (HK/EN/KR) player accounts and the JP operations on Global.
+SDK guest `tourist.login`/`cache.login`, PlayerLogin (area 6, channel 2001, brand 5, platform
+omitted) and GetPlayerData with `x-player-bid`/`x-player-id`/`x-player-credential`/
+`x-master-version`/`x-resource-version` were verified live on all three servers on 2026-09-26 with
+the user's approval; Whoami is disabled on Global production and is never sent. The Global bundle
+is the client's descriptor subset for the proxy RPCs plus PlayerLogin. Profile, ranking, deck and
+announcement reads on Global are implemented but not yet exercised live. Covered by tests with a
+local mock SDK and mock game servers: signing and PlayerLogin wire vectors shared with the
+research tooling, bootstrap and verify, one login under concurrency, re-login on token signals
+without replay, ban/queue/concurrent-device handling, login interval and daily cap, verified
+headers, Whoami never sent, redaction in logs/status/errors, configuration validation, cache scope
+across credential rotation and a JP+HK+EN+KR deployment. Linux and Windows CI.

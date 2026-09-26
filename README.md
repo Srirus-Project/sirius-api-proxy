@@ -20,7 +20,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
-The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has a separate discovery/version bundle. The application release version **1.2.0** is
+The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version **1.2.0** is
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 
@@ -31,10 +31,12 @@ with `registry-serve`, using the same manifest contract as Master consumers.
 
 Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
 network activity. Use one instance per region. JP retains its existing functionality; Global
-supports verified server discovery/version queries, the Master data pipeline (download,
+supports verified server discovery/version queries, player operations with SDK guest accounts, the Master data pipeline (download,
 registry, sync, Git and database publication) and schema-3 resource snapshots for the asset
 updater (`resource_snapshot`). A production end-to-end Global asset acceptance run is still
-pending. SDK login is not implemented. See [region support and upgrade
+pending. Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
+([Global accounts](docs/ACCOUNTS.md#global-accounts)); login and player data are live-verified,
+the other Global reads are implemented but not yet exercised live. See [region support and upgrade
 instructions](docs/REGIONS.md) before deploying paired v1.2.0 services.
 
 ## Quick start
@@ -56,9 +58,12 @@ For one process serving multiple regions, see [multi-region configuration](docs/
 Keep the bundled `protocol/` directory beside the executable and run from that directory,
 or configure an absolute `protocol_directory`. No external protoc, Redis or database is needed.
 
-Player queries require an existing account: use `accounts`, or configure both `player_id_env` and
-`player_credential_env`, then provide the referenced secrets. The service does not register,
-transfer or delete accounts. Public profile IDs are different from credential player IDs.
+Player queries require an account. JP uses an existing account: use `accounts`, or configure both
+`player_id_env` and `player_credential_env`, then provide the referenced secrets. The service does
+not register, transfer or delete JP accounts. HK/EN/KR use SDK guest identity files; the one-shot
+`global-account bootstrap` (explicit `--create-sdk-guest`) and `global-account verify` commands
+are described in [Global accounts](docs/ACCOUNTS.md#global-accounts), including the terms-of-service
+risk. Public profile IDs are different from credential player IDs.
 
 For multiple existing accounts, see [account pool and live credential rotation](docs/ACCOUNTS.md).
 

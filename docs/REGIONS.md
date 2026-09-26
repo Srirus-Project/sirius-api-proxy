@@ -8,9 +8,9 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy, verified download/export pipeline and Master data |
-| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Server discovery, anonymous version query, Master data and resource snapshots |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, version, SDK guest accounts and the JP proxy operations (see [Global operations](#global-operations)), Master data and resource snapshots |
+| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Same as `hk` |
+| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Same as `hk` |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 The Traditional Chinese (TW/HK/MO) region is `hk`, the identifier the game itself uses (CDN
@@ -36,11 +36,45 @@ fingerprints select native codecs; compatible changed definitions use dynamic st
 `GET /api/v1/system` includes region, platform, protocol family, supported RPCs and observed
 Master/resource versions. All three endpoints require the API token.
 
-Global player/profile/ranking/announcement/account operations return HTTP 501 without sending
-a request. The Global bundle deliberately includes only the two verified RPCs and their
-necessary types. JP authentication, account registration and Master decryption are not assumed
-to work on Global; no SDK registration/login implementation is included in this release.
-Global Master data is supported as described below; nothing else about Global accounts is.
+### Global operations
+
+HK/EN/KR offer the same public and internal operations as JP. Authenticated operations use a
+Global SDK guest account (see [Global accounts](ACCOUNTS.md#global-accounts)); without an account
+they return 503 without sending a request. The Global bundle contains the client's own message
+definitions for exactly these RPCs plus the internal `PlayerLogin`. It has no Whoami: Global
+production rejects it ("native whoami is disabled in production"), so the proxy never sends it
+and the account identity is the `PlayerLogin` result. JP credentials are never used for Global.
+
+`GET /api/v1/regions` reports each operation's status in `operations`:
+
+| Operation | Global RPC | Status |
+| --- | --- | --- |
+| `version` | `MasterdataService/Version` | `live_verified` |
+| `servers` | `PlayerLoginService/GetServerList` | `live_verified` |
+| `account_login` | SDK `cache.login` + `PlayerLoginService/PlayerLogin` | `live_verified` |
+| `player_data` | `PlayerService/GetPlayerData` | `live_verified` |
+| `account_identity` | none (PlayerLogin result) | `implemented_unverified` |
+| `announcements` | `AnnouncementService/GetList`, `Get` | `implemented_unverified` |
+| `profile` | `FriendService/FindByProfileID` | `implemented_unverified` |
+| `event_ranking` | `EventService/GetRankingList` | `implemented_unverified` |
+| `event_deck` | `EventService/GetDeck` | `implemented_unverified` |
+| `music_ranking` | `LiveMusicService/GetRanking` | `implemented_unverified` |
+| `challenge_ranking` | `EventService/GetChallengeMusicRanking` | `implemented_unverified` |
+
+`live_verified` was exercised against production on all three servers (2026-09-26).
+`implemented_unverified` uses paths, request fields and authentication options identical to JP in
+the verified Global descriptors, and is covered by local mock tests only. JP reports
+`live_verified` for its operations, `static_credentials` for `account_login` and `unsupported`
+for `servers`; CN reports `reserved`. `capability` is `jp_proxy`, `global_proxy` or `reserved`.
+
+Notes:
+
+- Profile IDs, event IDs and player IDs are server-scoped: query the region that owns them.
+- The client's descriptor names `ServerInfo` field 8 `areaID`. The proxy validates it by field
+  number and keeps publishing it as `areaId` in `/api/v1/servers`.
+- `GetPlayerData` responses include the Global-only fields `chatReportUsedToday` and `roomIds`.
+- Upgrading from the earlier two-RPC Global bundle changes field names and file names, so a
+  running instance cannot hot-reload across that change; restart with the new bundle.
 
 ## Master data
 
@@ -230,5 +264,5 @@ schema-1 JP receipts remain readable for offline verification/export. Export sum
 adds region and platform. Keep published outputs immutable; directory names are opaque and
 must not be parsed as the previous `catalog-UUID` naming convention.
 
-`cn` has no default API/CDN, invented area ID, copied Global protocol or fallback to JP.
+`cn` has no default API/CDN, invented area ID, copied Global protocol, accounts or fallback to JP.
 Enabling it later requires verified endpoints, login/protobuf contracts and resource behavior.
