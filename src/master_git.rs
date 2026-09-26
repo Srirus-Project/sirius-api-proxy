@@ -158,6 +158,36 @@ struct Prepared {
     manifest: PublishedManifest,
     names: Vec<String>,
 }
+/// Windows canonical paths use the `\\?\` verbatim form, which Git for Windows rejects
+/// (`cannot mkdir ...: Invalid argument`). Convert drive and UNC forms back to ordinary
+/// absolute paths; other platforms and other verbatim forms are returned unchanged.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+#[cfg(test)]
+#[test]
+fn verbatim_windows_paths_become_plain_absolute_paths() {
+    for (input, expected) in [
+        (r"\\?\C:\Temp\git-state", r"C:\Temp\git-state"),
+        (r"\\?\UNC\server\share\git", r"\\server\share\git"),
+        (r"\\?\Volume{0}\git", r"\\?\Volume{0}\git"),
+        ("/var/lib/sirius/git", "/var/lib/sirius/git"),
+    ] {
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(input)),
+            PathBuf::from(expected)
+        );
+    }
+}
 fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, Error> {
     if let Ok(meta) = fs::symlink_metadata(destination) {
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -165,7 +195,8 @@ fn prepare(source: &Path, destination: &Path, scope: Scope) -> Result<Prepared, 
         }
     }
     fs::create_dir_all(destination).map_err(|_| Error::Snapshot)?;
-    let directory = fs::canonicalize(destination).map_err(|_| Error::Snapshot)?;
+    let directory =
+        without_verbatim_prefix(fs::canonicalize(destination).map_err(|_| Error::Snapshot)?);
     let lock = directory.join("owner.lock");
     if fs::symlink_metadata(&lock).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         return Err(Error::Ownership);
