@@ -9512,6 +9512,66 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
 }
 
 #[test]
+fn master_database_rejects_only_inherited_libpq_client_environment() {
+    use crate::master_database::ambient_libpq_configuration as ambient;
+    // SQLx 0.9 reads these and nothing in the explicit configuration replaces them.
+    for name in ["PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGOPTIONS"] {
+        assert!(ambient(|n| n == name), "{name}");
+    }
+    // SQLx reads these too, but explicit values always replace them (checked below against the
+    // real process environment); PGPASSFILE is never consulted. Server installation variables
+    // are set wherever PostgreSQL is installed (GitHub Windows runners also set PGUSER and
+    // PGPASSWORD) and must not disable the database transport.
+    for name in [
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGPASSFILE",
+        "PGDATABASE",
+        "PGSSLMODE",
+        "PGAPPNAME",
+        "PGDATA",
+        "PGBIN",
+        "PGROOT",
+    ] {
+        assert!(!ambient(|n| n == name), "{name}");
+    }
+    assert!(!ambient(|_| false));
+    let mut config = master_database_config();
+    config.host = "127.0.0.2".into();
+    config.port = 5433;
+    config.database = "sirius_scope".into();
+    config.username = "sirius_scope_user".into();
+    config.password_env = format!("SIRIUS_DB_AMBIENT_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&config.password_env, "ambient-scope-password");
+    let options = config.options().unwrap();
+    assert_eq!(options.get_host(), "127.0.0.2");
+    assert_eq!(options.get_port(), 5433);
+    assert_eq!(options.get_database(), Some("sirius_scope"));
+    assert_eq!(options.get_username(), "sirius_scope_user");
+    assert!(options.get_socket().is_none());
+    assert!(matches!(
+        options.get_ssl_mode(),
+        sqlx::postgres::PgSslMode::Disable
+    ));
+    assert_eq!(
+        options.get_application_name(),
+        Some("sirius-master-database")
+    );
+    assert_eq!(
+        options.get_options(),
+        Some("-c statement_timeout=10000 -c lock_timeout=10000")
+    );
+    config.plaintext_loopback = false;
+    assert!(matches!(
+        config.options().unwrap().get_ssl_mode(),
+        sqlx::postgres::PgSslMode::VerifyFull
+    ));
+}
+
+#[test]
 fn master_database_worker_config_and_credentials_are_scoped() {
     use crate::master_database_worker::{self as worker, Config as Policy};
     let mut cfg = regional_config(crate::region::Region::Jp);

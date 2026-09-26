@@ -22,7 +22,8 @@ client_auth:
 ```
 
 The database transport follows [MASTER_DATABASE.md](MASTER_DATABASE.md): verified TLS by default,
-password by environment reference, and ambient `PG*` variables rejected. Sirius never creates or
+password by environment reference, and ambient libpq client settings (`PGSSLROOTCERT`,
+`PGSSLCERT`, `PGSSLKEY`, `PGOPTIONS`) rejected. Sirius never creates or
 changes this schema; the issuing system owns it:
 
 ```sql

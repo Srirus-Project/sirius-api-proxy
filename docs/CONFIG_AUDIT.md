@@ -92,7 +92,7 @@ Original: `DatabaseConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:102-115`.
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | Presence of the per-region `client_auth` section (`src/config.rs:25`) | Original use: the SeaORM `sekai_users` / `sekai_user_servers` tables behind the JWT middleware (`Haruki-Sekai-API@07da6b80:src/db.rs:9-45`). Sirius reads `sirius_api_users` / `sirius_api_user_regions` and never creates or changes the schema ([CLIENT_AUTH.md](CLIENT_AUTH.md)). |
-| `dsn` | ADAPTED | `client_auth.database.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds}` (`src/client_auth.rs:34-45`) | PostgreSQL only. Verified TLS unless loopback, password from an env reference, ambient `PG*` variables rejected (transport shared with the Master mirror, `src/client_auth.rs:85-99`, `src/master_database.rs:119-121`). |
+| `dsn` | ADAPTED | `client_auth.database.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds}` (`src/client_auth.rs:34-45`) | PostgreSQL only. Verified TLS unless loopback, password from an env reference, ambient libpq client settings SQLx would inherit (`PGSSLROOTCERT`/`PGSSLCERT`/`PGSSLKEY`/`PGOPTIONS`) rejected (transport shared with the Master mirror, `src/client_auth.rs:85-99`, `src/master_database.rs:119-124,155-169`). |
 | `max_connections` (default 10) | ADAPTED | `client_auth.database.max_connections` (default 4, 1–64; `src/client_auth.rs:46-47`, `:61-63`) | Validated through the shared connection policy (`src/client_auth.rs:82`, `src/master_database.rs:96`). |
 | `ingest_concurrency` | IGNORED_BY_ORIGINAL | none | Only read from `master_database` (`Haruki-Sekai-API@07da6b80:src/bin/run_ingest.rs:32`, `Haruki-Sekai-API@07da6b80:src/updater/scheduler.rs:124`, `:175`). On `database` it has no effect in the original. |
 | `driver` (example only) | IGNORED_BY_ORIGINAL | none | Not a struct field. Sirius is PostgreSQL only. |
@@ -241,8 +241,9 @@ Other environment reads in Sirius:
 - `master-import` reads `SIRIUS_MASTER_KEY_HEX` / `SIRIUS_MASTER_IV_HEX` (`src/main.rs:227-234`).
 - `master-git-push` reads `SIRIUS_MASTER_GIT_PROXY_URL` / `SIRIUS_MASTER_GIT_AUTHORIZATION`
   (`src/main.rs:191-199`). See [Decisions](#decisions).
-- PostgreSQL connections refuse to start while any `PG*` variable is set
-  (`src/master_database.rs:119-121`).
+- PostgreSQL connections refuse to start while `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` or
+  `PGOPTIONS` is set; other SQLx-read `PG*` variables are always overridden by explicit
+  configuration (`src/master_database.rs:119-124,155-169`).
 
 ## Decisions
 

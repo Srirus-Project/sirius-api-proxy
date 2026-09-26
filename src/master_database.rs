@@ -116,9 +116,10 @@ impl Config {
     }
     pub(crate) fn options_named(&self, application: &str) -> Result<PgConnectOptions, Error> {
         self.validate()?;
-        // SQLx's defaults read PG* options, including client key paths. Reject ambient
-        // libpq configuration instead of accidentally importing another service's identity.
-        if std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("PG")) {
+        // SQLx's defaults read PG* options, including client certificate/key paths. Reject ambient
+        // libpq configuration that would survive the explicit settings below instead of
+        // accidentally importing another service's identity, trust roots or server options.
+        if ambient_libpq_configuration(|name| std::env::var_os(name).is_some()) {
             return Err(Error::Config);
         }
         let password = std::env::var(&self.password_env).map_err(|_| Error::Secret)?;
@@ -150,6 +151,21 @@ impl Config {
         }
         Ok(options)
     }
+}
+/// libpq environment variables that SQLx 0.9 `PgConnectOptions::new_without_pgpass()` reads and
+/// whose values would survive the explicit configuration in `options_named`: a trust root when
+/// none is configured, a client certificate/key, and server options appended to our own.
+///
+/// SQLx also reads PGHOST, PGHOSTADDR, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE and
+/// PGAPPNAME, but every one of those is unconditionally replaced by an explicit value, and
+/// PGPASSFILE is only consulted by the password-file lookup this transport never uses. Server
+/// installation variables (PGDATA, PGBIN, PGROOT, ...) are not client configuration at all.
+/// Hosts with PostgreSQL tooling (including GitHub Windows runners, which set PGUSER and
+/// PGPASSWORD) therefore keep working. Review this list whenever SQLx is upgraded.
+const INHERITED_LIBPQ_VARIABLES: [&str; 4] =
+    ["PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGOPTIONS"];
+pub(crate) fn ambient_libpq_configuration(is_set: impl Fn(&str) -> bool) -> bool {
+    INHERITED_LIBPQ_VARIABLES.iter().any(|name| is_set(name))
 }
 struct Snapshot {
     manifest: PublishedManifest,

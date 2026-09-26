@@ -81,7 +81,7 @@ impl Config {
         }
         self.connection().validate().map_err(|_| invalid())
     }
-    /// Reuse the Master database transport policy: verified TLS, no ambient PG* settings.
+    /// Reuse the Master database transport policy: verified TLS, no inherited ambient libpq settings.
     fn connection(&self) -> crate::master_database::Config {
         let d = &self.database;
         crate::master_database::Config {

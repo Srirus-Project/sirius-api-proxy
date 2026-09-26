@@ -18,8 +18,13 @@ Transport defaults to TLS with CA and hostname verification, using the bundled W
 or an explicit `root_certificate`. `plaintext_loopback: true` is permitted only for literal
 loopback IPs (for a local test database or separately secured tunnel); it rejects DNS names
 and non-loopback hosts. Passwords are loaded from the named environment variable; connection
-strings and raw database errors are never printed. Ambient `PG*` variables are rejected to
-prevent importing libpq client certificates, keys, options or identities unintentionally.
+strings and raw database errors are never printed. Ambient libpq variables that SQLx would
+otherwise carry into the connection (`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGOPTIONS`) are
+rejected to prevent importing trust roots, client certificates, keys or server options
+unintentionally. `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+`PGSSLMODE` and `PGAPPNAME` are always replaced by the explicit configuration, `PGPASSFILE` is never
+read, and server installation variables such as `PGDATA`, `PGBIN` or `PGROOT` are ignored, so hosts
+with PostgreSQL installed or `psql` defaults configured keep working.
 
 ## Stored data and consistency
 
