@@ -112,6 +112,9 @@ impl Config {
         Ok(())
     }
     pub(crate) fn options(&self) -> Result<PgConnectOptions, Error> {
+        self.options_named("sirius-master-database")
+    }
+    pub(crate) fn options_named(&self, application: &str) -> Result<PgConnectOptions, Error> {
         self.validate()?;
         // SQLx's defaults read PG* options, including client key paths. Reject ambient
         // libpq configuration instead of accidentally importing another service's identity.
@@ -128,7 +131,7 @@ impl Config {
             .database(&self.database)
             .username(&self.username)
             .password(&password)
-            .application_name("sirius-master-database")
+            .application_name(application)
             .ssl_mode(if self.plaintext_loopback {
                 PgSslMode::Disable
             } else {

@@ -60,6 +60,7 @@ pub struct GameClient {
     master_git_wake: tokio::sync::Notify,
     master_database_wake: tokio::sync::Notify,
     master_database_reader: Option<crate::master_database::Reader>,
+    client_auth: Option<crate::client_auth::Authenticator>,
     master_publication_wake: tokio::sync::Notify,
     node_routing: Option<crate::node_routing::Router>,
     config: Config,
@@ -135,7 +136,16 @@ impl GameClient {
             .clone()
             .map(|routing| crate::node_routing::Router::new(routing, config.region))
             .transpose()?;
+        let client_auth = config
+            .client_auth
+            .as_ref()
+            .map(|auth| {
+                let protected = crate::master_notify::protected_tokens(&[&config]);
+                crate::client_auth::Authenticator::new(auth, config.region, &protected)
+            })
+            .transpose()?;
         Ok(Arc::new(Self {
+            client_auth,
             master_sync_wake: tokio::sync::Notify::new(),
             master_publication_wake: tokio::sync::Notify::new(),
             master_git_wake: tokio::sync::Notify::new(),
@@ -161,6 +171,9 @@ impl GameClient {
             protocol: RwLock::new(Arc::new(protocol)),
             reload_lock: Mutex::new(()),
         }))
+    }
+    pub(crate) fn client_auth(&self) -> Option<&crate::client_auth::Authenticator> {
+        self.client_auth.as_ref()
     }
     #[cfg(test)]
     pub(crate) fn for_test(config: Config) -> Arc<Self> {

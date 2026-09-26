@@ -20,6 +20,9 @@ pub struct Config {
     pub peer_token_env: Option<String>,
     #[serde(default)]
     pub asset_dispatch: Option<crate::asset_dispatch::Config>,
+    /// Optional per-client JWT credentials accepted on public API routes.
+    #[serde(default)]
+    pub client_auth: Option<crate::client_auth::Config>,
     #[serde(default)]
     pub logging: Option<crate::application_log::Config>,
     #[serde(default)]
@@ -194,6 +197,18 @@ impl Config {
         }
         if let Some(routing) = &self.node_routing {
             routing.validate(self.region)?;
+        }
+        if let Some(auth) = &self.client_auth {
+            auth.validate()?;
+            if [&self.api_token_env, &self.internal_token_env]
+                .into_iter()
+                .chain(self.peer_token_env.as_ref())
+                .any(|name| name == &auth.signing_key_env || name == &auth.database.password_env)
+            {
+                return Err(AppError::Config(
+                    "client authorization secrets need independent environment references",
+                ));
+            }
         }
         if let Some(dispatch) = &self.asset_dispatch {
             dispatch.validate()?;

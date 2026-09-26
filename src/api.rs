@@ -30,6 +30,30 @@ pub(crate) async fn authorize(
     }
     Ok(next.run(request).await)
 }
+/// Public API routes accept the static bearer or, when `client_auth` is configured, exactly
+/// one per-client token. Presenting both, duplicates, or a user token on a profile without
+/// client authorization is rejected. Internal routes never accept user tokens.
+async fn authorize_api(
+    State((token, client)): State<(Arc<str>, Arc<GameClient>)>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let headers = request.headers();
+    let users = headers.get_all(crate::client_auth::HEADER).iter().count();
+    if users == 0 {
+        return authorize(State(token), request, next).await;
+    }
+    let auth = client.client_auth().ok_or(AppError::Unauthorized)?;
+    if users != 1 || headers.contains_key("authorization") {
+        return Err(AppError::Unauthorized);
+    }
+    let value = headers
+        .get(crate::client_auth::HEADER)
+        .and_then(|h| h.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    auth.authorize(value).await?;
+    Ok(next.run(request).await)
+}
 pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String) -> Router {
     health_router().merge(router_at(
         client,
@@ -100,8 +124,8 @@ pub fn router_at(
             get(challenge_ranking),
         )
         .route_layer(middleware::from_fn_with_state(
-            Arc::<str>::from(api_token),
-            authorize,
+            (Arc::<str>::from(api_token), client.clone()),
+            authorize_api,
         ));
     let internal = Router::new()
         .route("/nodes", get(nodes))

@@ -11,6 +11,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
 - Separate public API and internal administration tokens; private account responses stay internal.
 - Binary Protobuf over HTTP/2 unary gRPC with verified TLS, trailers, deadlines and response limits.
 - Optional per-region [HTTP/HTTPS outbound proxies](docs/UPSTREAM_PROXY.md) with scoped authentication.
+- Optional [per-client API tokens](docs/CLIENT_AUTH.md) with PostgreSQL users and region grants.
 - Native Protobuf/JSON codecs generated at build time; compatible proto hot reload switches to
   dynamic codecs without restarting. Rebuilding restores the native path for the new definitions.
 - Master manifest verification, Rijndael-256 decryption, gzip/JSON validation, atomic snapshots,
@@ -74,7 +75,8 @@ Rotate secrets in the deployment environment and restart after a server-side cre
 
 ## HTTP API
 
-All routes except `/health` require `Authorization: Bearer ...`.
+All routes except `/health` require `Authorization: Bearer ...`. Public `/api/v1` routes also accept
+a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) is configured.
 
 | Route | Token | Result |
 | --- | --- | --- |

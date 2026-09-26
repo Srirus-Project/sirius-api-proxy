@@ -183,3 +183,12 @@ global config and no askpass fallback. A cmd.exe helper test with timeout/cancel
 control, plus real Git commit and stalled HTTP remote shutdown tests, are enabled for Windows and
 run by a new Windows CI job; locally they are cross-compiled only, so Windows runtime evidence
 depends on that job.
+
+Restored optional per-client authorization (`client_auth`, see CLIENT_AUTH.md) from the original
+multi-user JWT middleware: HS256 `X-Sirius-Token` with `uid`/`credential`, PostgreSQL users and
+per-region grants, 401/403/503 outcomes and a bounded positive-decision cache. It fails closed
+instead of the original open mode, enforces `exp` when present, rejects every non-HS256 algorithm,
+keys the in-process cache by credential digest instead of storing raw credentials in Redis, and never
+applies to internal routes. Tests cover RFC 4231 HMAC vectors, forged/none/HS512/expired tokens,
+routing without a reachable database (static bearer unaffected, 503 for valid tokens, nothing
+cached), secret independence and, on PostgreSQL, credentials, grants, revocation and cache disabling.

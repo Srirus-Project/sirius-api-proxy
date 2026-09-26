@@ -35,6 +35,7 @@ fn config() -> Config {
         master_sync: None,
         node_routing: None,
         peer_token_env: None,
+        client_auth: None,
         asset_dispatch: None,
         logging: None,
         region: crate::region::Region::Jp,
@@ -11777,4 +11778,330 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         "../docs/examples/master-database.yaml"
     ))
     .unwrap();
+}
+
+fn client_token(key: &[u8], header: Value, claims: Value) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let signed = format!(
+        "{}.{}",
+        b64.encode(serde_json::to_vec(&header).unwrap()),
+        b64.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature = crate::client_auth::hmac_sha256(key, signed.as_bytes());
+    format!("{signed}.{}", b64.encode(signature))
+}
+const CLIENT_KEY: &str = "client-signing-key-0123456789abcdef";
+fn client_auth_config(port: u16) -> crate::client_auth::Config {
+    let key = format!("SIRIUS_CLIENT_KEY_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&key, CLIENT_KEY);
+    let password = format!("SIRIUS_CLIENT_DB_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(
+        &password,
+        std::env::var("SIRIUS_TEST_POSTGRES_PASSWORD").unwrap_or_else(|_| "unused-db-pass".into()),
+    );
+    crate::client_auth::Config {
+        signing_key_env: key,
+        cache_seconds: 60,
+        cache_entries: 16,
+        database: crate::client_auth::Database {
+            host: "127.0.0.1".into(),
+            port,
+            database: "sirius_test".into(),
+            username: "postgres".into(),
+            password_env: password,
+            root_certificate: None,
+            plaintext_loopback: true,
+            timeout_seconds: 2,
+            max_connections: 2,
+        },
+    }
+}
+
+#[test]
+fn client_token_hmac_matches_rfc4231_and_verification_is_strict() {
+    use crate::client_auth::{hmac_sha256, verify};
+    let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(
+        hex(hmac_sha256(&[0x0b; 20], b"Hi There")),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+    assert_eq!(
+        hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    assert_eq!(
+        hex(hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        )),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+    );
+    let key = CLIENT_KEY.as_bytes();
+    let hs256 = json!({"alg":"HS256","typ":"JWT"});
+    let good = client_token(
+        key,
+        hs256.clone(),
+        json!({"uid":"u1","credential":"c1","iat":1}),
+    );
+    let claims = verify(&good, key, 1000).unwrap();
+    assert_eq!(
+        (claims.uid.as_str(), claims.credential.as_str()),
+        ("u1", "c1")
+    );
+    // Future expiry passes; past or current expiry fails (the original ignored `exp`).
+    assert!(verify(
+        &client_token(
+            key,
+            hs256.clone(),
+            json!({"uid":"u","credential":"c","exp":1001})
+        ),
+        key,
+        1000
+    )
+    .is_some());
+    assert!(verify(
+        &client_token(
+            key,
+            hs256.clone(),
+            json!({"uid":"u","credential":"c","exp":1000})
+        ),
+        key,
+        1000
+    )
+    .is_none());
+    for (header, claims) in [
+        (json!({"alg":"none"}), json!({"uid":"u","credential":"c"})),
+        (json!({"alg":"HS512"}), json!({"uid":"u","credential":"c"})),
+        (
+            json!({"alg":"HS256","typ":"JWS"}),
+            json!({"uid":"u","credential":"c"}),
+        ),
+        (hs256.clone(), json!({"uid":"","credential":"c"})),
+        (hs256.clone(), json!({"uid":"u"})),
+        (hs256.clone(), json!({"uid":"u","credential":7})),
+    ] {
+        assert!(verify(&client_token(key, header, claims), key, 1000).is_none());
+    }
+    assert!(verify(&good, b"another-key-another-key-another-key", 1000).is_none());
+    let (head, rest) = good.split_once('.').unwrap();
+    let (_, signature) = rest.split_once('.').unwrap();
+    use base64::Engine;
+    let forged = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"uid":"admin","credential":"c1"}"#);
+    assert!(verify(&format!("{head}.{forged}.{signature}"), key, 1000).is_none());
+    assert!(verify(&format!("{good}.extra"), key, 1000).is_none());
+    assert!(verify(&format!("{head}.{}", "a".repeat(9000)), key, 1000).is_none());
+}
+
+#[tokio::test]
+async fn client_tokens_are_fail_closed_and_never_reach_internal_routes() {
+    use axum::body::Body;
+    let request = |path: &str, headers: &[(&str, &str)]| {
+        let mut builder = Request::get(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    // A profile without client_auth rejects user tokens instead of ignoring them.
+    let plain = api::router(
+        GameClient::for_test(config()),
+        "read".into(),
+        "admin".into(),
+    );
+    let token = client_token(
+        CLIENT_KEY.as_bytes(),
+        json!({"alg":"HS256"}),
+        json!({"uid":"u1","credential":"c1"}),
+    );
+    let status = |app: axum::Router, req: Request<Body>| async move {
+        app.oneshot(req).await.unwrap().status()
+    };
+    assert_eq!(
+        status(
+            plain.clone(),
+            request("/api/v1/regions", &[("x-sirius-token", &token)])
+        )
+        .await,
+        401
+    );
+    assert_eq!(
+        status(
+            plain,
+            request("/api/v1/regions", &[("authorization", "Bearer read")])
+        )
+        .await,
+        200
+    );
+    // An unreachable user store: static bearer keeps working, bad tokens fail before any
+    // database access, and a well-formed token yields 503 rather than open access.
+    let mut cfg = config();
+    cfg.client_auth = Some(client_auth_config(1));
+    let client = GameClient::for_test(cfg);
+    let app = api::router(client.clone(), "read".into(), "admin".into());
+    assert_eq!(
+        status(
+            app.clone(),
+            request("/api/v1/regions", &[("authorization", "Bearer read")])
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        status(app.clone(), request("/api/v1/regions", &[])).await,
+        401
+    );
+    let start = std::time::Instant::now();
+    assert_eq!(
+        status(
+            app.clone(),
+            request("/api/v1/regions", &[("x-sirius-token", "a.b.c")])
+        )
+        .await,
+        401
+    );
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert_eq!(
+        status(
+            app.clone(),
+            request("/api/v1/regions", &[("x-sirius-token", &token)])
+        )
+        .await,
+        503
+    );
+    assert_eq!(client.client_auth().unwrap().cached_entries(), 0);
+    for headers in [
+        vec![
+            ("x-sirius-token", token.as_str()),
+            ("authorization", "Bearer read"),
+        ],
+        vec![
+            ("x-sirius-token", token.as_str()),
+            ("x-sirius-token", token.as_str()),
+        ],
+    ] {
+        assert_eq!(
+            status(app.clone(), request("/api/v1/regions", &headers)).await,
+            401
+        );
+    }
+    assert_eq!(
+        status(
+            app,
+            request("/internal/v1/protocol", &[("x-sirius-token", &token)])
+        )
+        .await,
+        401
+    );
+}
+
+#[test]
+fn client_auth_secrets_are_bounded_and_independent() {
+    let mut cfg = config();
+    let auth = client_auth_config(5432);
+    cfg.client_auth = Some(auth.clone());
+    cfg.validate().unwrap();
+    let mut shared = cfg.clone();
+    shared.client_auth.as_mut().unwrap().signing_key_env = shared.api_token_env.clone();
+    assert!(shared.validate().is_err());
+    for change in [
+        |a: &mut crate::client_auth::Config| a.cache_seconds = 3601,
+        |a: &mut crate::client_auth::Config| a.cache_entries = 0,
+        |a: &mut crate::client_auth::Config| a.database.timeout_seconds = 0,
+        |a: &mut crate::client_auth::Config| a.database.max_connections = 65,
+        |a: &mut crate::client_auth::Config| a.database.host = "db.example/x".into(),
+        |a: &mut crate::client_auth::Config| a.signing_key_env = "BAD-NAME".into(),
+    ] {
+        let mut bad = auth.clone();
+        change(&mut bad);
+        assert!(bad.validate().is_err());
+    }
+    let region = crate::region::Region::Jp;
+    crate::client_auth::Authenticator::new(&auth, region, &[]).unwrap();
+    std::env::set_var(&auth.signing_key_env, "too-short");
+    assert!(crate::client_auth::Authenticator::new(&auth, region, &[]).is_err());
+    std::env::set_var(&auth.signing_key_env, CLIENT_KEY);
+    assert!(crate::client_auth::Authenticator::new(&auth, region, &[CLIENT_KEY.into()]).is_err());
+    let yaml = "signing_key_env: K\ndatabase: {host: 127.0.0.1, database: d, username: u, password_env: P}\nunknown: 1\n";
+    assert!(yaml_serde::from_str::<crate::client_auth::Config>(yaml).is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn client_tokens_check_credentials_region_grants_and_cache_against_postgres() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use axum::body::Body;
+    use sqlx::Connection;
+    let port: u16 = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut database = master_database_config();
+    database.port = port;
+    let mut conn = sqlx::PgConnection::connect_with(&database.options().unwrap())
+        .await
+        .unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS sirius_api_user_regions",
+        "DROP TABLE IF EXISTS sirius_api_users",
+        "CREATE TABLE sirius_api_users (id TEXT PRIMARY KEY, credential TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '')",
+        "CREATE TABLE sirius_api_user_regions (user_id TEXT NOT NULL REFERENCES sirius_api_users(id) ON DELETE CASCADE, region TEXT NOT NULL, PRIMARY KEY (user_id, region))",
+        "INSERT INTO sirius_api_users (id, credential) VALUES ('granted', 'secret-a'), ('elsewhere', 'secret-b')",
+        "INSERT INTO sirius_api_user_regions VALUES ('granted', 'jp'), ('elsewhere', 'tw')",
+    ] {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    let token = |uid: &str, credential: &str| {
+        client_token(
+            CLIENT_KEY.as_bytes(),
+            json!({"alg":"HS256","typ":"JWT"}),
+            json!({"uid":uid,"credential":credential}),
+        )
+    };
+    let build = |cache_seconds: u64| {
+        let mut cfg = config();
+        let mut auth = client_auth_config(port);
+        auth.cache_seconds = cache_seconds;
+        cfg.client_auth = Some(auth);
+        let client = GameClient::for_test(cfg);
+        (
+            client.clone(),
+            api::router(client, "read".into(), "admin".into()),
+        )
+    };
+    let status = |app: axum::Router, token: String| async move {
+        app.oneshot(
+            Request::get("/api/v1/regions")
+                .header("x-sirius-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    };
+    let (client, app) = build(60);
+    assert_eq!(status(app.clone(), token("granted", "secret-a")).await, 200);
+    assert_eq!(status(app.clone(), token("granted", "secret-x")).await, 401);
+    assert_eq!(status(app.clone(), token("missing", "secret-a")).await, 401);
+    assert_eq!(
+        status(app.clone(), token("elsewhere", "secret-b")).await,
+        403
+    );
+    assert_eq!(client.client_auth().unwrap().cached_entries(), 1);
+    // Revocation takes effect after the cache lifetime; with caching disabled, immediately.
+    sqlx::query("DELETE FROM sirius_api_user_regions WHERE user_id = 'granted'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(status(app, token("granted", "secret-a")).await, 200);
+    let (_, uncached) = build(0);
+    assert_eq!(status(uncached, token("granted", "secret-a")).await, 403);
+    for sql in [
+        "DROP TABLE sirius_api_user_regions",
+        "DROP TABLE sirius_api_users",
+    ] {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
 }

@@ -23,6 +23,10 @@ pub enum AppError {
     InvalidRequest,
     #[error("authentication required")]
     Unauthorized,
+    #[error("not authorized for this region")]
+    Forbidden,
+    #[error("client authorization is temporarily unavailable")]
+    AuthUnavailable,
     #[error("environment not found")]
     NotFound,
     #[error("game account is not configured")]
@@ -50,12 +54,14 @@ impl IntoResponse for AppError {
             Self::InvalidRequest => StatusCode::BAD_REQUEST,
             Self::ProtocolDefinition => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::NodeUnavailable
             | Self::PeerAccountUnavailable
             | Self::AccountUnavailable
             | Self::SnapshotUnavailable
             | Self::MasterUnavailable
+            | Self::AuthUnavailable
             | Self::Grpc(14) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::BAD_GATEWAY,
