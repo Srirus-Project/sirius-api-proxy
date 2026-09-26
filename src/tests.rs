@@ -15803,3 +15803,29 @@ regions:
         .is_err());
     }
 }
+
+#[tokio::test]
+async fn catalog_hash_fetch_honors_the_overall_update_deadline() {
+    let app = axum::Router::new().fallback(|| async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        "0123456789abcdef0123456789abcdef"
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let network = crate::master_update::Network {
+        request_timeout_ms: 60_000,
+        update_timeout_seconds: 1,
+        attempts: 1,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let result = crate::resources::fetch_catalog_hash(
+        &reqwest::Client::new(),
+        &network,
+        &format!("{origin}/asset/Android/catalog_1.0.0.104.hash"),
+        None,
+    )
+    .await;
+    assert!(matches!(result, Err(AppError::SnapshotUnavailable)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    server.abort();
+}

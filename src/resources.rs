@@ -103,27 +103,46 @@ pub(crate) async fn fetch_catalog_hash(
         }
         catalog_hash(&bytes).ok_or(UpdateError::Master)
     };
-    for attempt in 0..network.attempts {
-        match once().await {
-            Err(error) if network.retry(&error, attempt) => {
-                tokio::time::sleep(network.delay(attempt)).await
-            }
-            Ok(hash) => return Ok(hash),
-            Err(error) => {
-                let status = match error {
-                    UpdateError::Http(code) => Some(code),
-                    _ => None,
-                };
-                tracing::warn!(
-                    error_code = "catalog_hash_unavailable",
-                    status,
-                    "Global catalog hash request failed; resource snapshot stays unavailable"
-                );
-                return Err(AppError::SnapshotUnavailable);
+    // update_timeout_seconds bounds every attempt and retry delay together, as in Master
+    // updates; request_timeout_ms still bounds each single request.
+    let attempts = async {
+        for attempt in 0..network.attempts {
+            match once().await {
+                Err(error) if network.retry(&error, attempt) => {
+                    tokio::time::sleep(network.delay(attempt)).await
+                }
+                Ok(hash) => return Ok(hash),
+                Err(error) => {
+                    let status = match error {
+                        UpdateError::Http(code) => Some(code),
+                        _ => None,
+                    };
+                    tracing::warn!(
+                        error_code = "catalog_hash_unavailable",
+                        status,
+                        "Global catalog hash request failed; resource snapshot stays unavailable"
+                    );
+                    return Err(AppError::SnapshotUnavailable);
+                }
             }
         }
+        Err(AppError::SnapshotUnavailable)
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(network.update_timeout_seconds),
+        attempts,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                error_code = "catalog_hash_deadline",
+                "Global catalog hash request exceeded update_timeout_seconds; resource snapshot stays unavailable"
+            );
+            Err(AppError::SnapshotUnavailable)
+        }
     }
-    Err(AppError::SnapshotUnavailable)
 }
 #[cfg(test)]
 pub(crate) fn select(raw: &str, client: &str) -> Result<(String, String), AppError> {

@@ -156,9 +156,8 @@ any difference:
 
 The `.hash` request is one bounded GET: at most 256 bytes, no redirects, and the timeouts,
 attempts and optional proxy of `resource_snapshot.network`. The same fields as
-[`master_update.network`](MASTER_NETWORK.md) are accepted, except that `update_timeout_seconds`
-has no effect here: the request is bounded by `attempts` times `request_timeout_ms` plus the
-retry delays. The result, including a failure, is reused
+[`master_update.network`](MASTER_NETWORK.md) apply: `request_timeout_ms` bounds each request and
+`update_timeout_seconds` bounds all attempts and retry delays together. The result, including a failure, is reused
 for the same root and resource version for `catalog_hash_ttl_seconds` (default 60, 10–300).
 Builds are serialized, so repeated snapshot reads or dispatch polls never multiply CDN
 requests. No request is made until a snapshot is read or the [asset dispatch](ASSET_DISPATCH.md)

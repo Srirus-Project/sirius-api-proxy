@@ -353,7 +353,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | Root profile (`src/config.rs:5-70`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
 | `upstream` (`src/config.rs:72-84`) | all | `src/transport.rs:35-66`, `src/client.rs:157-158`, `:1002`, `:1022`, `:1130`, SDK proxy at `:1449-1462` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
-| `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. **`network.update_timeout_seconds` is validated but has no effect here**; see [Findings](#findings). |
+| `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
 | `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
 | `master_database`, `master_sync`, `master_notify`, `node_routing` (+ `transport`), `asset_dispatch`, `response_cache`, `tls`, `access_log`, `logging` | all, including `connection.max_read_connections` (1.2.1) | Cited in the tables above; unchanged in use since 1.2.0 |
 | `client_auth` (`src/client_auth.rs:20-48`) | all | `src/client_auth.rs:84-100`, `:132-145`, `src/client.rs:165-172` |
@@ -368,13 +368,12 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 
 ### Findings
 
-- **`resource_snapshot.network.update_timeout_seconds` is accepted and validated (1–3600) but
-  ignored.** `resource_snapshot.network` reuses the Master `Network` type (`src/config.rs:160-162`).
-  The Master updater uses `update_timeout_seconds` as its overall deadline
-  (`src/master_update.rs:196`); the catalog `.hash` fetch (`src/resources.rs:75-127`) has no
-  overall deadline and is bounded by `attempts` × (`request_timeout_ms` plus the retry delay)
-  instead. [REGIONS.md](REGIONS.md#resource-snapshots) now says so. Rejecting the key or
-  honoring it as a deadline is a behavior change left for a later release.
+- **`resource_snapshot.network.update_timeout_seconds` was accepted but ignored; fixed in 1.2.1.**
+  The review found that the catalog `.hash` fetch had no overall deadline. It now wraps every
+  attempt and retry delay in `update_timeout_seconds`, exactly as the Master updater does
+  (`src/resources.rs`, test `catalog_hash_fetch_honors_the_overall_update_deadline`).
+- **Release smoke script:** `scripts/smoke-release.py` expected HTTP 501 for a Global profile
+  lookup; Global now supports it, and without a configured account it returns 503. Updated.
 - One-shot commands honor a documented subset of the profile: `master-git-commit` and
   `master-git-push` ([Decision 7](#decisions)); `global-account verify` uses the profile's
   accounts, `global_login` and `upstream` but, like every one-shot command except
@@ -427,6 +426,6 @@ classification and evidence:
   `resource_snapshot.network` has its own proxy, and the fixed gRPC metadata set includes the
   Global headers.
 - **Reverse check:** added the [Sirius fields](#sirius-fields-reverse-check) table. One ignored
-  field was found (`resource_snapshot.network.update_timeout_seconds`), now documented.
+  field was found (`resource_snapshot.network.update_timeout_seconds`) and fixed; none remain.
 - **Examples:** the example test now parses every commented optional block of every shipped
   example.

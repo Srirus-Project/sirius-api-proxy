@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory() as tmp:
             assert code == 200 and regions["selected"] == "en"
             assert next(r for r in regions["regions"] if r["region"] == "cn")["reserved"]
             assert request("/api/v1/regions")[0] == 401
-            assert request("/api/v1/players/by-profile-id/1", env["SIRIUS_API_TOKEN"])[0] == 501
+            assert request("/api/v1/players/by-profile-id/1", env["SIRIUS_API_TOKEN"])[0] == 503  # Global route; no account configured
         finally:
             proc.terminate()
             try:
