@@ -74,7 +74,9 @@ Notes:
   number and keeps publishing it as `areaId` in `/api/v1/servers`.
 - `GetPlayerData` responses include the Global-only fields `chatReportUsedToday` and `roomIds`.
 - Upgrading from the earlier two-RPC Global bundle changes field names and file names, so a
-  running instance cannot hot-reload across that change; restart with the new bundle.
+  running instance cannot hot-reload across that change, and a 1.2.1 binary refuses to start on
+  the old bundle (`Error: ProtocolDefinition`). Replace a Global `protocol_directory` kept outside
+  the release package with the package's `protocol/global/1.0.1`, then restart.
 
 ## Master data
 

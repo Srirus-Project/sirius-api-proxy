@@ -22,7 +22,9 @@
 - `protocol/global/1.0.1` is now the client's own descriptor subset for these RPCs plus
   `PlayerLogin` (47 files), without Whoami. `ServerInfo` field 8 is validated by number; the client
   names it `areaID`, and `/api/v1/servers` keeps publishing `areaId`. The previous two-RPC bundle
-  cannot be hot-reloaded into the new one; restart.
+  cannot be hot-reloaded into the new one, and 1.2.1 refuses to start with it
+  (`Error: ProtocolDefinition`): a Global `protocol_directory` outside the release package must be
+  replaced with the package's `protocol/global/1.0.1` before restarting.
 - Global account status adds `session_state`, `last_login_at`, `logins_24h` and
   `last_error_code`. Response cache account scopes for Global use the account name and SDK uid,
   never the rotating credential. JP accounts and cache keys are unchanged.
