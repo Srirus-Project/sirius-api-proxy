@@ -5499,10 +5499,14 @@ async fn peer_transport_redirect_deadline_and_connection_failures_are_distinct()
         Policy::default(),
     )
     .unwrap();
+    // Windows retries a SYN answered by RST before reporting WSAECONNREFUSED, so a refused
+    // loopback connection takes about two seconds there instead of failing immediately. Give
+    // the call a deadline beyond that and the 5-second connect timeout, so the outcome is
+    // decided by the transport's connection failure and never by the overall request deadline.
     let error = transport
         .call(
             &request,
-            tokio::time::Instant::now() + Duration::from_secs(2),
+            tokio::time::Instant::now() + Duration::from_secs(10),
         )
         .await
         .err()
