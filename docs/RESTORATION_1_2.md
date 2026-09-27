@@ -222,14 +222,14 @@ live game system query, and served as the game API for the paired updater's full
 incremental end-to-end runs. Published archives were re-downloaded, checksum-verified and
 startup-tested. Global remains limited to verified discovery/version capabilities; CN is reserved.
 
-Post-1.2.0 (1.2.1, unreleased): Master Git `indented_root` layout and configurable branch for
+Post-1.2.0 (1.2.1): Master Git `indented_root` layout and configurable branch for
 public per-region Master repositories; asset-version provenance recorded with installations,
 exposed in manifests outside content identity and carried by owner-to-consumer sync. Native
 layout output is unchanged. Covered by real-Git tests (tree listing, byte-exact indentation,
 token-preservation property, dedup, table removal, missing provenance, branch/remote), updater
 and sync provenance tests; Linux and Windows CI.
 
-Post-1.2.0 (1.2.1, unreleased): Master data for TW/EN/KR (CN still reserved). The Global Master
+Post-1.2.0 (1.2.1): Master data for TW/EN/KR (CN still reserved). The Global Master
 CDN layout, encryption and unauthenticated access were verified live on 2026-09-26 with the
 user's approval. The JP-only gates in configuration, updater, registry, sync, notification,
 standalone registry, Git and database workers were lifted for Global. Anonymous CDN access is an
@@ -242,14 +242,14 @@ remote), same-region sync, cross-region rejection, notifications, CDN-authorizat
 region-recording imports and legacy receipts, and a four-region `master_update` + `master_git`
 publisher deployment. Linux and Windows CI.
 
-Post-1.2.0 (1.2.1, unreleased): the Traditional Chinese region identifier is renamed from `tw` to
+Post-1.2.0 (1.2.1): the Traditional Chinese region identifier is renamed from `tw` to
 `hk`, the name the game uses (CDN `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list). The
 ledger entries above keep the wording of their time. `tw` survives only as a deprecated
 configuration/CLI alias with a startup warning; snapshot receipts and Git state recorded as `tw`
 are read as `hk`, and nothing writes or serves `tw`. See
 [the `hk` identifier](REGIONS.md#the-hk-identifier).
 
-Post-1.2.0 (1.2.1, unreleased): Global resource snapshots (schema 3) from the VERSION body
+Post-1.2.0 (1.2.1): Global resource snapshots (schema 3) from the VERSION body
 `resourceVersion` plus the base catalog `.hash`. The Global asset CDN layout
 (`{CdnRoot}/asset/Android/catalog_{rv}[_{locale}].bin|.hash`, bundles in `{CdnRoot}/asset/Android`)
 and its unauthenticated access were verified live on 2026-09-26 with the user's approval; tests
@@ -258,7 +258,7 @@ use only local mocks. The tests cover snapshot creation for each Global region, 
 missing and redirected `.hash` responses, refusal of server-announced roots, Basic credential
 scope, configuration validation, and JP schema-2 stability. JP snapshots are unchanged.
 
-Post-1.2.0 (1.2.1, unreleased): Global (HK/EN/KR) player accounts and the JP operations on Global.
+Post-1.2.0 (1.2.1): Global (HK/EN/KR) player accounts and the JP operations on Global.
 SDK guest `tourist.login`/`cache.login`, PlayerLogin (area 6, channel 2001, brand 5, platform
 omitted) and GetPlayerData with `x-player-bid`/`x-player-id`/`x-player-credential`/
 `x-master-version`/`x-resource-version` were verified live on all three servers on 2026-09-26 with

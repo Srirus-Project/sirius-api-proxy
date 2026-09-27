@@ -20,7 +20,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
-The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version **1.2.1** is
+The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version **1.2.2** is
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 
@@ -33,11 +33,13 @@ Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejec
 network activity. Use one instance per region. JP retains its existing functionality; Global
 supports verified server discovery/version queries, player operations with SDK guest accounts, the Master data pipeline (download,
 registry, sync, Git and database publication) and schema-3 resource snapshots for the asset
-updater (`resource_snapshot`). A production end-to-end Global asset acceptance run is still
-pending. Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
-([Global accounts](docs/ACCOUNTS.md#global-accounts)); login and player data are live-verified,
-the other Global reads are implemented but not yet exercised live. See [region support and upgrade
-instructions](docs/REGIONS.md) before deploying paired v1.2.1 services.
+updater (`resource_snapshot`), with a production end-to-end Global asset acceptance (1.2.1).
+Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
+([Global accounts](docs/ACCOUNTS.md#global-accounts)); login, player data, announcements, song
+ranking and profile lookup are live-verified, event ranking/deck and challenge ranking are
+implemented but not yet exercised live. The Global servers do not share players: query the region
+that owns a profile ID. See [region support and upgrade instructions](docs/REGIONS.md) before
+deploying with Sirius Asset Updater 1.2.1 or later.
 
 ## Quick start
 
