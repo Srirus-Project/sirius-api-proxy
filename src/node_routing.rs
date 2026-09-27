@@ -342,5 +342,6 @@ fn failure_error(failure: Failure) -> AppError {
         Failure::Transport {} => AppError::Transport,
         Failure::Protocol {} => AppError::Protocol,
         Failure::Game { grpc_status } => AppError::Grpc(grpc_status),
+        Failure::NotFound {} => AppError::NotFound,
     }
 }

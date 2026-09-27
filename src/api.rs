@@ -230,7 +230,18 @@ fn operations(region: crate::region::Region) -> Value {
         Region::Cn => "reserved",
         Region::Jp if operation == "account_login" => "static_credentials",
         Region::Jp => "live_verified",
-        _ if matches!(operation, "version" | "account_login" | "player_data") => "live_verified",
+        _ if matches!(
+            operation,
+            "version"
+                | "account_login"
+                | "player_data"
+                | "announcements"
+                | "profile"
+                | "music_ranking"
+        ) =>
+        {
+            "live_verified"
+        }
         _ => "implemented_unverified",
     };
     let mut map = serde_json::Map::new();

@@ -54,14 +54,15 @@ and the account identity is the `PlayerLogin` result. JP credentials are never u
 | `account_login` | SDK `cache.login` + `PlayerLoginService/PlayerLogin` | `live_verified` |
 | `player_data` | `PlayerService/GetPlayerData` | `live_verified` |
 | `account_identity` | none (PlayerLogin result) | `implemented_unverified` |
-| `announcements` | `AnnouncementService/GetList`, `Get` | `implemented_unverified` |
-| `profile` | `FriendService/FindByProfileID` | `implemented_unverified` |
+| `announcements` | `AnnouncementService/GetList`, `Get` | `live_verified` |
+| `profile` | `FriendService/FindByProfileID` | `live_verified` |
 | `event_ranking` | `EventService/GetRankingList` | `implemented_unverified` |
 | `event_deck` | `EventService/GetDeck` | `implemented_unverified` |
-| `music_ranking` | `LiveMusicService/GetRanking` | `implemented_unverified` |
+| `music_ranking` | `LiveMusicService/GetRanking` | `live_verified` |
 | `challenge_ranking` | `EventService/GetChallengeMusicRanking` | `implemented_unverified` |
 
-`live_verified` was exercised against production on all three servers (2026-09-26).
+`live_verified` was exercised against production on all three servers (2026-09-26/27; for
+`profile`, a found player on HK and EN and the not-found answer on all three).
 `implemented_unverified` uses paths, request fields and authentication options identical to JP in
 the verified Global descriptors, and is covered by local mock tests only. JP reports
 `live_verified` for its operations, `static_credentials` for `account_login` and `unsupported`
@@ -70,6 +71,12 @@ for `servers`; CN reports `reserved`. `capability` is `jp_proxy`, `global_proxy`
 Notes:
 
 - Profile IDs, event IDs and player IDs are server-scoped: query the region that owns them.
+  One SDK guest identity gets a separate player on each server it logs in to. Live
+  (2026-09-27): a profile ID from another Global region answers exactly like an unknown one,
+  gRPC 2 with `x-sirius-error-code: PLAYER_NOT_FOUND`; the servers do not share players.
+- `PLAYER_NOT_FOUND` on `profile` or `event_deck` names the looked-up player: the proxy answers
+  404 and keeps the account session. On any other operation it still means the account's own
+  player and triggers a new PlayerLogin.
 - The client's descriptor names `ServerInfo` field 8 `areaID`. The proxy validates it by field
   number and keeps publishing it as `areaId` in `/api/v1/servers`.
 - `GetPlayerData` responses include the Global-only fields `chatReportUsedToday` and `roomIds`.

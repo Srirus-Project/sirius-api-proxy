@@ -5738,11 +5738,46 @@ async fn routing_mock(
                 1=>json!({"status":"failure","kind":{"type":"transport"}}),
                 2=>json!({"status":"failure","kind":{"type":"game","grpc_status":14}}),
                 3=>json!({"status":"failure","kind":{"type":"identity_mismatch"}}),
+                5=>json!({"status":"failure","kind":{"type":"not_found"}}),
                 _=>json!({"status":"success","data":{"node":name,"myRank":99,"myScore":88}}),
             };
             axum::Json(json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":outcome}))
         }
     }))).await
+}
+#[tokio::test]
+async fn node_routing_not_found_is_terminal_without_failover_or_cooldown() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let first_seen = Arc::new(AtomicUsize::new(0));
+    let second_seen = Arc::new(AtomicUsize::new(0));
+    let (first, a) = routing_mock("first", Arc::new(AtomicUsize::new(5)), first_seen.clone()).await;
+    let (second, b) =
+        routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![
+            routing_target("second", second, 20),
+            routing_target("first", first, 10),
+        ],
+        failure_threshold: 1,
+        cooldown_ms: 60000,
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    for n in 1..=2 {
+        assert!(matches!(
+            front
+                .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+                .await,
+            Err(AppError::NotFound)
+        ));
+        // A missing player is an answer, not a node fault: no failover, no cooldown.
+        assert_eq!(first_seen.load(Ordering::Relaxed), n);
+        assert_eq!(second_seen.load(Ordering::Relaxed), 0);
+    }
+    a.abort();
+    b.abort();
 }
 #[tokio::test]
 async fn node_routing_priorities_cooldown_single_probe_and_terminal_game_errors() {
@@ -15155,6 +15190,51 @@ mod global_accounts {
     }
 
     #[tokio::test]
+    async fn looked_up_player_not_found_keeps_the_session_and_answers_not_found() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        // Live 2026-09-27: another region's (or an unknown) profile ID answers gRPC 2 with
+        // PLAYER_NOT_FOUND about the target. Repeating it must not disable the account.
+        for _ in 0..3 {
+            e.script
+                .call_errors
+                .lock()
+                .unwrap()
+                .push_back((2, "PLAYER_NOT_FOUND"));
+            assert!(matches!(
+                c.public_call(crate::peer::Operation::Profile {
+                    profile_id: 99999999999
+                })
+                .await,
+                Err(AppError::NotFound)
+            ));
+        }
+        let s = status(&c);
+        assert_eq!(s["session_state"], "active");
+        assert_eq!(s["disabled"], false);
+        assert!(s.get("last_error_code").is_none());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        let last = e.f.received.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(last["x-player-credential"], "SECRETCRED-hk-1");
+        // Other codes on a lookup still describe the account's own session.
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(matches!(
+            c.public_call(crate::peer::Operation::Profile {
+                profile_id: 99999999999
+            })
+            .await,
+            Err(AppError::Grpc(16))
+        ));
+        assert_eq!(status(&c)["session_state"], "relogin_pending");
+    }
+
+    #[tokio::test]
     async fn ban_disables_and_login_queue_cools_down_without_polling() {
         for (errors, calls, expected) in [
             (vec![(7, "BAN_ACCOUNT")], vec![], "disabled"),
@@ -15411,12 +15491,12 @@ mod global_accounts {
             ("account_login", "live_verified"),
             ("player_data", "live_verified"),
             ("account_identity", "implemented_unverified"),
-            ("profile", "implemented_unverified"),
+            ("profile", "live_verified"),
             ("event_ranking", "implemented_unverified"),
             ("event_deck", "implemented_unverified"),
-            ("music_ranking", "implemented_unverified"),
+            ("music_ranking", "live_verified"),
             ("challenge_ranking", "implemented_unverified"),
-            ("announcements", "implemented_unverified"),
+            ("announcements", "live_verified"),
         ] {
             assert_eq!(en["operations"][operation], expected, "{operation}");
         }

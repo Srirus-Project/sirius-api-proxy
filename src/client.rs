@@ -22,6 +22,13 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
 use crate::accounts::Auth;
 
+/// Global `PLAYER_NOT_FOUND` on a lookup of another player names the target, not the account's
+/// own player: it must not drop the session or count toward disabling the account.
+fn target_not_found(route: &str, response: &Result<Value, AppError>, code: Option<&str>) -> bool {
+    matches!(route, PROFILE | EVENT_DECK)
+        && matches!(response, Err(AppError::Grpc(_)))
+        && code == Some("PLAYER_NOT_FOUND")
+}
 pub(crate) fn authenticated(route: &str) -> bool {
     matches!(
         route,
@@ -672,8 +679,16 @@ impl GameClient {
                     }
                     let (response, code) = if authenticated(route) {
                         // Authenticated reads are never replayed.
-                        self.execute_once(&protocol, route, input, auth.as_ref(), deadline)
-                            .await
+                        let (response, code) = self
+                            .execute_once(&protocol, route, input, auth.as_ref(), deadline)
+                            .await;
+                        if global && target_not_found(route, &response, code.as_deref()) {
+                            // The session worked; the looked-up player does not exist on this
+                            // server (including players of another Global region).
+                            (Err(AppError::NotFound), None)
+                        } else {
+                            (response, code)
+                        }
                     } else {
                         (
                             self.execute(&protocol, route, input, None, deadline).await,

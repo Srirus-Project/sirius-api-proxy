@@ -64,7 +64,10 @@ a reload from changing a queued request's contract before execution.
 
 HTTP 200 contains the request identity/id and a typed outcome: `status: success` with `data`,
 or `status: failure` with `kind`. The reply also carries the executor's sanitized `observation`. Failure types are `identity_mismatch`, `unsupported_operation`,
-`account_unavailable`, `unavailable_before_dispatch`, `timeout`, `transport`, `protocol`, or `game` with `grpc_status`.
+`account_unavailable`, `unavailable_before_dispatch`, `timeout`, `transport`, `protocol`, `not_found`
+(1.2.2: a Global looked-up player does not exist; terminal, no failover or node cooldown), or
+`game` with `grpc_status`. A pre-1.2.2 caller cannot parse `not_found` and records a protocol
+fault for that node, so upgrade routing callers before or together with their executors.
 The echoed identity binds the response to the request; an identity failure does not claim
 that identity was accepted. Malformed input and failed authorization use HTTP errors.
 Raw upstream diagnostics and credentials are never serialized. Account-relative `myRank` and

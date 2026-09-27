@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.2
+
+- Global `profile` and `event_deck` lookups: `PLAYER_NOT_FOUND` names the looked-up player, so
+  the proxy answers 404 and keeps the account session. 1.2.1 treated it as the account's own
+  player: every unknown or other-region profile ID dropped the session (a new PlayerLogin, subject
+  to `login_min_interval_seconds`), two in a row disabled the account, and the answer was 502.
+  Other codes on these lookups (for example `TOKEN_*`) still apply to the account.
+- Peer queries add the terminal failure kind `not_found` (no failover, no node cooldown).
+  Pre-1.2.2 routing callers cannot parse it; upgrade callers before or with their executors.
+- Live-verified on HK/EN/KR (2026-09-27): announcements, song ranking and profile lookup, now
+  reported as `live_verified` in `/api/v1/regions`. A profile ID from another Global region
+  answers like an unknown one: the servers do not share players, although one SDK guest identity
+  gets its own player on each server.
+
 ## 1.2.1
 
 - Global (HK/EN/KR) player accounts. An account references a private SDK guest identity file

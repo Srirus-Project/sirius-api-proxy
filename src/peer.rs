@@ -132,6 +132,7 @@ pub enum Failure {
     Transport {},
     Protocol {},
     Game { grpc_status: u16 },
+    NotFound {},
 }
 impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
@@ -143,6 +144,7 @@ impl From<AppError> for Failure {
             AppError::Transport | AppError::Proxy => Self::Transport {},
             AppError::Grpc(grpc_status) => Self::Game { grpc_status },
             AppError::PeerIdentityMismatch => Self::IdentityMismatch {},
+            AppError::NotFound => Self::NotFound {},
             _ => Self::Protocol {},
         }
     }
