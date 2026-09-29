@@ -7,7 +7,8 @@ RUN if [ "$VERSION" != "dev" ]; then grep -Fx "version = \"${VERSION#v}\"" Cargo
 RUN cargo build --release --locked
 
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates tzdata && addgroup -S sirius && adduser -S -G sirius sirius
+# git: master_git commits and pushes Master repositories by running the git executable.
+RUN apk add --no-cache ca-certificates tzdata git && addgroup -S sirius && adduser -S -G sirius sirius
 WORKDIR /app
 COPY --from=builder /app/LICENSE* /usr/share/licenses/sirius-api-proxy/
 COPY --from=builder /app/target/release/sirius-api-proxy /usr/local/bin/sirius-api-proxy

@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory() as tmp:
         docker("run", "--rm", "--network", "none", "--entrypoint", "sh", a.image,
                "-c", "test -w /app/downloads && test -w /app/exports")
     else:
+        # master_git runs the git executable inside the container.
+        docker("run", "--rm", "--network", "none", "--entrypoint", "git", a.image, "--version")
         container = docker("run", "-d", *options, a.image)
         try:
             for _ in range(60):

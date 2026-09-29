@@ -145,7 +145,7 @@ See [protocol updates](docs/PROTO_RELOAD.md) and [deployment checks](docs/DEPLOY
 
 ## Deployment and scope
 
-The Docker image contains the executable and protocol bundle. Mount configuration, supply
+The Docker image contains the executable, protocol bundle and the `git` executable used by `master_git`. Mount configuration, supply
 secrets and set `listen: 0.0.0.0:9999` inside the container. Persist `/app/master-data` if enabled.
 Restrict internal routes at the reverse proxy as well as through their separate token.
 
