@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.3
+
+- The Docker image includes `git`. `master_git` commits and pushes Master repositories by running
+  the git executable, which the 1.2.0–1.2.2 images did not contain, so Master publication failed
+  in the official container. The container smoke test now runs `git --version`.
+
 ## 1.2.2
 
 - Global `profile` and `event_deck` lookups: `PLAYER_NOT_FOUND` names the looked-up player, so
