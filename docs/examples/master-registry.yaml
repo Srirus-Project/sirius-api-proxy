@@ -17,7 +17,8 @@ backend:
 #     database: sirius_master
 #     username: sirius_reader
 #     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
-#     timeout_seconds: 30
+#     timeout_seconds: 30 # owner publication; also caps the default read deadline
+#     read_timeout_seconds: 30 # each read; with an owner, keep this short and raise timeout_seconds
 # Use a dedicated SELECT-only role on already initialized sirius_master_* tables.
 # tls:
 #   certificate_file: ./registry-cert.pem

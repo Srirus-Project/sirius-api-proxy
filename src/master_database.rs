@@ -42,8 +42,13 @@ pub struct Config {
     /// Only literal loopback IPs may opt out of TLS, for local tunnels/test servers.
     #[serde(default)]
     pub plaintext_loopback: bool,
+    /// Publication, import and migration deadline (also caps the default read deadline).
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
+    /// Deadline for registry/HTTP reads (default: the smaller of timeout_seconds and 30).
+    /// Independent of timeout_seconds, which keeps bounding publication, import and migration.
+    #[serde(default)]
+    pub read_timeout_seconds: Option<u64>,
     #[serde(default = "retention")]
     pub keep_snapshots: usize,
     /// Read pool size (registry and HTTP reads). Writers always use one connection:
@@ -63,6 +68,8 @@ fn retention() -> usize {
 fn read_connections() -> u32 {
     4
 }
+/// Waiting for a pooled/new read connection fails fast; the read deadline still bounds the whole read.
+const READ_ACQUIRE_LIMIT: Duration = Duration::from_secs(5);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Import {
@@ -93,6 +100,9 @@ impl Config {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
             || !(1..=600).contains(&self.timeout_seconds)
+            || self
+                .read_timeout_seconds
+                .is_some_and(|s| !(1..=600).contains(&s))
             || !(1..=10000).contains(&self.keep_snapshots)
             || !(1..=64).contains(&self.max_read_connections)
             || (self.plaintext_loopback
@@ -112,10 +122,29 @@ impl Config {
         }
         Ok(())
     }
+    pub(crate) fn read_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.read_timeout_seconds
+                .unwrap_or(self.timeout_seconds.min(30)),
+        )
+    }
+    /// Writer options: server statement/lock deadlines follow timeout_seconds.
     pub(crate) fn options(&self) -> Result<PgConnectOptions, Error> {
         self.options_named("sirius-master-database")
     }
     pub(crate) fn options_named(&self, application: &str) -> Result<PgConnectOptions, Error> {
+        self.connect_options(application, Duration::from_secs(self.timeout_seconds))
+    }
+    /// Reader options: a read the client abandons, or one queued behind a lock, is also cancelled
+    /// by the server at the read deadline instead of running on for the writer budget.
+    pub(crate) fn read_options(&self) -> Result<PgConnectOptions, Error> {
+        self.connect_options("sirius-master-database", self.read_timeout())
+    }
+    fn connect_options(
+        &self,
+        application: &str,
+        deadline: Duration,
+    ) -> Result<PgConnectOptions, Error> {
         self.validate()?;
         // SQLx's defaults read PG* options, including client certificate/key paths. Reject ambient
         // libpq configuration that would survive the explicit settings below instead of
@@ -140,11 +169,8 @@ impl Config {
                 PgSslMode::VerifyFull
             })
             .options([
-                (
-                    "statement_timeout",
-                    (self.timeout_seconds * 1000).to_string(),
-                ),
-                ("lock_timeout", (self.timeout_seconds * 1000).to_string()),
+                ("statement_timeout", deadline.as_millis().to_string()),
+                ("lock_timeout", deadline.as_millis().to_string()),
             ])
             .disable_statement_logging();
         if let Some(path) = &self.root_certificate {
@@ -154,7 +180,7 @@ impl Config {
     }
 }
 /// libpq environment variables that SQLx 0.9 `PgConnectOptions::new_without_pgpass()` reads and
-/// whose values would survive the explicit configuration in `options_named`: a trust root when
+/// whose values would survive the explicit configuration in `connect_options`: a trust root when
 /// none is configured, a client certificate/key, and server options appended to our own.
 ///
 /// SQLx also reads PGHOST, PGHOSTADDR, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE and
@@ -574,6 +600,7 @@ pub struct Reader {
     pool: std::sync::Arc<tokio::sync::OnceCell<PgPool>>,
     options: PgConnectOptions,
     timeout: Duration,
+    acquire: Duration,
     connections: u32,
 }
 #[derive(Serialize)]
@@ -645,20 +672,30 @@ pub struct HistoryPage {
 }
 impl Reader {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let timeout = Duration::from_secs(config.timeout_seconds);
+        let timeout = config.read_timeout();
         Ok(Self {
             pool: Default::default(),
-            options: config.options()?,
+            options: config.read_options()?,
             timeout,
+            acquire: timeout.min(READ_ACQUIRE_LIMIT),
             connections: config.max_read_connections,
         })
+    }
+    /// Read deadline, pool acquire limit and server options (no credentials). No network I/O.
+    #[cfg(test)]
+    pub(crate) async fn limits(&self) -> (Duration, Duration, Option<String>) {
+        (
+            self.timeout,
+            self.pool().await.options().get_acquire_timeout(),
+            self.options.get_options().map(str::to_owned),
+        )
     }
     async fn pool(&self) -> &PgPool {
         self.pool
             .get_or_init(|| async {
                 PgPoolOptions::new()
                     .max_connections(self.connections)
-                    .acquire_timeout(self.timeout)
+                    .acquire_timeout(self.acquire)
                     .connect_lazy_with(self.options.clone())
             })
             .await

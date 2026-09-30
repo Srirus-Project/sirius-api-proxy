@@ -93,6 +93,7 @@ impl Config {
             root_certificate: d.root_certificate.clone(),
             plaintext_loopback: d.plaintext_loopback,
             timeout_seconds: d.timeout_seconds,
+            read_timeout_seconds: None,
             keep_snapshots: 1,
             max_read_connections: d.max_connections,
         }

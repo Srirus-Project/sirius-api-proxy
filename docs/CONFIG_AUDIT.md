@@ -95,8 +95,8 @@ Original: `DatabaseConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:102-115`.
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | Presence of the per-region `client_auth` section (`src/config.rs:25`, read at `src/client.rs:165-172`) | Original use: the SeaORM `sekai_users` / `sekai_user_servers` tables behind the JWT middleware (`Haruki-Sekai-API@07da6b80:src/db.rs:9-45`). Sirius reads `sirius_api_users` / `sirius_api_user_regions` and never creates or changes the schema ([CLIENT_AUTH.md](CLIENT_AUTH.md)). |
-| `dsn` | ADAPTED | `client_auth.database.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds}` (`src/client_auth.rs:34-45`) | PostgreSQL only. Verified TLS unless loopback, password from an env reference, ambient libpq client settings SQLx would inherit (`PGSSLROOTCERT`/`PGSSLCERT`/`PGSSLKEY`/`PGOPTIONS`) rejected (transport shared with the Master mirror, `src/client_auth.rs:84-100`, `src/master_database.rs:118-125,155-170`). |
-| `max_connections` (default 10) | ADAPTED | `client_auth.database.max_connections` (default 4, 1–64; `src/client_auth.rs:46-47`, `:61-63`) | Validated through the shared connection policy (`src/client_auth.rs:82`, `:97`, `src/master_database.rs:97`) and used as the pool size (`src/client_auth.rs:140`). |
+| `dsn` | ADAPTED | `client_auth.database.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds}` (`src/client_auth.rs:34-45`) | PostgreSQL only. Verified TLS unless loopback, password from an env reference, ambient libpq client settings SQLx would inherit (`PGSSLROOTCERT`/`PGSSLCERT`/`PGSSLKEY`/`PGOPTIONS`) rejected (transport shared with the Master mirror, `src/client_auth.rs:84-100`, `src/master_database.rs:148-154,182-196`). |
+| `max_connections` (default 10) | ADAPTED | `client_auth.database.max_connections` (default 4, 1–64; `src/client_auth.rs:46-47`, `:61-63`) | Validated through the shared connection policy (`src/client_auth.rs:82`, `:97`, `src/master_database.rs:107`) and used as the pool size (`src/client_auth.rs:140`). |
 | `ingest_concurrency` | IGNORED_BY_ORIGINAL | none | Only read from `master_database` (`Haruki-Sekai-API@07da6b80:src/bin/run_ingest.rs:32`, `Haruki-Sekai-API@07da6b80:src/updater/scheduler.rs:124`, `:175`). On `database` it has no effect in the original. |
 | `driver` (example only) | IGNORED_BY_ORIGINAL | none | Not a struct field. Sirius is PostgreSQL only. |
 
@@ -107,9 +107,9 @@ Original: `DatabaseConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:102-115`.
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | Presence of `master_database` (`src/config.rs:9`), JP/HK/EN/KR (CN rejected) and requires `master_directory` (`src/master_database_worker.rs:20-35`) | Sirius stores the verified generic JSON documents plus JSONB. It does not use the original's Sekai Ent-typed tables, which the restoration objective excludes. |
-| `dsn` | ADAPTED | `connection.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds, keep_snapshots}` (`src/master_database.rs:32-53`) | The secret moved into an env var; TLS is required unless loopback. |
-| `max_connections` | ADAPTED | `connection.max_read_connections` (default 4, 1–64; `src/master_database.rs:49-52`, `:63-65`, `:97`) sizes the read pool (`:646-664`) | Writers intentionally use one connection (`src/master_database.rs:227-228`, `:419-420`) because publication and migration are single serialized transactions. |
-| `ingest_concurrency` | ADAPTED | none needed | The original knob bounded parallel per-table ingest memory (`Haruki-Sekai-API@07da6b80:src/ingest_engine.rs:25`). Sirius publishes each snapshot in one serial transaction (`src/master_database.rs:218-238`, `:275`), so there is no parallelism to bound. |
+| `dsn` | ADAPTED | `connection.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds, read_timeout_seconds, keep_snapshots}` (`src/master_database.rs:32-58`); `read_timeout_seconds` (1.3.0; 1–600, default min(`timeout_seconds`, 30)) is validated at `:103-105` and read by `read_timeout`/`read_options` (`:125-130`, `:140-142`) in `Reader::new` (`:674-683`) | The secret moved into an env var; TLS is required unless loopback. `timeout_seconds` bounds publication, import and migration; reads have their own deadline ([Decision 17](#decisions)). |
+| `max_connections` | ADAPTED | `connection.max_read_connections` (default 4, 1–64; `src/master_database.rs:54-57`, `:68-70`, `:107`) sizes the read pool (`:673-702`) | Writers intentionally use one connection (`src/master_database.rs:253-254`, `:445-446`) because publication and migration are single serialized transactions. |
+| `ingest_concurrency` | ADAPTED | none needed | The original knob bounded parallel per-table ingest memory (`Haruki-Sekai-API@07da6b80:src/ingest_engine.rs:25`). Sirius publishes each snapshot in one serial transaction (`src/master_database.rs:244-264`, `:301`), so there is no parallelism to bound. |
 | `driver` (example only) | IGNORED_BY_ORIGINAL | none | Not a struct field. |
 
 ## `git`
@@ -253,7 +253,7 @@ Other environment reads in Sirius:
   `global_login.sdk_app_key_env` (same default, `src/global_account.rs:48-60`, `src/client.rs:1448`).
 - PostgreSQL connections refuse to start while `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` or
   `PGOPTIONS` is set; other SQLx-read `PG*` variables are always overridden by explicit
-  configuration (`src/master_database.rs:118-125,155-170`).
+  configuration (`src/master_database.rs:148-154,182-196`).
 
 ## Decisions
 
@@ -270,7 +270,7 @@ These generic capabilities are intentionally not restored in their original form
 
    A partial download therefore cannot publish. File-store snapshots are never deleted by Sirius.
    Git keeps every earlier commit. The PostgreSQL mirror only drops whole snapshots beyond
-   `keep_snapshots` (`src/master_database.rs:367-368`). A table that upstream really drops is
+   `keep_snapshots` (`src/master_database.rs:393-394`). A table that upstream really drops is
    absent from the next snapshot, as the manifest says, and all earlier snapshots remain
    readable. No ratio threshold would prevent a verified manifest from being published.
 2. **Cron syntax became fixed intervals.** `master_update.interval_seconds`,
@@ -434,13 +434,28 @@ These generic capabilities are intentionally not restored in their original form
    Sirius PostgreSQL history kept only scope, content hash and time, and did not return the time;
    once a snapshot was pruned, nothing said what it had been. Since 1.3.0 every event also stores
    the Master `version`, asset `resource_version`, file count and plaintext byte total, and the
-   history API returns them with `published_at` (`src/master_database.rs:253-265`, `:353-361`,
-   `:579-640`, `:756-777`); file history adds `resource_version` (`src/master_registry.rs:394-404`).
+   history API returns them with `published_at` (`src/master_database.rs:279-291`, `:379-387`,
+   `:606-667`, `:793-814`); file history adds `resource_version` (`src/master_registry.rs:394-404`).
    Differences: `app_version` and `cdn_version` are Sekai concepts and are not restored; a Git
    commit is not recorded, because Git is an asynchronous downstream mirror and one content hash
    can map to several commits; events written before 1.3.0 are not backfilled and report null;
-   the migration receipt hash keeps its 1.2 format (`src/master_database.rs:434-482`). No
+   the migration receipt hash keeps its 1.2 format (`src/master_database.rs:460-508`). No
    configuration is added.
+17. **PostgreSQL reads get their own deadline, without a breaker or fallback.** The original
+   registry blob store gives reads a 2-second budget, trips a 5-second breaker and falls back
+   to disk (`Haruki-Sekai-API@9a53714:src/registry/blobs.rs:71-84`, `:439-530`, `:714-728`).
+   Before 1.3.0 one Sirius `timeout_seconds` (default 120) bounded publication and every read,
+   including the read pool's acquire wait and each read connection's server
+   `statement_timeout`/`lock_timeout`. Since 1.3.0 `connection.read_timeout_seconds` (1–600,
+   default min(`timeout_seconds`, 30)) bounds each HTTP/registry read end to end and sets those
+   server timeouts on read connections only, and waiting for a read connection gives up after
+   5 s, or the read deadline if shorter (`src/master_database.rs:72`, `:125-180`, `:674-702`).
+   Differences: the default is not 2 s, because a verified read decodes, hashes and checks tables
+   of up to 64 MiB inside the deadline; there is no breaker and no fallback, because Sirius
+   backends never fall back to each other and no production deployment reads Master data from
+   PostgreSQL yet, so a breaker would only turn a 503 after 5 s into an immediate 503. An expired
+   read answers the existing 503 `master_unavailable`. Publication, import and migration keep
+   `timeout_seconds`.
 
 ## Original fields that were ignored by the original itself
 
@@ -471,7 +486,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
 | `master_git` (`src/master_git_worker.rs:9-27`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) and `timeout_seconds` (1.3.0) | `src/master_git_worker.rs:37-44`, `:163-182`, `:222`; `src/master_git.rs:302-326`, `:904-935`; `timeout_seconds` through `options()` (`src/master_git_worker.rs:42`) into the publication deadline (`src/master_git.rs:100-102`, `:665`); CLI subset (commit, push and, since 1.3.0, adopt with scope, `layout`, `branch` and `timeout_seconds` only) in [Decision 7](#decisions) |
-| `master_database`, `master_sync`, `master_notify`, `node_routing` (+ `transport`), `asset_dispatch`, `response_cache`, `tls`, `access_log`, `logging` | all, including `connection.max_read_connections` (1.2.1) | Cited in the tables above; unchanged in use since 1.2.0 |
+| `master_database`, `master_sync`, `master_notify`, `node_routing` (+ `transport`), `asset_dispatch`, `response_cache`, `tls`, `access_log`, `logging` | all, including `connection.max_read_connections` (1.2.1) and `connection.read_timeout_seconds` (1.3.0) | Cited in the tables above; unchanged in use since 1.2.0 except `read_timeout_seconds`, read only by `Reader::new` (`src/master_database.rs:674-683`); the writers (`master_database_worker`, the registry owner and the `master-db-*` CLI) accept and ignore it |
 | `client_auth` (`src/client_auth.rs:20-48`) | all | `src/client_auth.rs:84-100`, `:132-145`, `src/client.rs:165-172` |
 | `accounts[]` (`src/accounts.rs:24-34`), `account_pool` (`:35-48`) | all, including `global_identity_file` (1.2.1) | `src/accounts.rs:81-101`, `:333-344`, `:346-429`, `:619-650`; path health since 1.3.0: `src/path_health.rs:74-83`, `src/client.rs:569-596` ([Decision 12](#decisions)) |
 | `global_login` (1.2.1, `src/global_account.rs:29-47`) | `sdk_origin`, `sdk_app_key_env`, `sdk_timeout_ms` | `src/client.rs:1445-1471` |
@@ -480,7 +495,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | Global identity file (1.2.1, `src/global_account.rs:83-106`, `src/global_sdk.rs:50-69`) | `schema`, `sdk.{uid, access_key, id_token, mid}`, `players.<region>.expected_player_id`, `device.{udid, model, pf_ver, dp, net, operators, adid, lang, time_zone, isRoot}`, `device.unity_{device_model, operating_system, device_id}` | `src/global_account.rs:127-162`, `:253-270`, `src/global_sdk.rs:101-114`, `:239-252`, `src/client.rs:854` |
 | `MultiConfig` (`src/deployment.rs:13-25`) | all; `regions` accepts the deprecated `tw` key (1.2.1) | `src/deployment.rs:156-201`, `:383-389`, `src/application_log.rs:78-93` |
 | Registry `Config`, `Backend` (`src/registry_service.rs:20-42`), `owner` (`src/registry_owner.rs:7-16`) | all | `src/registry_service.rs:56-247`, `src/registry_owner.rs:29-60`, `src/main.rs:11` |
-| `master-db-*` `Import` (`src/master_database.rs:66-73`) | `source`, `scope`, `database` | `src/main.rs:92-113` |
+| `master-db-*` `Import` (`src/master_database.rs:73-80`) | `source`, `scope`, `database` | `src/main.rs:92-113` |
 
 ### Findings
 
@@ -571,3 +586,7 @@ classification and evidence:
   `src/main.rs`, `src/master_git.rs` and `src/master_git_worker.rs` references are refreshed.
 - **History metadata:** new [Decision 16](#decisions). No field is added; the moved
   `src/master_database.rs` references in the `master_database` rows and Decision 1 are refreshed.
+- **Database read deadline:** new [Decision 17](#decisions). `connection.read_timeout_seconds`
+  is added to the `master_database` `dsn` row and the reverse check; the moved
+  `src/master_database.rs` references (including the environment variable list, Decisions 1 and
+  16 and the `client_auth` rows) are refreshed.

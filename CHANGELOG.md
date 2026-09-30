@@ -69,6 +69,13 @@
 - The first 1.3 publication or migration adds the history columns once (an exclusive lock on the
   history table for that transaction; the role must own it). 1.2.x readers and writers keep
   working against the upgraded table, and migration receipts written by 1.2.x still replay.
+- PostgreSQL Master reads (`/api/v1/master-data/database/*` and registry `backend: postgres`)
+  have their own deadline, `connection.read_timeout_seconds` (1–600, default
+  min(`timeout_seconds`, 30)), which also sets the read connections' server statement/lock
+  timeouts; waiting for a read connection gives up after 5 s. Reads that previously waited up to
+  `timeout_seconds` (default 120) now answer 503 `master_unavailable` sooner; set
+  `read_timeout_seconds` to keep the old budget. Publication, import and migration keep
+  `timeout_seconds`. No circuit breaker or file fallback is added.
 
 ## 1.2.4
 

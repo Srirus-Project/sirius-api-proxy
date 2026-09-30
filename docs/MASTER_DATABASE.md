@@ -44,7 +44,14 @@ identifiers are fixed and all data values use bound parameters.
 Scope is the serialized `{region, environment, platform}` object. A scoped publish, history
 entry, current-pointer switch and retention are atomic. An advisory transaction lock serializes
 writers and initial schema creation. Only one connection is used per import. The configured
-`timeout_seconds` bounds network/database work and sets server statement/lock deadlines.
+`timeout_seconds` (default 120, 1–600) bounds publication, import and migration end to end and
+sets their server statement/lock deadlines.
+`read_timeout_seconds` (1–600; defaults to the smaller of `timeout_seconds` and 30) is the
+separate deadline for HTTP and standalone registry reads. It bounds each read end to end,
+including connecting and verification, and sets that read connection's server
+`statement_timeout` and `lock_timeout`, so an abandoned read or one queued behind a lock is
+cancelled by PostgreSQL too. It is independent of `timeout_seconds` and may exceed it. An expired
+read answers 503 `master_unavailable`; there is no circuit breaker and no fallback to files.
 Local source verification precedes connection establishment; it retains the existing Master
 size/depth limits and loads the pinned snapshot into memory.
 
@@ -56,7 +63,8 @@ older local content can intentionally make that content current again.
 
 `keep_snapshots` defaults to 20 (range 1–10000) per scope, ordered by latest publication.
 `max_read_connections` (default 4, range 1–64) sizes the lazily opened read pool used by HTTP and
-standalone registry reads. Publication, import and migration always use a single connection because
+standalone registry reads. Waiting for a read connection is capped at 5 s (or the read deadline
+if shorter), so an exhausted pool surfaces as 503 after at most 5 s. Publication, import and migration always use a single connection because
 each runs as one serialized, advisory-locked transaction; a larger writer pool would add nothing.
 Pruning deletes old database documents through foreign keys, preserves current and other scopes,
 and leaves historical event hashes and every local file intact. History is not automatically
@@ -98,6 +106,7 @@ master_database:
     username: sirius_master
     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
     timeout_seconds: 120
+    read_timeout_seconds: 30
     keep_snapshots: 20
     max_read_connections: 4
 ```

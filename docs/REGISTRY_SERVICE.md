@@ -18,8 +18,10 @@ state directly, so it needs no local source files. It does not initialize or mut
 schema: first publish/import/migrate using the documented database writer, and grant the
 registry role SELECT access to the existing tables. Database passwords must differ from
 the registry bearer. Verified TLS, lazy bounded pooling, read deadlines and corruption
-checks match [the database mirror](MASTER_DATABASE.md). A database outage returns 503;
-there is no file fallback. Restart to rotate tokens or connection settings.
+checks match [the database mirror](MASTER_DATABASE.md). Reads use the connection's
+`read_timeout_seconds` (default the smaller of `timeout_seconds` and 30); with an owner worker,
+its database publication uses `timeout_seconds`, so the writer budget can stay long while reads
+stay short. A database outage or an expired read returns 503; there is no file fallback. Restart to rotate tokens or connection settings.
 
 ## Routes and consumers
 

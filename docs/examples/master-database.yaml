@@ -12,4 +12,5 @@ database:
   # root_certificate: /absolute/path/to/database-ca.pem
   plaintext_loopback: false
   timeout_seconds: 120
+  # read_timeout_seconds is accepted here but only used by readers (HTTP and registry).
   keep_snapshots: 20

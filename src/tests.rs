@@ -11644,6 +11644,7 @@ fn master_database_config() -> crate::master_database::Config {
         root_certificate: None,
         plaintext_loopback: true,
         timeout_seconds: 10,
+        read_timeout_seconds: None,
         keep_snapshots: 2,
         max_read_connections: 4,
     }
@@ -11695,6 +11696,139 @@ async fn master_database_policy_rejects_unsafe_transport_and_source_before_conne
         Err(Error::Snapshot)
     ));
     assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+}
+
+#[tokio::test]
+async fn master_database_read_deadline_is_bounded_defaulted_and_separate_from_writes() {
+    use crate::master_database as db;
+    use std::time::Duration;
+    let password = format!("SIRIUS_TEST_DB_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&password, "fixture-db-secret");
+    let mut good = master_database_config();
+    good.password_env = password;
+    // The client_auth-style literal (no read deadline) keeps validating.
+    good.validate().unwrap();
+    for seconds in [1, 600] {
+        let mut c = good.clone();
+        c.read_timeout_seconds = Some(seconds);
+        c.validate().unwrap();
+    }
+    for seconds in [0, 601] {
+        let mut c = good.clone();
+        c.read_timeout_seconds = Some(seconds);
+        assert!(c.validate().is_err());
+    }
+    let yaml = "host: 127.0.0.1\ndatabase: d\nusername: u\npassword_env: P\n";
+    let parsed: db::Config =
+        yaml_serde::from_str(&format!("{yaml}read_timeout_seconds: 5\n")).unwrap();
+    assert_eq!(parsed.read_timeout_seconds, Some(5));
+    assert_eq!(
+        yaml_serde::from_str::<db::Config>(yaml)
+            .unwrap()
+            .read_timeout_seconds,
+        None
+    );
+    assert!(yaml_serde::from_str::<db::Config>(&format!("{yaml}read_timeout_ms: 5\n")).is_err());
+    let mut c = good.clone();
+    c.timeout_seconds = 120;
+    assert_eq!(c.read_timeout(), Duration::from_secs(30));
+    c.timeout_seconds = 10;
+    assert_eq!(c.read_timeout(), Duration::from_secs(10));
+    c.read_timeout_seconds = Some(45);
+    assert_eq!(c.read_timeout(), Duration::from_secs(45));
+    // Writers keep timeout_seconds for their server deadlines; readers use the read deadline.
+    c.timeout_seconds = 120;
+    c.read_timeout_seconds = None;
+    let write = c.options_named("sirius-master-database").unwrap();
+    let write = write.get_options().unwrap();
+    assert!(write.contains("statement_timeout=120000"), "{write}");
+    assert!(write.contains("lock_timeout=120000"), "{write}");
+    let read = c.read_options().unwrap();
+    let read = read.get_options().unwrap().to_owned();
+    assert!(read.contains("statement_timeout=30000"), "{read}");
+    assert!(read.contains("lock_timeout=30000"), "{read}");
+    assert!(!read.contains("fixture-db-secret"));
+    let (deadline, acquire, options) = db::Reader::new(&c).unwrap().limits().await;
+    assert_eq!(
+        (deadline, acquire, options.as_deref()),
+        (
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            Some(read.as_str())
+        )
+    );
+    c.read_timeout_seconds = Some(2);
+    let (deadline, acquire, options) = db::Reader::new(&c).unwrap().limits().await;
+    assert_eq!(
+        (deadline, acquire),
+        (Duration::from_secs(2), Duration::from_secs(2))
+    );
+    let options = options.unwrap();
+    assert!(options.contains("statement_timeout=2000"), "{options}");
+    assert!(options.contains("lock_timeout=2000"), "{options}");
+}
+
+#[tokio::test]
+async fn master_database_reads_fail_fast_on_unresponsive_server_and_retry() {
+    use crate::master_database::{self as db, Error};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let password = format!("SIRIUS_TEST_DB_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&password, "fixture-db-secret");
+    // A black-hole PostgreSQL: connections are accepted and held open, but never answered.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+    let mut c = master_database_config();
+    c.password_env = password;
+    c.port = port;
+    c.timeout_seconds = 600;
+    c.read_timeout_seconds = Some(1);
+    let reader = db::Reader::new(&c).unwrap();
+    let scope = registry_scope();
+    let expect_fast = |started: Instant, result: Result<(), Error>| {
+        let error = result.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(matches!(error, Error::Timeout | Error::Database));
+        let text = error.to_string();
+        assert!(!text.contains("127.0.0.1") && !text.contains(&port.to_string()));
+    };
+    let started = Instant::now();
+    expect_fast(
+        started,
+        reader.document(&scope, None, None).await.map(|_| ()),
+    );
+    let started = Instant::now();
+    expect_fast(started, reader.history(&scope, 20, None).await.map(|_| ()));
+    let wait_for = |n: usize| {
+        let accepted = accepted.clone();
+        async move {
+            let started = Instant::now();
+            while accepted.load(Ordering::SeqCst) < n && started.elapsed() < Duration::from_secs(2)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            accepted.load(Ordering::SeqCst)
+        }
+    };
+    let seen = wait_for(1).await;
+    assert!(seen >= 1);
+    // No failure is latched: the next read tries the server again.
+    let started = Instant::now();
+    expect_fast(
+        started,
+        reader.document(&scope, None, None).await.map(|_| ()),
+    );
+    assert!(wait_for(seen + 1).await > seen);
+    server.abort();
 }
 
 #[tokio::test]
@@ -12523,6 +12657,44 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
     );
     assert!(remaining.entries.iter().all(|e| !e.retained));
     assert!(remaining.next_before.is_none());
+    // A read queued behind a lock ends at the read deadline (client and server side), not at
+    // the writer budget; reads that avoid the locked table and later writes are unaffected.
+    let mut short = connection.clone();
+    short.timeout_seconds = 600;
+    short.read_timeout_seconds = Some(1);
+    let short_reader = db::Reader::new(&short).unwrap();
+    let mut locker = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    let mut lock = locker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.sirius_master_history IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(short_reader.history(&scope, 20, None).await.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(
+        short_reader
+            .document(&scope, None, None)
+            .await
+            .unwrap()
+            .version,
+        "reader-v3"
+    );
+    lock.rollback().await.unwrap();
+    assert!(!short_reader
+        .history(&scope, 20, None)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(
+        !db::publish(&connection, &source, scope.clone())
+            .await
+            .unwrap()
+            .changed
+    );
     let (status, _, history) =
         request("/api/v1/master-data/database/history?limit=1".into(), None).await;
     assert_eq!(status, 200);

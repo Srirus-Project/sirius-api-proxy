@@ -181,6 +181,7 @@ response_cache:
 #     username: sirius_master
 #     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
 #     timeout_seconds: 120
+#     read_timeout_seconds: 30 # HTTP reads; default min(timeout_seconds, 30)
 #     keep_snapshots: 20
 #     max_read_connections: 4
 
