@@ -161,7 +161,8 @@ An invalid existing pointer/predecessor fails publication rather than silently s
 `GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
 (and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
 query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
-`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
+`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, nullable
+`resource_version` (the asset version in the snapshot's manifest, since 1.3.0), scoped content
 SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
 history: explicit reimports of identical content remain visible with equal content hashes;
 ordinary unchanged CDN/sync polls do not install and thus add no record. Read paths never call

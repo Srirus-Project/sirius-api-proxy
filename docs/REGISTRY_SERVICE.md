@@ -50,8 +50,12 @@ cover the adapted bytes, and manifests require revalidation. Verified table resp
 immutable private caching. Integrity verification precedes conditional 304 handling.
 
 History returns `{backend, history}`. File history contains committed snapshot IDs and uses
-`next_before` as its snapshot cursor. PostgreSQL history contains decimal-string sequences,
-content hashes and retention flags; use its `next_before` sequence cursor. Do not reuse a
+`next_before` as its snapshot cursor; since 1.3.0 its entries also include a nullable
+`resource_version`. PostgreSQL history contains decimal-string sequences, content hashes,
+retention flags, `published_at` and nullable `version`, `resource_version`, `file_count` and
+`total_size` (null on events written before 1.3.0, see
+[MASTER_DATABASE.md](MASTER_DATABASE.md#database-mirror-read-api)); use its `next_before` sequence
+cursor. Do not reuse a
 cursor after changing backends. History uses private `no-store` caching. The endpoint does
 not pretend that file installation chronology and database publication chronology are identical.
 

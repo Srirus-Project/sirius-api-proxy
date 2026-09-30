@@ -8822,6 +8822,68 @@ async fn master_history_pages_follow_commits_across_new_publications_and_reject_
     assert!(f.received.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn master_history_reports_resource_version() {
+    use crate::{master, master_registry as registry};
+    use axum::body::{to_bytes, Body};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let second =
+        master::import_directory_with_resource_version(&input, &output, &decoder, Some("asset-7"))
+            .unwrap();
+    let page = registry::history_page(&output, registry_scope(), 10, None).unwrap();
+    assert_eq!(page.entries[0].snapshot, second.snapshot);
+    assert_eq!(page.entries[0].resource_version.as_deref(), Some("asset-7"));
+    assert_eq!(page.entries[1].snapshot, first.snapshot);
+    assert!(page.entries[1].resource_version.is_none());
+    let check = |body: &Value| {
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["resource_version"], "asset-7");
+        // Serialized as an explicit null, like `published_at`.
+        assert!(entries[1]
+            .as_object()
+            .unwrap()
+            .get("resource_version")
+            .unwrap()
+            .is_null());
+    };
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/master-data/history")
+                .header("authorization", "Bearer api")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    check(&body(response).await);
+    let registry = standalone_registry_config(output.clone())
+        .prepare()
+        .unwrap()
+        .router;
+    let response = registry
+        .oneshot(
+            Request::get("/api/v1/master-data/history")
+                .header("authorization", "Bearer owner-read")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["backend"], "files");
+    check(&body["history"]);
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
 #[test]
 fn master_history_pagination_reads_more_than_one_hundred_installations_without_gaps() {
     use crate::{master, master_registry as registry};
@@ -11762,6 +11824,26 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
             .await
             .unwrap();
     assert_eq!(history, 3);
+    // Event metadata outlives payload retention.
+    let page = db::Reader::new(&cfg)
+        .unwrap()
+        .history(&scope, 20, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].version.as_deref(), Some("db-third"));
+    assert_eq!(page.entries[0].file_count, Some(third.tables as u64));
+    let oldest = &page.entries[2];
+    assert!(!oldest.retained);
+    assert_eq!(oldest.content_sha256, first.content_sha256);
+    assert_eq!(oldest.version, Some(master_fixture().0.version));
+    assert!(oldest.resource_version.is_none());
+    assert_eq!(oldest.file_count, Some(first.tables as u64));
+    assert_eq!(oldest.total_size, Some(first.bytes));
+    assert!(page
+        .entries
+        .windows(2)
+        .all(|pair| pair[0].published_at >= pair[1].published_at));
     let other_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
             .bind(other_key)
@@ -11796,6 +11878,135 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
     tls.plaintext_loopback = false;
     assert!(db::publish(&tls, &source, scope).await.is_err());
     assert!(registry::hash_valid(&third.content_sha256));
+}
+
+fn master_database_test_config() -> crate::master_database::Config {
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_postgres_steady_state_publish_takes_no_history_lock() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master, master_database as db};
+    use sqlx::Connection;
+    let cfg = master_database_test_config();
+    let mut scope = registry_scope();
+    scope.environment = format!("steady-{}", uuid::Uuid::new_v4().simple());
+    let (_root, input, source, _) = registry_fixture();
+    // Creates or upgrades the schema; later publications must find nothing to alter.
+    db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "steady-second".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    // An open history read holds ACCESS SHARE, which any ALTER TABLE would wait behind.
+    let mut reading = conn.begin().await.unwrap();
+    sqlx::query("SELECT id FROM public.sirius_master_history LIMIT 1")
+        .fetch_optional(&mut *reading)
+        .await
+        .unwrap();
+    let mut short = cfg.clone();
+    short.timeout_seconds = 5;
+    let receipt = db::publish(&short, &source, scope.clone()).await.unwrap();
+    assert!(receipt.changed);
+    reading.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_history_reads_legacy_schema_and_upgrades() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::master_database as db;
+    use sqlx::Connection;
+    let cfg = master_database_test_config();
+    let mut scope = registry_scope();
+    scope.environment = format!("legacy-{}", uuid::Uuid::new_v4().simple());
+    let (_root, _input, source, _) = registry_fixture();
+    let mut schema = scope.clone();
+    schema.environment.push_str("-schema");
+    db::publish(&cfg, &source, schema).await.unwrap();
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    // Set the shared table aside (instead of dropping columns, which would leave dropped
+    // attributes behind) and recreate the exact 1.2 table for the duration of the test.
+    sqlx::raw_sql(
+        "ALTER TABLE public.sirius_master_history RENAME TO sirius_master_history_c3_saved;
+ALTER INDEX public.sirius_master_history_scope RENAME TO sirius_master_history_scope_c3_saved;
+CREATE TABLE public.sirius_master_history (
+ id BIGSERIAL PRIMARY KEY, scope TEXT NOT NULL, content_hash TEXT NOT NULL,
+ published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX sirius_master_history_scope ON public.sirius_master_history(scope,id DESC);",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let outcome = tokio::spawn({
+        let (cfg, source) = (cfg.clone(), source.clone());
+        async move {
+            let key = serde_json::to_string(&scope).unwrap();
+            let legacy = "a".repeat(64);
+            let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO public.sirius_master_history(scope,content_hash) VALUES($1,$2)")
+                .bind(&key)
+                .bind(&legacy)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let reader = db::Reader::new(&cfg).unwrap();
+            let page = reader.history(&scope, 10, None).await.unwrap();
+            assert_eq!(page.entries.len(), 1);
+            let event = serde_json::to_value(&page.entries[0]).unwrap();
+            assert!(event["published_at"].is_string());
+            for field in ["version", "resource_version", "file_count", "total_size"] {
+                assert!(event[field].is_null(), "{field}");
+            }
+            let receipt = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+            assert!(receipt.changed);
+            // A 1.2.x writer lists its columns; its events read back without metadata.
+            sqlx::query("INSERT INTO public.sirius_master_history(scope,content_hash,published_at) VALUES($1,$2,CURRENT_TIMESTAMP)")
+                .bind(&key)
+                .bind(&receipt.content_sha256)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let page = reader.history(&scope, 10, None).await.unwrap();
+            assert_eq!(page.entries.len(), 3);
+            assert!(page.entries[0].version.is_none() && page.entries[0].retained);
+            let published = &page.entries[1];
+            assert_eq!(published.version, Some(master_fixture().0.version));
+            assert!(published.resource_version.is_none());
+            assert_eq!(published.file_count, Some(receipt.tables as u64));
+            assert_eq!(published.total_size, Some(receipt.bytes));
+            assert_eq!(page.entries[2].content_sha256, legacy);
+            assert!(page.entries[2].version.is_none() && page.entries[2].file_count.is_none());
+        }
+    })
+    .await;
+    sqlx::raw_sql(
+        "DROP TABLE public.sirius_master_history;
+ALTER TABLE public.sirius_master_history_c3_saved RENAME TO sirius_master_history;
+ALTER INDEX public.sirius_master_history_scope_c3_saved RENAME TO sirius_master_history_scope;",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    outcome.unwrap();
 }
 
 #[test]
@@ -12315,10 +12526,13 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
     let (status, _, history) =
         request("/api/v1/master-data/database/history?limit=1".into(), None).await;
     assert_eq!(status, 200);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&history).unwrap()["entries"][0]["content_sha256"],
-        fourth.content_sha256
-    );
+    let newest = &serde_json::from_slice::<Value>(&history).unwrap()["entries"][0];
+    assert_eq!(newest["content_sha256"], fourth.content_sha256);
+    assert_eq!(newest["version"], "reader-v3");
+    assert!(newest["resource_version"].is_null());
+    assert_eq!(newest["file_count"], fourth.tables);
+    assert_eq!(newest["total_size"], fourth.bytes);
+    assert!(chrono::DateTime::parse_from_rfc3339(newest["published_at"].as_str().unwrap()).is_ok());
     let mut other = scope.clone();
     other.environment.push_str("-missing");
     assert!(matches!(
@@ -12431,6 +12645,165 @@ async fn master_database_migration_verifies_committed_chain_before_connection() 
     assert_eq!(chain.entries.len(), 1);
 }
 
+/// The migration source-plan hash exactly as 1.2.x computed it: the History serialization of
+/// that release, which had no `resource_version` in its entries.
+fn legacy_migration_plan_digest(history: &crate::master_registry::History) -> String {
+    fn text<T: serde::Serialize + ?Sized>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+    let entries = history
+        .entries
+        .iter()
+        .map(|e| {
+            format!(
+                r#"{{"snapshot":{},"version":{},"content_sha256":{},"published_at":{},"file_count":{},"total_size":{}}}"#,
+                text(&e.snapshot),
+                text(&e.version),
+                text(&e.content_sha256),
+                text(&e.published_at),
+                e.file_count,
+                e.total_size
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::master_registry::digest(
+        format!(
+            r#"{{"schema_version":{},"scope":{},"head":{},"entries":[{entries}],"has_more":{},"next_before":{},"legacy_boundary":{}}}"#,
+            history.schema_version,
+            text(&history.scope),
+            text(&history.head),
+            history.has_more,
+            text(&history.next_before),
+            history.legacy_boundary
+        )
+        .as_bytes(),
+    )
+}
+
+#[test]
+fn master_database_migration_plan_digest_is_frozen() {
+    use crate::{master, master_database as db, master_registry as registry};
+    let (_root, input, source, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    master::import_directory_with_resource_version(&input, &source, &decoder, Some("asset-7"))
+        .unwrap();
+    let history = registry::committed_history(&source, registry_scope()).unwrap();
+    assert_eq!(history.entries.len(), 2);
+    assert_eq!(
+        history.entries[0].resource_version.as_deref(),
+        Some("asset-7")
+    );
+    assert!(history.entries[1].resource_version.is_none());
+    let digest = db::migration_plan_digest(&history).unwrap();
+    assert_eq!(digest, legacy_migration_plan_digest(&history));
+    // The public History shape moved on; the durable receipt format did not.
+    assert_ne!(
+        digest,
+        registry::digest(&serde_json::to_vec(&history).unwrap())
+    );
+}
+
+#[test]
+fn master_database_history_rows_validate_metadata() {
+    use crate::master_database::{self as db, Error, HistoryRow};
+    let hash = "ab".repeat(32);
+    let row = || HistoryRow {
+        id: 7,
+        content_hash: hash.clone(),
+        retained: false,
+        published_at: Some("2026-10-01T02:03:04.123456Z".into()),
+        version: Some("1.2.3/0123456789abcdef0123456789abcdef".into()),
+        resource_version: Some("asset-7".into()),
+        file_count: Some(2),
+        total_size: Some(4096),
+    };
+    let entry = serde_json::to_value(db::history_entry(row()).ok().unwrap()).unwrap();
+    assert_eq!(
+        entry,
+        json!({
+            "sequence": "7",
+            "content_sha256": hash,
+            "retained": false,
+            "published_at": "2026-10-01T02:03:04.123456Z",
+            "version": "1.2.3/0123456789abcdef0123456789abcdef",
+            "resource_version": "asset-7",
+            "file_count": 2,
+            "total_size": 4096,
+        })
+    );
+    // Offsets are normalized to UTC.
+    let mut offset = row();
+    offset.published_at = Some("2026-10-01T11:03:04+09:00".into());
+    let entry = serde_json::to_value(db::history_entry(offset).ok().unwrap()).unwrap();
+    assert_eq!(entry["published_at"], "2026-10-01T02:03:04Z");
+    // Events written before 1.3.0 (or by a 1.2.x writer) carry no metadata.
+    let mut legacy = row();
+    legacy.version = None;
+    legacy.resource_version = None;
+    legacy.file_count = None;
+    legacy.total_size = None;
+    let entry = serde_json::to_value(db::history_entry(legacy).ok().unwrap()).unwrap();
+    for field in ["version", "resource_version", "file_count", "total_size"] {
+        assert!(entry[field].is_null(), "{field}");
+    }
+    assert!(entry["published_at"].is_string());
+    let mut unrecorded = row();
+    unrecorded.resource_version = None;
+    let entry = serde_json::to_value(db::history_entry(unrecorded).ok().unwrap()).unwrap();
+    assert!(entry["resource_version"].is_null() && entry["version"].is_string());
+    let max_total = crate::master_registry::MAX_TOTAL as i64;
+    type Mutation = fn(&mut HistoryRow);
+    let invalid: [(&str, Mutation); 15] = [
+        ("version without totals", |r| r.file_count = None),
+        ("totals without version", |r| {
+            r.version = None;
+            r.resource_version = None;
+        }),
+        ("asset without version", |r| {
+            r.version = None;
+            r.file_count = None;
+            r.total_size = None;
+        }),
+        ("path version", |r| {
+            r.version = Some("../secret-version".into())
+        }),
+        ("path asset", |r| {
+            r.resource_version = Some("../secret-asset".into())
+        }),
+        ("long version", |r| r.version = Some("v".repeat(257))),
+        ("no files", |r| r.file_count = Some(0)),
+        ("negative files", |r| r.file_count = Some(-1)),
+        ("negative size", |r| r.total_size = Some(-4096)),
+        ("size below count", |r| r.total_size = Some(1)),
+        ("size over bound", |r| {
+            r.total_size = Some(crate::master_registry::MAX_TOTAL as i64 + 1)
+        }),
+        ("no time", |r| r.published_at = None),
+        ("bad time", |r| {
+            r.published_at = Some("not-a-time-4455".into())
+        }),
+        ("sequence", |r| r.id = 0),
+        ("hash", |r| r.content_hash = "secret-hash".into()),
+    ];
+    for (name, mutate) in invalid {
+        let mut bad = row();
+        mutate(&mut bad);
+        match db::history_entry(bad) {
+            Err(error @ Error::Integrity) => {
+                let text = error.to_string();
+                for value in ["secret", "4455", "vvvv", "4096"] {
+                    assert!(!text.contains(value), "{name}");
+                }
+            }
+            _ => panic!("{name} accepted"),
+        }
+    }
+    let mut bound = row();
+    bound.total_size = Some(max_total);
+    assert!(db::history_entry(bound).is_ok());
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
 async fn master_database_migration_atomic_order_retention_replay_and_conflict() {
@@ -12454,10 +12827,15 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        master::import_directory(&input, &source, &decoder).unwrap();
+        let asset = (version == "third").then_some("migration-asset-3");
+        master::import_directory_with_resource_version(&input, &source, &decoder, asset).unwrap();
     }
     let chain = registry::committed_history(&source, scope.clone()).unwrap();
     assert_eq!(chain.entries.len(), 4);
+    assert_eq!(
+        chain.entries[0].resource_version.as_deref(),
+        Some("migration-asset-3")
+    );
     let head = chain.head.clone();
     // Establish schema and a populated unrelated scope; migration must not overwrite it.
     let mut other = scope.clone();
@@ -12519,11 +12897,37 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
     assert_ne!(a.changed, b.changed);
     assert_eq!(a.source_sha256, b.source_sha256);
     assert_eq!(a.publications, 4);
-    let rows = sqlx::query("SELECT content_hash,published_at::text AS at FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
+    // The durable receipt keeps the 1.2 plan format, so scopes migrated by 1.2.x replay.
+    let stored: String = sqlx::query_scalar(
+        "SELECT source_hash FROM public.sirius_master_migrations WHERE scope=$1",
+    )
+    .bind(&key)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(stored, legacy_migration_plan_digest(&chain));
+    assert_eq!(a.source_sha256, stored);
+    let rows = sqlx::query("SELECT content_hash,published_at::text AS at,version,resource_version,file_count,total_size FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
         .bind(&key).fetch_all(&mut conn).await.unwrap();
     assert_eq!(rows.len(), 4);
     for (row, entry) in rows.iter().zip(&chain.entries) {
         assert_eq!(row.get::<String, _>("content_hash"), entry.content_sha256);
+        assert_eq!(
+            row.get::<Option<String>, _>("version"),
+            Some(entry.version.clone())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("resource_version"),
+            entry.resource_version
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("file_count"),
+            Some(entry.file_count as i64)
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("total_size"),
+            Some(entry.total_size as i64)
+        );
         let at: String = row.get("at");
         let parsed = chrono::DateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S%.f%#z").unwrap();
         assert_eq!(
@@ -12541,6 +12945,14 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
     let reader = db::Reader::new(&cfg).unwrap();
     let page = reader.history(&scope, 20, None).await.unwrap();
     assert_eq!(page.entries.iter().filter(|e| e.retained).count(), 3);
+    for (event, entry) in page.entries.iter().zip(&chain.entries) {
+        assert_eq!(event.version.as_ref(), Some(&entry.version));
+        assert_eq!(event.resource_version, entry.resource_version);
+        assert_eq!(
+            event.published_at.timestamp_micros(),
+            entry.published_at.unwrap().timestamp_micros()
+        );
+    }
     assert_eq!(registry::current_snapshot(&source).unwrap(), head);
     // A later normal publication advances CURRENT. Replaying the old migration receipt
     // must acknowledge it without rewinding that newer database state.
@@ -12896,6 +13308,16 @@ async fn standalone_registry_postgres_pinned_contract_consumer_and_outage() {
     let body: Value =
         serde_json::from_slice(&to_bytes(history.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["backend"], "postgres");
+    let entry = &body["history"]["entries"][0];
+    assert_eq!(entry["content_sha256"], manifest.content_sha256);
+    assert_eq!(entry["version"], manifest.version);
+    assert!(entry["resource_version"].is_null());
+    assert_eq!(entry["file_count"], manifest.files.len());
+    assert_eq!(
+        entry["total_size"],
+        manifest.files.iter().map(|f| f.size).sum::<u64>()
+    );
+    assert!(entry["published_at"].is_string());
     server.abort();
     connection.port = 1;
     cfg.backend = service::Backend::Postgres { connection };

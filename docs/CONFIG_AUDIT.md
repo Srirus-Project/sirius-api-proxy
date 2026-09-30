@@ -108,8 +108,8 @@ Original: `DatabaseConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:102-115`.
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | Presence of `master_database` (`src/config.rs:9`), JP/HK/EN/KR (CN rejected) and requires `master_directory` (`src/master_database_worker.rs:20-35`) | Sirius stores the verified generic JSON documents plus JSONB. It does not use the original's Sekai Ent-typed tables, which the restoration objective excludes. |
 | `dsn` | ADAPTED | `connection.{host, port, database, username, password_env, root_certificate, plaintext_loopback, timeout_seconds, keep_snapshots}` (`src/master_database.rs:32-53`) | The secret moved into an env var; TLS is required unless loopback. |
-| `max_connections` | ADAPTED | `connection.max_read_connections` (default 4, 1–64; `src/master_database.rs:49-52`, `:63-65`, `:97`) sizes the read pool (`:524-542`) | Writers intentionally use one connection (`src/master_database.rs:227-228`, `:403-404`) because publication and migration are single serialized transactions. |
-| `ingest_concurrency` | ADAPTED | none needed | The original knob bounded parallel per-table ingest memory (`Haruki-Sekai-API@07da6b80:src/ingest_engine.rs:25`). Sirius publishes each snapshot in one serial transaction (`src/master_database.rs:218-238`, `:263`), so there is no parallelism to bound. |
+| `max_connections` | ADAPTED | `connection.max_read_connections` (default 4, 1–64; `src/master_database.rs:49-52`, `:63-65`, `:97`) sizes the read pool (`:646-664`) | Writers intentionally use one connection (`src/master_database.rs:227-228`, `:419-420`) because publication and migration are single serialized transactions. |
+| `ingest_concurrency` | ADAPTED | none needed | The original knob bounded parallel per-table ingest memory (`Haruki-Sekai-API@07da6b80:src/ingest_engine.rs:25`). Sirius publishes each snapshot in one serial transaction (`src/master_database.rs:218-238`, `:275`), so there is no parallelism to bound. |
 | `driver` (example only) | IGNORED_BY_ORIGINAL | none | Not a struct field. |
 
 ## `git`
@@ -270,7 +270,7 @@ These generic capabilities are intentionally not restored in their original form
 
    A partial download therefore cannot publish. File-store snapshots are never deleted by Sirius.
    Git keeps every earlier commit. The PostgreSQL mirror only drops whole snapshots beyond
-   `keep_snapshots` (`src/master_database.rs:350-351`). A table that upstream really drops is
+   `keep_snapshots` (`src/master_database.rs:367-368`). A table that upstream really drops is
    absent from the next snapshot, as the manifest says, and all earlier snapshots remain
    readable. No ratio threshold would prevent a verified manifest from being published.
 2. **Cron syntax became fixed intervals.** `master_update.interval_seconds`,
@@ -428,6 +428,19 @@ These generic capabilities are intentionally not restored in their original form
    schema skip the early hit; the quarantine fallback reads other accounts' retained entries only
    with an explicit stale window, through bounded GETRANGE pipelines of at most four keys (not
    MGET), and never refreshes or reports health. No configuration is added.
+16. **Master history events carry generic metadata, not Sekai's publish record.** The original
+   registry records each publication with its versions and totals
+   (`Haruki-Sekai-API@9a53714:src/registry/state.rs:53-82`, `:329-361`). Before 1.3.0 the
+   Sirius PostgreSQL history kept only scope, content hash and time, and did not return the time;
+   once a snapshot was pruned, nothing said what it had been. Since 1.3.0 every event also stores
+   the Master `version`, asset `resource_version`, file count and plaintext byte total, and the
+   history API returns them with `published_at` (`src/master_database.rs:253-265`, `:353-361`,
+   `:579-640`, `:756-777`); file history adds `resource_version` (`src/master_registry.rs:394-404`).
+   Differences: `app_version` and `cdn_version` are Sekai concepts and are not restored; a Git
+   commit is not recorded, because Git is an asynchronous downstream mirror and one content hash
+   can map to several commits; events written before 1.3.0 are not backfilled and report null;
+   the migration receipt hash keeps its 1.2 format (`src/master_database.rs:434-482`). No
+   configuration is added.
 
 ## Original fields that were ignored by the original itself
 
@@ -556,3 +569,5 @@ classification and evidence:
   per-command timeout and low-speed abort; [Decision 7](#decisions) and the environment variable
   list add `SIRIUS_MASTER_GIT_TIMEOUT_SECONDS`. The `master_git` reverse-check row and the moved
   `src/main.rs`, `src/master_git.rs` and `src/master_git_worker.rs` references are refreshed.
+- **History metadata:** new [Decision 16](#decisions). No field is added; the moved
+  `src/master_database.rs` references in the `master_database` rows and Decision 1 are refreshed.

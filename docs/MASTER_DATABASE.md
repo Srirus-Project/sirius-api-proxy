@@ -38,6 +38,8 @@ identifiers are fixed and all data values use bound parameters.
   A GIN index supports PostgreSQL JSON containment queries without game-specific schemas.
 - `sirius_master_current`: current hash for each scope.
 - `sirius_master_history`: ordered publication events, retained independently of document retention.
+  Since 1.3.0 each event also records its Master `version`, asset `resource_version`, file count and
+  plaintext byte total.
 
 Scope is the serialized `{region, environment, platform}` object. A scoped publish, history
 entry, current-pointer switch and retention are atomic. An advisory transaction lock serializes
@@ -60,6 +62,26 @@ Pruning deletes old database documents through foreign keys, preserves current a
 and leaves historical event hashes and every local file intact. History is not automatically
 pruned. PostgreSQL JSONB's supported numeric/string range still applies; a value PostgreSQL
 cannot represent causes transaction rollback even though exact JSON bytes are also retained.
+
+### Schema upgrade from 1.2
+
+The first 1.3 publication or migration adds the four nullable history columns in its transaction.
+PostgreSQL does not rewrite the table for them, but the `ALTER TABLE` holds an exclusive lock on
+`sirius_master_history` until that transaction commits, so history reads wait for it (up to their
+deadline) once. Later publications check the catalog and do not alter the table again. The role
+must own the table, which is the case when the service created it. Otherwise that publication
+fails with the sanitized database error until an owner runs, once:
+
+```sql
+ALTER TABLE public.sirius_master_history ADD COLUMN IF NOT EXISTS version TEXT,
+ ADD COLUMN IF NOT EXISTS resource_version TEXT, ADD COLUMN IF NOT EXISTS file_count BIGINT,
+ ADD COLUMN IF NOT EXISTS total_size BIGINT;
+```
+
+Mixed versions are safe during a rollout. A 1.2.x reader ignores the new columns, and a 1.2.x
+writer names its columns, so its events read back with null metadata. A 1.3 reader also reads a
+table that has not been upgraded yet, reporting null metadata. Downgrading leaves the extra
+columns in place, where they are harmless.
 
 ## Background publication
 
@@ -104,12 +126,19 @@ an isolated PostgreSQL server with a `sirius_test` database and `postgres` user.
 `SIRIUS_TEST_POSTGRES_PORT` and `SIRIUS_TEST_POSTGRES_PASSWORD`, then run it with `--ignored`.
 It creates synthetic scoped data, injects a document-insert failure, exercises lock timeout and
 cancellation, verifies concurrent deduplication, retention/isolation and corruption refusal,
-and checks that verified TLS refuses a plaintext-only server. Never point it at production.
+and checks that verified TLS refuses a plaintext-only server. It also checks that a pruned event
+keeps its version, file count, byte total and publication time. Never point it at production.
+
+`master_database_postgres_steady_state_publish_takes_no_history_lock` publishes while another
+transaction reads the history table, proving that an upgraded schema is never altered again.
+`master_database_history_reads_legacy_schema_and_upgrades` temporarily sets the history table
+aside, recreates the 1.2 table, reads a 1.2 event, upgrades through a publication and writes an
+event the way a 1.2.x writer does. It restores the original table afterwards.
 
 The optional `master_database_worker_start_wake_retry_auth_and_shutdown` test exercises real
 startup publication, independent update hints, a failed database insert followed by timed recovery,
 internal route authorization/redaction, and shutdown during a blocked database transaction.
-The two PostgreSQL tests serialize their schema-failure fixtures within the test process.
+The PostgreSQL tests serialize their schema-failure fixtures within the test process.
 
 ## Database mirror read API
 
@@ -137,11 +166,25 @@ Manifest/table reads share a repeatable-read, read-only transaction, preventing 
 current-pointer changes from mixing versions within a response. Manifest and payload reads are
 bounded to 1 MiB and 64 MiB respectively on the database side before allocating response bytes.
 
-History returns `entries` containing decimal-string `sequence`, `content_sha256` and `retained`,
-plus optional `next_before`. Pass that cursor as `before` on the next request. Pages have 1–200
-entries; new publications do not shift an existing sequence cursor. Events remain after payload
-retention, and `retained` reflects availability when that page was read. History has `no-store`
-caching. Sequence identifiers are global database IDs; gaps within a scope are expected.
+History returns `entries` containing decimal-string `sequence`, `content_sha256`, `retained`,
+`published_at`, `version`, `resource_version`, `file_count` and `total_size`, plus optional
+`next_before`. Pass that cursor as `before` on the next request. Pages have 1–200 entries; new
+publications do not shift an existing sequence cursor. Events remain after payload retention, with
+their metadata, and `retained` reflects availability when that page was read. History has
+`no-store` caching. Sequence identifiers are global database IDs; gaps within a scope are expected.
+
+`published_at` is an RFC 3339 UTC time: the database transaction time for a publication, or the
+original file publication time for a migrated event. The other four fields describe the snapshot
+as it was published and are always present, but may be null:
+
+- `version`, `file_count` and `total_size` are null together on events written before 1.3.0 or by a
+  1.2.x writer. Older events are not backfilled.
+- `resource_version` is null when no asset version was recorded. It is taken from the published
+  manifest when the event is written; a later publication of identical tables that records an asset
+  version updates the retained manifest but not earlier events.
+
+A stored event with invalid metadata (an unsafe version, a partial set of fields or impossible
+totals) fails the page closed with 503, like an invalid hash. Values are never echoed.
 
 Each profile lazily opens a shared pool of at most four read connections; publication uses its
 separate single connection. The configured database deadline includes pool admission. Restart
@@ -150,8 +193,8 @@ The pool is initialized on the first authenticated valid request, not during con
 
 The optional `master_database_read_http_integrity_retention_history_and_scope` test uses real
 PostgreSQL through the actual HTTP router. It covers pinned bytes without local CURRENT,
-conditional reads, pruning/history pagination across new publication, scope isolation, corrupt
-and oversized rows, and database outage without local fallback.
+conditional reads, pruning/history pagination across new publication, history metadata, scope
+isolation, corrupt and oversized rows, and database outage without local fallback.
 
 ## One-time committed file-history migration
 
@@ -174,8 +217,12 @@ receipt commit in one transaction. Original publication times are preserved to P
 microsecond precision; the legacy boundary's unknown time uses the migration transaction time.
 Repeated consecutive content still preserves each committed file publication as an event.
 `keep_snapshots` retains the most recently published distinct content hashes, while every event
-remains. The additional `public.sirius_master_migrations` table stores the scoped source-plan
+remains. Migrated events carry each snapshot's version, recorded asset version, file count and
+byte total. The additional `public.sirius_master_migrations` table stores the scoped source-plan
 hash, head, publication count and legacy-boundary flag. It contains no credentials or paths.
+The source-plan hash keeps the 1.2 format: it covers each entry's snapshot, version, content hash,
+publication time, file count and byte total, not `resource_version`, so scopes migrated by 1.2.x
+still replay.
 
 Retrying the same source plan returns `changed: false` without duplicating events or rewinding
 subsequent database publications. A different plan in a previously migrated scope is refused;
@@ -190,6 +237,8 @@ by the durable receipt. Database writers use the same advisory lock, including b
 
 The optional PostgreSQL migration test injects a failure at the final receipt insert and verifies
 that no partial snapshots, documents, history, current or receipt survive. It also covers canceled
-lock admission, concurrent identical migration, exact chronology, retention, occupied-scope refusal,
-scope isolation and receipt replay after a newer publication. Default tests cover corrupt historical
-tables, cycles, orphan exclusion and the explicit legacy boundary without connecting to a database.
+lock admission, concurrent identical migration, exact chronology and event metadata, the 1.2
+receipt format, retention, occupied-scope refusal, scope isolation and receipt replay after a newer
+publication. Default tests cover corrupt historical tables, cycles, orphan exclusion, the explicit
+legacy boundary, the frozen receipt format and history row validation without connecting to a
+database.

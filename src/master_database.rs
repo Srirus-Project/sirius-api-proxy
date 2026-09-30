@@ -237,6 +237,9 @@ pub async fn publish(config: &Config, source: &Path, scope: Scope) -> Result<Rec
     .await
     .map_err(|_| Error::Timeout)?
 }
+// 1.3.0 added nullable per-event metadata to history (no backfill). Tables created by 1.2.x
+// are upgraded once: ALTER TABLE takes an exclusive lock even when every column exists, so it
+// only runs while a column is missing and steady-state publication never blocks history reads.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS public.sirius_master_snapshots (
  scope TEXT NOT NULL, content_hash TEXT NOT NULL, manifest BYTEA NOT NULL,
@@ -249,8 +252,17 @@ CREATE TABLE IF NOT EXISTS public.sirius_master_documents (
 CREATE INDEX IF NOT EXISTS sirius_master_documents_json ON public.sirius_master_documents USING GIN(document);
 CREATE TABLE IF NOT EXISTS public.sirius_master_history (
  id BIGSERIAL PRIMARY KEY, scope TEXT NOT NULL, content_hash TEXT NOT NULL,
- published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+ published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ version TEXT, resource_version TEXT, file_count BIGINT, total_size BIGINT);
 CREATE INDEX IF NOT EXISTS sirius_master_history_scope ON public.sirius_master_history(scope,id DESC);
+DO $$ BEGIN
+ IF (SELECT count(*) FROM pg_attribute WHERE attrelid='public.sirius_master_history'::regclass
+  AND attname IN ('version','resource_version','file_count','total_size') AND NOT attisdropped) < 4 THEN
+  ALTER TABLE public.sirius_master_history ADD COLUMN IF NOT EXISTS version TEXT,
+   ADD COLUMN IF NOT EXISTS resource_version TEXT, ADD COLUMN IF NOT EXISTS file_count BIGINT,
+   ADD COLUMN IF NOT EXISTS total_size BIGINT;
+ END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS public.sirius_master_current (
  scope TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
  FOREIGN KEY(scope, content_hash) REFERENCES public.sirius_master_snapshots(scope, content_hash));
@@ -338,10 +350,15 @@ async fn store_snapshot(
                 .execute(&mut **tx).await.map_err(|_| Error::Database)?;
         }
     }
+    let bytes: u64 = snapshot.tables.iter().map(|(f, _, _)| f.size).sum();
     let changed = publication.is_some() || current.as_ref() != Some(hash);
     if changed {
-        let sequence: i64 = sqlx::query_scalar("INSERT INTO public.sirius_master_history(scope,content_hash,published_at) VALUES($1,$2,COALESCE($3::text::timestamptz,CURRENT_TIMESTAMP)) RETURNING id")
-            .bind(&scope).bind(hash).bind(publication.flatten()).fetch_one(&mut **tx).await.map_err(|_| Error::Database)?;
+        // Events are immutable: each records the provenance known when it was written.
+        let total = i64::try_from(bytes).map_err(|_| Error::Snapshot)?;
+        let sequence: i64 = sqlx::query_scalar("INSERT INTO public.sirius_master_history(scope,content_hash,published_at,version,resource_version,file_count,total_size) VALUES($1,$2,COALESCE($3::text::timestamptz,CURRENT_TIMESTAMP),$4,$5,$6,$7) RETURNING id")
+            .bind(&scope).bind(hash).bind(publication.flatten()).bind(&snapshot.manifest.version)
+            .bind(snapshot.manifest.resource_version.as_deref()).bind(snapshot.tables.len() as i64).bind(total)
+            .fetch_one(&mut **tx).await.map_err(|_| Error::Database)?;
         sqlx::query("UPDATE public.sirius_master_snapshots SET touched=$3 WHERE scope=$1 AND content_hash=$2")
             .bind(&scope).bind(hash).bind(sequence).execute(&mut **tx).await.map_err(|_| Error::Database)?;
         sqlx::query("INSERT INTO public.sirius_master_current(scope,content_hash) VALUES($1,$2) ON CONFLICT(scope) DO UPDATE SET content_hash=EXCLUDED.content_hash")
@@ -352,7 +369,7 @@ async fn store_snapshot(
     Ok(Receipt {
         content_sha256: hash.clone(),
         tables: snapshot.tables.len(),
-        bytes: snapshot.tables.iter().map(|(f, _, _)| f.size).sum(),
+        bytes,
         changed,
     })
 }
@@ -395,8 +412,7 @@ pub async fn migrate_history(
     })
     .await
     .map_err(|_| Error::Snapshot)??;
-    let source_sha256 =
-        registry::digest(&serde_json::to_vec(&history).map_err(|_| Error::Snapshot)?);
+    let source_sha256 = migration_plan_digest(&history)?;
     let options = config.options()?;
     let duration = Duration::from_secs(config.timeout_seconds);
     tokio::time::timeout(duration, async {
@@ -413,6 +429,56 @@ pub async fn migrate_history(
     })
     .await
     .map_err(|_| Error::Timeout)?
+}
+
+/// Hash of a migration source plan, stored as the durable receipt in
+/// `sirius_master_migrations.source_hash` and compared on every replay. This is a frozen format:
+/// exactly the 1.2 serialization of `registry::History`. It must not follow History's public
+/// shape (1.3.0 added `resource_version` to entries), or replaying `master-db-migrate` on a scope
+/// migrated by an earlier release would be refused as an integrity conflict.
+pub(crate) fn migration_plan_digest(history: &registry::History) -> Result<String, Error> {
+    #[derive(Serialize)]
+    struct PlanV1<'a> {
+        schema_version: u32,
+        scope: &'a Scope,
+        head: &'a str,
+        entries: Vec<PlanEntryV1<'a>>,
+        has_more: bool,
+        next_before: Option<&'a str>,
+        legacy_boundary: bool,
+    }
+    #[derive(Serialize)]
+    struct PlanEntryV1<'a> {
+        snapshot: &'a str,
+        version: &'a str,
+        content_sha256: &'a str,
+        published_at: Option<chrono::DateTime<chrono::Utc>>,
+        file_count: usize,
+        total_size: u64,
+    }
+    let plan = PlanV1 {
+        schema_version: history.schema_version,
+        scope: &history.scope,
+        head: &history.head,
+        entries: history
+            .entries
+            .iter()
+            .map(|e| PlanEntryV1 {
+                snapshot: &e.snapshot,
+                version: &e.version,
+                content_sha256: &e.content_sha256,
+                published_at: e.published_at,
+                file_count: e.file_count,
+                total_size: e.total_size,
+            })
+            .collect(),
+        has_more: history.has_more,
+        next_before: history.next_before.as_deref(),
+        legacy_boundary: history.legacy_boundary,
+    };
+    Ok(registry::digest(
+        &serde_json::to_vec(&plan).map_err(|_| Error::Snapshot)?,
+    ))
 }
 
 async fn migrate_transaction(
@@ -515,6 +581,62 @@ pub struct HistoryEntry {
     pub sequence: String,
     pub content_sha256: String,
     pub retained: bool,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    /// Event metadata, null on events written before 1.3.0 or by a 1.2.x writer (no backfill).
+    /// With a version, a null `resource_version` means no asset version was recorded.
+    pub version: Option<String>,
+    pub resource_version: Option<String>,
+    pub file_count: Option<u64>,
+    pub total_size: Option<u64>,
+}
+/// One history row as read from the database, before validation.
+pub(crate) struct HistoryRow {
+    pub id: i64,
+    pub content_hash: String,
+    pub retained: bool,
+    pub published_at: Option<String>,
+    pub version: Option<String>,
+    pub resource_version: Option<String>,
+    pub file_count: Option<i64>,
+    pub total_size: Option<i64>,
+}
+/// Validate a stored event. Invalid rows fail closed without echoing any stored value.
+pub(crate) fn history_entry(row: HistoryRow) -> Result<HistoryEntry, Error> {
+    let published_at = row
+        .published_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .ok_or(Error::Integrity)?
+        .with_timezone(&chrono::Utc);
+    let (file_count, total_size) = match (&row.version, row.file_count, row.total_size) {
+        (None, None, None) => (None, None),
+        (Some(_), Some(count), Some(total))
+            if count >= 1 && count <= total && total as u64 <= registry::MAX_TOTAL =>
+        {
+            (Some(count as u64), Some(total as u64))
+        }
+        _ => return Err(Error::Integrity),
+    };
+    if row.id <= 0
+        || !registry::hash_valid(&row.content_hash)
+        || (row.resource_version.is_some() && row.version.is_none())
+        || [&row.version, &row.resource_version]
+            .into_iter()
+            .flatten()
+            .any(|v| !crate::master::safe_version(v))
+    {
+        return Err(Error::Integrity);
+    }
+    Ok(HistoryEntry {
+        sequence: row.id.to_string(),
+        content_sha256: row.content_hash,
+        retained: row.retained,
+        published_at,
+        version: row.version,
+        resource_version: row.resource_version,
+        file_count,
+        total_size,
+    })
 }
 #[derive(Serialize)]
 pub struct HistoryPage {
@@ -631,15 +753,25 @@ impl Reader {
         }
         let key = serde_json::to_string(scope).map_err(|_| Error::Config)?;
         tokio::time::timeout(self.timeout,async {
-            let rows=sqlx::query("SELECT h.id,h.content_hash,EXISTS(SELECT 1 FROM public.sirius_master_snapshots s WHERE s.scope=h.scope AND s.content_hash=h.content_hash) AS retained FROM public.sirius_master_history h WHERE h.scope=$1 AND ($2::bigint IS NULL OR h.id<$2) ORDER BY h.id DESC LIMIT $3")
+            // Metadata columns are read through to_jsonb, so a table not yet upgraded from 1.2
+            // reads them as null. Oversized text is cut one byte past the version bound, so it is
+            // still rejected rather than silently truncated; the time is rendered in UTC.
+            let rows=sqlx::query("SELECT h.id,h.content_hash,EXISTS(SELECT 1 FROM public.sirius_master_snapshots s WHERE s.scope=h.scope AND s.content_hash=h.content_hash) AS retained,to_char(h.published_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at,substr(to_jsonb(h)->>'version',1,257) AS version,substr(to_jsonb(h)->>'resource_version',1,257) AS resource_version,(to_jsonb(h)->>'file_count')::bigint AS file_count,(to_jsonb(h)->>'total_size')::bigint AS total_size FROM public.sirius_master_history h WHERE h.scope=$1 AND ($2::bigint IS NULL OR h.id<$2) ORDER BY h.id DESC LIMIT $3")
                 .bind(key).bind(before).bind((limit+1) as i64).fetch_all(self.pool().await).await.map_err(|_| Error::Database)?;
             let more=rows.len()>limit;
             let mut entries=Vec::new();
             for row in rows.into_iter().take(limit) {
-                let sequence:i64=row.try_get("id").map_err(|_| Error::Database)?;
-                let hash:String=row.try_get("content_hash").map_err(|_| Error::Database)?;
-                if sequence<=0 || !registry::hash_valid(&hash) {return Err(Error::Integrity);}
-                entries.push(HistoryEntry{sequence:sequence.to_string(),content_sha256:hash,retained:row.try_get("retained").map_err(|_| Error::Database)?});
+                let get=|_:sqlx::Error| Error::Database;
+                entries.push(history_entry(HistoryRow{
+                    id:row.try_get("id").map_err(get)?,
+                    content_hash:row.try_get("content_hash").map_err(get)?,
+                    retained:row.try_get("retained").map_err(get)?,
+                    published_at:row.try_get("published_at").map_err(get)?,
+                    version:row.try_get("version").map_err(get)?,
+                    resource_version:row.try_get("resource_version").map_err(get)?,
+                    file_count:row.try_get("file_count").map_err(get)?,
+                    total_size:row.try_get("total_size").map_err(get)?,
+                })?);
             }
             let next_before=if more {entries.last().map(|e|e.sequence.clone())} else {None};
             Ok(HistoryPage{entries,next_before})

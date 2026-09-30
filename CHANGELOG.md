@@ -62,6 +62,13 @@
   `-adopt` run. HTTP(S) Git transfers now also abort after 30 s below 1000 bytes/s. The Git
   status endpoint reserves the static error code `timeout_config` for an invalid budget, which
   configuration validation already rejects. Omitting the field keeps 1.2.x behavior.
+- PostgreSQL Master history keeps each event's `version`, `resource_version`, `file_count` and
+  `total_size`, also after the snapshot is pruned, and now reports its `published_at`. File
+  history entries add `resource_version`. All fields are additive; events written before 1.3.0 or
+  by a 1.2.x writer report null metadata and are not backfilled.
+- The first 1.3 publication or migration adds the history columns once (an exclusive lock on the
+  history table for that transaction; the role must own it). 1.2.x readers and writers keep
+  working against the upgraded table, and migration receipts written by 1.2.x still replay.
 
 ## 1.2.4
 

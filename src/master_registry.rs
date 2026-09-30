@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 const MAX_JSON: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_TOTAL: u64 = 512 * 1024 * 1024;
 const MAX_INDEX: u64 = 1024 * 1024;
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -395,6 +395,8 @@ pub(crate) fn predecessor(root: &Path) -> Result<Option<String>, MasterError> {
 pub struct HistoryEntry {
     pub snapshot: String,
     pub version: String,
+    /// The snapshot's recorded asset version, or null when none was recorded.
+    pub resource_version: Option<String>,
     pub content_sha256: String,
     pub published_at: Option<chrono::DateTime<chrono::Utc>>,
     pub file_count: usize,
@@ -481,6 +483,7 @@ fn history_page_inner(
         entries.push(HistoryEntry {
             snapshot,
             version: value.version,
+            resource_version: value.resource_version,
             content_sha256: value.content_sha256,
             published_at,
             file_count: value.files.len(),
