@@ -5,7 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AppError {
     #[error("no node is currently available")]
     NodeUnavailable,

@@ -87,8 +87,10 @@ pub struct GameClient {
     accounts: std::sync::Mutex<crate::accounts::Pool>,
     cdn_secrets: BTreeMap<String, String>,
     state: Mutex<State>,
-    // Optional account serialization, independent of the protocol activation barrier.
-    call_lock: Mutex<()>,
+    /// Anonymous call slots while `session_lock` is true (accounts use their own lock).
+    anonymous_calls: tokio::sync::Semaphore,
+    /// Shared executions of identical in-flight public reads (see `coalesces`).
+    flights: crate::single_flight::SingleFlight<Result<Arc<Value>, AppError>>,
     protocol_calls: AsyncRwLock<()>,
     bootstrap_lock: Mutex<()>,
     timeout: Duration,
@@ -163,6 +165,7 @@ impl GameClient {
             .map_err(|_| AppError::Config("invalid resource snapshot network configuration"))?;
         let timeout = Duration::from_millis(config.upstream.timeout_ms);
         let inflight = tokio::sync::Semaphore::new(config.upstream.max_inflight);
+        let anonymous_calls = tokio::sync::Semaphore::new(config.upstream.anonymous_slots());
         let response_cache = crate::response_cache::Cache::new(config.response_cache.clone())?;
         let node_routing = config
             .node_routing
@@ -195,7 +198,8 @@ impl GameClient {
             accounts: std::sync::Mutex::new(accounts),
             cdn_secrets,
             state: Mutex::new(state),
-            call_lock: Mutex::new(()),
+            anonymous_calls,
+            flights: crate::single_flight::SingleFlight::new(),
             protocol_calls: AsyncRwLock::new(()),
             bootstrap_lock: Mutex::new(()),
             timeout,
@@ -539,218 +543,303 @@ impl GameClient {
                 return Err(AppError::UnsupportedRegionOperation);
             }
             let deadline = tokio::time::Instant::now() + self.timeout;
-            let result = async {
-                let _permit = tokio::time::timeout_at(deadline, self.inflight.acquire())
-                    .await
-                    .map_err(|_| AppError::Timeout)?
-                    .map_err(|_| AppError::Transport)?;
-                let _protocol_call = tokio::time::timeout_at(deadline, self.protocol_calls.read())
-                    .await
-                    .map_err(|_| AppError::Timeout)?;
-                if expected_protocol.is_some_and(|expected| {
-                    self.protocol_status()
-                        .map_or(true, |status| status.sha256 != expected)
-                }) {
-                    return Err(AppError::PeerIdentityMismatch);
-                }
-                let lease = if authenticated(route) {
-                    Some(
-                        self.accounts
-                            .lock()
-                            .map_err(|_| AppError::AccountUnavailable)?
-                            .select(name, matches!(route, WHOAMI | PLAYER_DATA))
-                            .map_err(|e| {
-                                if expected_protocol.is_some() {
-                                    AppError::PeerAccountUnavailable
-                                } else {
-                                    e
-                                }
-                            })?,
-                    )
-                } else {
-                    None
-                };
-                let account = lease.as_ref().map(|l| l.account.as_ref());
-
-                let mut account_attempted = false;
-                let result = tokio::time::timeout_at(deadline, async {
-                    let protocol = self
-                        .protocol
-                        .read()
-                        .map_err(|_| AppError::ProtocolDefinition)?
-                        .clone();
-                    if authenticated(route) && !identity_only && self.needs_bootstrap().await {
-                        let _bootstrap = self.bootstrap_lock.lock().await;
-                        if self.needs_bootstrap().await {
-                            self.execute(&protocol, VERSION, json!({}), None, deadline)
-                                .await?;
-                        }
-                    }
-                    let cache_key = self
-                        .response_cache_key(&protocol, route, &input, account)
-                        .await?;
-                    if refresh_key
-                        .as_ref()
-                        .is_some_and(|key| cache_key.as_ref() != Some(key))
-                    {
-                        return Err(AppError::ProtocolDefinition);
-                    }
-                    if let Some(key) = &cache_key {
-                        if refresh_key.is_none() {
-                            if let Some(cached) = self.read_cached_state(key, route, deadline).await
-                            {
-                                if cached.stale {
-                                    if let Some(guard) = self.response_cache.try_refresh_guard(key)
-                                    {
-                                        let client = self.clone();
-                                        let key = key.clone();
-                                        let route = route.to_owned();
-                                        let input = input.clone();
-                                        let account_name = account.map(|a| a.name.clone());
-                                        tokio::spawn(async move {
-                                            let _guard = guard;
-                                            let _ = client
-                                                .call_selected(
-                                                    &route,
-                                                    input,
-                                                    account_name.as_deref(),
-                                                    Some(key),
-                                                    None,
-                                                )
-                                                .await;
-                                        });
-                                    }
-                                }
-                                return Ok(cached.value);
-                            }
-                        } else if let Some(value) = self.read_cached(key, route, deadline).await {
-                            return Ok(value);
-                        }
-                    }
-                    let _fill = if let Some(key) = &cache_key {
-                        let guard = self.response_cache.fill_guard(key).await;
-                        if let Some(value) = self.read_cached(key, route, deadline).await {
-                            return Ok(value);
-                        }
-                        Some(guard)
-                    } else {
-                        None
-                    };
-                    let _guard = tokio::time::timeout_at(deadline, async {
-                        if self.config.session_lock {
-                            Some(match account {
-                                Some(a) => a.lock.lock().await,
-                                None => self.call_lock.lock().await,
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                    .map_err(|_| AppError::Timeout)?;
-                    if account.is_some_and(|a| !a.available()) {
-                        return Err(AppError::AccountUnavailable);
-                    }
-
-                    if let Some(expected) = &refresh_key {
-                        if self
-                            .response_cache_key(&protocol, route, &input, account)
-                            .await?
-                            .as_ref()
-                            != Some(expected)
-                        {
-                            return Err(AppError::ProtocolDefinition);
-                        }
-                    }
-                    let auth = match account {
-                        Some(a) if authenticated(route) => {
-                            Some(self.account_auth(&protocol, a, deadline).await?)
-                        }
-                        _ => None,
-                    };
-                    if identity_only {
-                        let auth = auth.ok_or(AppError::AccountUnavailable)?;
-                        return Ok(json!({ "playerId": auth.player_id }));
-                    }
-                    account_attempted = authenticated(route);
-                    if route == PLAYER_DATA && !global {
-                        self.execute(&protocol, WHOAMI, json!({}), auth.as_ref(), deadline)
-                            .await?;
-                    }
-                    let (response, code) = if authenticated(route) {
-                        // Authenticated reads are never replayed.
-                        let (response, code) = self
-                            .execute_once(&protocol, route, input, auth.as_ref(), deadline)
+            // Identical public reads share one execution, before admission, the protocol barrier
+            // and account selection, so a joined caller holds none of them. Named-account and
+            // cache-refresh calls always run on their own.
+            if name.is_none() && refresh_key.is_none() && self.coalesces(route) {
+                let key = self.flight_key(route, &input, expected_protocol)?;
+                return self
+                    .flights
+                    .run(key, deadline, Err(AppError::Timeout), || async move {
+                        let mut result = self
+                            .call_admitted(route, input, None, None, expected_protocol, deadline)
                             .await;
-                        if global && target_not_found(route, &response, code.as_deref()) {
-                            // The session worked; the looked-up player does not exist on this
-                            // server (including players of another Global region).
-                            (Err(AppError::NotFound), None)
-                        } else {
-                            (response, code)
-                        }
-                    } else {
-                        (
-                            self.execute(&protocol, route, input, None, deadline).await,
-                            None,
-                        )
-                    };
-                    if account_attempted {
-                        if let Some(lease) = &lease {
-                            lease.report(
-                                &response,
-                                code.as_deref(),
-                                &self.config.account_pool,
-                                self.config.global_login.as_ref(),
-                            );
-                        }
-                        account_attempted = false;
-                    }
-                    let mut value = response?;
-                    if let Some(key) = cache_key {
-                        // Account-relative ranking fields must never enter shared response storage.
+                        // A shared outcome never carries account-relative ranking fields.
                         if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-                            if let Some(object) = value.as_object_mut() {
+                            if let Some(object) =
+                                result.as_mut().ok().and_then(Value::as_object_mut)
+                            {
                                 object.remove("myRank");
                                 object.remove("myScore");
                             }
                         }
-                        let budget =
-                            deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
-                        let _ = tokio::time::timeout(
-                            budget,
-                            self.response_cache.put_route(route, key, &value),
-                        )
-                        .await;
+                        result.map(Arc::new)
+                    })
+                    .await
+                    .map(|value| Value::clone(&value));
+            }
+            self.call_admitted(route, input, name, refresh_key, expected_protocol, deadline)
+                .await
+        })
+    }
+    /// Public reads that share one execution among identical concurrent callers. Rankings spend
+    /// a game account, so they join only with `upstream.coalesce_public_reads`.
+    pub(crate) fn coalesces(&self, route: &str) -> bool {
+        match route {
+            VERSION | SERVER_LIST | ANNOUNCEMENTS | ANNOUNCEMENT => true,
+            EVENT_RANKING | MUSIC_RANKING | CHALLENGE_RANKING => {
+                self.config.upstream.coalesce_public_reads
+            }
+            _ => false,
+        }
+    }
+    /// Identity of a shared execution: everything that selects the upstream call and its schema,
+    /// including the protocol a peer caller asserted.
+    fn flight_key(
+        &self,
+        route: &str,
+        input: &Value,
+        expected_protocol: Option<&str>,
+    ) -> Result<[u8; 32], AppError> {
+        use sha2::{Digest, Sha256};
+        let (sha256, generation) = {
+            let protocol = self
+                .protocol
+                .read()
+                .map_err(|_| AppError::ProtocolDefinition)?;
+            (protocol.status.sha256.clone(), protocol.status.generation)
+        };
+        let scope = json!({"schema":1,"region":self.config.region,"environment":self.config.environment,
+            "endpoint":self.config.endpoint,"platform":self.config.platform(),"client":self.config.client_version,
+            "protocol":sha256,"protocol_generation":generation,"expected_protocol":expected_protocol,
+            "route":route,"input":input});
+        let bytes = serde_json::to_vec(&scope).map_err(|_| AppError::Protocol)?;
+        Ok(Sha256::digest(bytes).into())
+    }
+    #[cfg(test)]
+    pub(crate) fn test_flight_key(&self, route: &str, expected_protocol: Option<&str>) -> [u8; 32] {
+        self.flight_key(route, &json!({}), expected_protocol)
+            .unwrap()
+    }
+    /// One admitted logical call: inflight permit, protocol barrier, account or anonymous slot,
+    /// response cache, the upstream RPC and the resulting state.
+    async fn call_admitted(
+        self: &Arc<Self>,
+        route: &str,
+        input: Value,
+        name: Option<&str>,
+        refresh_key: Option<String>,
+        expected_protocol: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, AppError> {
+        let global = self.config.region.family() == "global";
+        let identity_only = global && route == WHOAMI;
+        let result = async {
+            let _permit = tokio::time::timeout_at(deadline, self.inflight.acquire())
+                .await
+                .map_err(|_| AppError::Timeout)?
+                .map_err(|_| AppError::Transport)?;
+            let _protocol_call = tokio::time::timeout_at(deadline, self.protocol_calls.read())
+                .await
+                .map_err(|_| AppError::Timeout)?;
+            if expected_protocol.is_some_and(|expected| {
+                self.protocol_status()
+                    .map_or(true, |status| status.sha256 != expected)
+            }) {
+                return Err(AppError::PeerIdentityMismatch);
+            }
+            let lease = if authenticated(route) {
+                Some(
+                    self.accounts
+                        .lock()
+                        .map_err(|_| AppError::AccountUnavailable)?
+                        .select(name, matches!(route, WHOAMI | PLAYER_DATA))
+                        .map_err(|e| {
+                            if expected_protocol.is_some() {
+                                AppError::PeerAccountUnavailable
+                            } else {
+                                e
+                            }
+                        })?,
+                )
+            } else {
+                None
+            };
+            let account = lease.as_ref().map(|l| l.account.as_ref());
+
+            let mut account_attempted = false;
+            let result = tokio::time::timeout_at(deadline, async {
+                let protocol = self
+                    .protocol
+                    .read()
+                    .map_err(|_| AppError::ProtocolDefinition)?
+                    .clone();
+                if authenticated(route) && !identity_only && self.needs_bootstrap().await {
+                    let _bootstrap = self.bootstrap_lock.lock().await;
+                    if self.needs_bootstrap().await {
+                        self.execute(&protocol, VERSION, json!({}), None, deadline)
+                            .await?;
                     }
-                    Ok(value)
+                }
+                let cache_key = self
+                    .response_cache_key(&protocol, route, &input, account)
+                    .await?;
+                if refresh_key
+                    .as_ref()
+                    .is_some_and(|key| cache_key.as_ref() != Some(key))
+                {
+                    return Err(AppError::ProtocolDefinition);
+                }
+                if let Some(key) = &cache_key {
+                    if refresh_key.is_none() {
+                        if let Some(cached) = self.read_cached_state(key, route, deadline).await {
+                            if cached.stale {
+                                if let Some(guard) = self.response_cache.try_refresh_guard(key) {
+                                    let client = self.clone();
+                                    let key = key.clone();
+                                    let route = route.to_owned();
+                                    let input = input.clone();
+                                    let account_name = account.map(|a| a.name.clone());
+                                    tokio::spawn(async move {
+                                        let _guard = guard;
+                                        let _ = client
+                                            .call_selected(
+                                                &route,
+                                                input,
+                                                account_name.as_deref(),
+                                                Some(key),
+                                                None,
+                                            )
+                                            .await;
+                                    });
+                                }
+                            }
+                            return Ok(cached.value);
+                        }
+                    } else if let Some(value) = self.read_cached(key, route, deadline).await {
+                        return Ok(value);
+                    }
+                }
+                let _fill = if let Some(key) = &cache_key {
+                    let guard = self.response_cache.fill_guard(key).await;
+                    if let Some(value) = self.read_cached(key, route, deadline).await {
+                        return Ok(value);
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
+                // With session_lock an account call holds the account's lock and an anonymous
+                // call one of `upstream.anonymous_max_inflight` slots.
+                let _guard = tokio::time::timeout_at(deadline, async {
+                    Ok::<_, AppError>(match account {
+                        _ if !self.config.session_lock => (None, None),
+                        Some(a) => (Some(a.lock.lock().await), None),
+                        None => (
+                            None,
+                            Some(
+                                self.anonymous_calls
+                                    .acquire()
+                                    .await
+                                    .map_err(|_| AppError::Transport)?,
+                            ),
+                        ),
+                    })
                 })
                 .await
-                .unwrap_or(Err(AppError::Timeout));
+                .map_err(|_| AppError::Timeout)??;
+                if account.is_some_and(|a| !a.available()) {
+                    return Err(AppError::AccountUnavailable);
+                }
+
+                if let Some(expected) = &refresh_key {
+                    if self
+                        .response_cache_key(&protocol, route, &input, account)
+                        .await?
+                        .as_ref()
+                        != Some(expected)
+                    {
+                        return Err(AppError::ProtocolDefinition);
+                    }
+                }
+                let auth = match account {
+                    Some(a) if authenticated(route) => {
+                        Some(self.account_auth(&protocol, a, deadline).await?)
+                    }
+                    _ => None,
+                };
+                if identity_only {
+                    let auth = auth.ok_or(AppError::AccountUnavailable)?;
+                    return Ok(json!({ "playerId": auth.player_id }));
+                }
+                account_attempted = authenticated(route);
+                if route == PLAYER_DATA && !global {
+                    self.execute(&protocol, WHOAMI, json!({}), auth.as_ref(), deadline)
+                        .await?;
+                }
+                let (response, code) = if authenticated(route) {
+                    // Authenticated reads are never replayed.
+                    let (response, code) = self
+                        .execute_once(&protocol, route, input, auth.as_ref(), deadline)
+                        .await;
+                    if global && target_not_found(route, &response, code.as_deref()) {
+                        // The session worked; the looked-up player does not exist on this
+                        // server (including players of another Global region).
+                        (Err(AppError::NotFound), None)
+                    } else {
+                        (response, code)
+                    }
+                } else {
+                    (
+                        self.execute(&protocol, route, input, None, deadline).await,
+                        None,
+                    )
+                };
                 if account_attempted {
                     if let Some(lease) = &lease {
                         lease.report(
-                            &result,
-                            None,
+                            &response,
+                            code.as_deref(),
                             &self.config.account_pool,
                             self.config.global_login.as_ref(),
                         );
                     }
+                    account_attempted = false;
                 }
-                result
-            }
-            .await;
-            if matches!(
-                result,
-                Err(AppError::Timeout | AppError::Transport | AppError::Protocol)
-            ) {
-                let mut s = self.state.lock().await;
-                s.snapshot_stale = true;
-                s.observation.grpc_status = None;
-                s.observation.observed_at = Some(Utc::now());
+                let mut value = response?;
+                if let Some(key) = cache_key {
+                    // Account-relative ranking fields must never enter shared response storage.
+                    if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("myRank");
+                            object.remove("myScore");
+                        }
+                    }
+                    let budget =
+                        deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+                    let _ = tokio::time::timeout(
+                        budget,
+                        self.response_cache.put_route(route, key, &value),
+                    )
+                    .await;
+                }
+                Ok(value)
+            })
+            .await
+            .unwrap_or(Err(AppError::Timeout));
+            if account_attempted {
+                if let Some(lease) = &lease {
+                    lease.report(
+                        &result,
+                        None,
+                        &self.config.account_pool,
+                        self.config.global_login.as_ref(),
+                    );
+                }
             }
             result
-        })
+        }
+        .await;
+        if matches!(
+            result,
+            Err(AppError::Timeout | AppError::Transport | AppError::Protocol)
+        ) {
+            let mut s = self.state.lock().await;
+            s.snapshot_stale = true;
+            s.observation.grpc_status = None;
+            s.observation.observed_at = Some(Utc::now());
+        }
+        result
     }
     /// Authenticated calls need the Master version (and, on Global, the resource version).
     async fn needs_bootstrap(&self) -> bool {

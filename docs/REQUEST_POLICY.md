@@ -13,8 +13,10 @@ Master CDN downloads have their separate existing limits.
 | `max_inflight` | 64 | 1..4096 |
 | `anonymous_attempts` | 1 | 1..5 total attempts |
 | `retry_delay_ms` | 250 | 1..10000 |
+| `anonymous_max_inflight` | omitted: min(4, `max_inflight`) | 1..64 and at most `max_inflight` |
+| `coalesce_public_reads` | false | `true` also shares identical ranking reads |
 
-A logical call includes admission wait, per-account session wait, protocol activation
+A logical call includes admission wait, per-account session or anonymous slot wait, protocol activation
 wait, anonymous Version bootstrap, optional identity verification, retries and the
 requested RPC. These share one deadline; entering another stage never resets it.
 The gRPC timeout header advertises the remaining budget, rounded up to milliseconds.
@@ -26,6 +28,41 @@ protobuf decoding. Oversized or malformed data is rejected without retry.
 lock. Additional requests wait within their own deadline. Per-account serialization
 still applies when `session_lock` is true; increasing regional concurrency does not
 implicitly enable concurrent use of one game session. Each region owns its semaphore.
+
+With `session_lock: true`, calls without an account (Version, server list, announcements,
+peer and cache-refresh calls of those routes) no longer share one regional lock: up to
+`anonymous_max_inflight` of them run at once, so a slow Version does not hold back an
+announcement read. `anonymous_max_inflight: 1` restores the 1.2.x serialization. The Version
+bootstrap of an authenticated call stays single-flight under its own lock and does not take
+an anonymous slot. With `session_lock: false` only `max_inflight` bounds anonymous calls.
+
+## Shared in-flight reads
+
+Identical concurrent public reads share one execution, independent of the
+[response cache](RESPONSE_CACHE.md): it also applies with the cache disabled or a TTL of 0.
+Version, server list and announcement list/detail always share; event, song and challenge
+rankings share only with `coalesce_public_reads: true`, because one account's result (and
+failure) then answers every joined request and is reported to account health once. Account
+fields (`myRank`, `myScore`) are removed before a shared ranking is handed out. Profiles,
+decks, private account data, logins, named-account calls and background cache refreshes never
+share.
+
+Two calls are identical when region, environment, endpoint, platform, client version,
+protocol fingerprint and generation, the fingerprint a peer caller asserted, route and input
+all match. A joined request:
+
+- receives the outcome of the running call, errors and timeouts included, so a burst against a
+  failing upstream causes one attempt (and one retry sequence);
+- waits only within its own deadline and then returns a timeout on its own, without touching
+  shared state;
+- holds no admission permit, protocol barrier, anonymous slot or account while it waits.
+
+If the running request is cancelled (client disconnect), one waiting request continues with
+its own call and deadline; requests arriving after that start a new execution. A finished
+call is never handed to a later request: this is not a cache, and the table lives in each
+process only (not in Redis). A joined request can receive a response to an RPC sent up to one
+round trip before it arrived. The Version bootstrap of authenticated calls never joins, since
+it already holds admission and the protocol barrier.
 
 ## Retry boundaries
 

@@ -3,7 +3,9 @@
 Caching is opt-in per region and disabled by default. Only public announcement
 list/detail and event/song/challenge ranking responses are eligible. Profile queries,
 decks, identity, private player data, server discovery and Version always execute
-normally. Service-account `myRank`/`myScore` fields are removed before ranking values
+normally, although identical concurrent Version, server-list and announcement calls still
+share one RPC ([shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)).
+Service-account `myRank`/`myScore` fields are removed before ranking values
 enter storage. Errors and maintenance responses are never inserted.
 
 ```yaml
@@ -93,6 +95,13 @@ request's original deadline. Failed fills do not populate the cache, and cancell
 a winner releases its lock so another request can proceed. A fixed set of 64 lock
 stripes bounds coordination memory; digest collisions can serialize unrelated fills.
 Fresh hits do not wait for a fill lock. This is not a distributed Redis lease.
+
+Anonymous routes (announcement list/detail) are also coalesced before the cache is consulted,
+independently of it, so identical concurrent requests share one RPC even with `backend:
+disabled` or a route TTL of 0; rankings do so only with `upstream.coalesce_public_reads`
+(see [shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)). The fill lock still
+coordinates background stale-while-revalidate refreshes, which never join a shared execution,
+with concurrent misses.
 
 ## Stale-while-revalidate
 

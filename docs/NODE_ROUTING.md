@@ -47,6 +47,12 @@ to have executed: connection failure, contract/capability rejection, or an expli
 admission rejection before game dispatch. Ambiguous timeout/transport/protocol failures return
 immediately for authenticated reads. No concurrent hedging or same-target retry is performed by
 the router. The executing node retains its existing local anonymous retry policy.
+Before any target is chosen, identical concurrent public reads (same identity, protocol
+generation and operation; rankings only with `upstream.coalesce_public_reads`) share one routed
+execution: one router admission and at most one peer POST per target, whose outcome, error or
+observation answers every joined request (see
+[shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)). This is not hedging: no
+extra request is sent.
 
 Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a Global
 looked-up player that does not exist) are terminal rather than presumed target failures. A peer

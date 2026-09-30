@@ -4,7 +4,7 @@ use crate::{
     config::secret,
     error::AppError,
     peer::{self, Failure, Operation, Outcome},
-    peer_transport,
+    peer_transport, routes,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -108,6 +108,7 @@ impl Config {
         Ok(())
     }
 }
+#[derive(Clone)]
 pub struct Execution {
     pub result: Result<Value, AppError>,
     pub observation: Observation,
@@ -248,6 +249,7 @@ pub struct Router {
     config: Config,
     targets: Vec<Target>,
     inflight: tokio::sync::Semaphore,
+    flights: crate::single_flight::SingleFlight<Execution>,
 }
 impl Router {
     pub fn new(config: Config, region: crate::region::Region) -> Result<Self, AppError> {
@@ -290,6 +292,7 @@ impl Router {
             config,
             targets,
             inflight,
+            flights: crate::single_flight::SingleFlight::new(),
         })
     }
     pub fn status(&self) -> Value {
@@ -311,12 +314,57 @@ impl Router {
             Ok(v) => v,
             Err(e) => return Execution::error(e),
         };
+        let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
+        if !client.coalesces(route) {
+            return self
+                .call_inner(client, operation, route, input, identity, deadline)
+                .await;
+        }
+        // Identical public reads share one routed execution (one admission, one peer POST)
+        // before any target is chosen. The request ID is per execution and not part of the key.
+        let key = match flight_key(client, &identity, &operation) {
+            Ok(v) => v,
+            Err(e) => return Execution::error(e),
+        };
+        self.flights
+            .run(
+                key,
+                deadline,
+                Execution::error(AppError::Timeout),
+                || async {
+                    let mut execution = self
+                        .call_inner(client, operation, route, input, identity, deadline)
+                        .await;
+                    if matches!(route, routes::MUSIC_RANKING | routes::CHALLENGE_RANKING) {
+                        if let Some(object) = execution
+                            .result
+                            .as_mut()
+                            .ok()
+                            .and_then(Value::as_object_mut)
+                        {
+                            object.remove("myRank");
+                            object.remove("myScore");
+                        }
+                    }
+                    execution
+                },
+            )
+            .await
+    }
+    async fn call_inner(
+        &self,
+        client: &Arc<GameClient>,
+        operation: Operation,
+        route: &'static str,
+        input: Value,
+        identity: peer::Identity,
+        deadline: Instant,
+    ) -> Execution {
         let request = peer::Request {
             request_id: uuid::Uuid::new_v4().to_string(),
             identity,
             operation,
         };
-        let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
         let _admission = match tokio::time::timeout_at(deadline, self.inflight.acquire()).await {
             Ok(Ok(v)) => v,
             _ => return Execution::error(AppError::Timeout),
@@ -428,6 +476,19 @@ impl Router {
         }
         last
     }
+}
+/// Identity of a shared routed execution: the caller identity (including the protocol hash),
+/// the protocol generation and the operation.
+fn flight_key(
+    client: &GameClient,
+    identity: &peer::Identity,
+    operation: &Operation,
+) -> Result<[u8; 32], AppError> {
+    use sha2::{Digest, Sha256};
+    let scope = json!({"schema":1,"identity":identity,
+        "protocol_generation":client.protocol_status()?.generation,"operation":operation});
+    let bytes = serde_json::to_vec(&scope).map_err(|_| AppError::Protocol)?;
+    Ok(Sha256::digest(bytes).into())
 }
 pub(crate) fn failure_error(failure: Failure, maintenance: bool) -> AppError {
     match failure {

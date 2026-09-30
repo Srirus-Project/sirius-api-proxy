@@ -15,6 +15,7 @@ mod tests;
 mod native;
 mod proto_source;
 mod routes;
+mod single_flight;
 
 pub mod region;
 

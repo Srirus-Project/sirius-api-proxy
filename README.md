@@ -77,6 +77,10 @@ operating with that uncertainty. The default 20-second request deadline includes
 serialization, bootstrap or protocol activation. Initial authenticated Version discovery
 remains single-flight, and protocol reload waits for all active logical calls in either mode.
 With concurrency enabled, upstream observations reflect response completion order.
+Calls without an account are not serialized by `session_lock`: up to
+`upstream.anonymous_max_inflight` (default 4; 1 restores the 1.2.x behavior) run at once, and
+identical concurrent anonymous reads share one upstream RPC, errors included
+([shared in-flight reads](docs/REQUEST_POLICY.md#shared-in-flight-reads)).
 
 CDN secrets are optional for API-only use. Resource snapshots become ready only when the
 observed CDN and credential match configuration. Secret values are never included in responses.

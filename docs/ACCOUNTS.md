@@ -36,7 +36,13 @@ completion, timeout or caller cancellation. `session_lock: true` serializes each
 account's logical call, including its identity check, while different accounts can
 work concurrently. False keeps the existing opt-out for concurrent use of a single
 session. Actual game-server support for single-session concurrency remains unproven.
-Anonymous bootstrap is shared within the region and carries no account headers.
+Anonymous calls carry no account headers. They no longer share one regional lock: with
+`session_lock: true` up to `upstream.anonymous_max_inflight` of them (default 4, at most
+`max_inflight`; 1 restores the 1.2.x serialization) run at once. The Version bootstrap of
+authenticated calls stays single-flight. With `upstream.coalesce_public_reads: true`, one
+account's ranking result (or failure) answers every identical concurrent ranking request and
+is reported to account health once; the default runs each ranking request on its own account
+selection.
 
 A gRPC permission/authentication failure (7 or 16) disables the selected account until
 successful credential reload. Transport/protocol failures, deadlines and gRPC

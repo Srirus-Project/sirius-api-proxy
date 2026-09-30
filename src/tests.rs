@@ -2713,6 +2713,11 @@ async fn framework_client_errors_are_json_without_echoing_input() {
     assert_eq!(r.status(), 401);
     assert_eq!(body(r).await["code"], "unauthorized");
 }
+fn announcements_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message("app.announcement.GetListResponse", json!({})));
+    reply
+}
 fn unavailable_reply() -> Reply {
     let mut reply = Reply::version();
     reply.trailers.insert("grpc-status", "14".parse().unwrap());
@@ -2803,7 +2808,8 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut first_reply = Reply::version();
     first_reply.gate = Some(gate.clone());
-    let mut slow = Reply::version();
+    // A different key: identical concurrent Version calls would share one execution instead.
+    let mut slow = announcements_reply();
     slow.delay = Duration::from_millis(400);
     let f = fixture(vec![first_reply, slow, Reply::version()]).await;
     let mut cfg = config();
@@ -2815,7 +2821,10 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     let first = tokio::spawn(async move { a.call(VERSION, json!({})).await });
     wait_for_requests(&f, 1).await;
     let a = c.clone();
-    let second = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    let second = tokio::spawn(async move {
+        a.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(f.received.lock().unwrap().len(), 1);
     gate.add_permits(1);
@@ -2831,6 +2840,328 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     assert!(budget < 250); // queue time was not reset before sending
     c.call(VERSION, json!({})).await.unwrap();
     assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn single_flight_shares_one_execution_and_its_errors() {
+    use crate::single_flight::SingleFlight;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for outcome in [Ok(7), Err(AppError::Grpc(14))] {
+        let flight = Arc::new(SingleFlight::<Result<u32, AppError>>::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let tasks = (0..20)
+            .map(|_| {
+                let (flight, runs, gate) = (flight.clone(), runs.clone(), gate.clone());
+                let outcome = outcome.clone();
+                tokio::spawn(async move {
+                    flight
+                        .run([1; 32], deadline, Err(AppError::Timeout), || async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            gate.acquire().await.unwrap().forget();
+                            outcome
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(flight.len(), 1);
+        gate.add_permits(1);
+        for task in tasks {
+            match (task.await.unwrap(), &outcome) {
+                (Ok(value), Ok(expected)) => assert_eq!(value, *expected),
+                (Err(AppError::Grpc(14)), Err(_)) => {}
+                (other, _) => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(flight.len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn single_flight_hands_over_on_cancellation_and_bounds_joined_waits() {
+    use crate::single_flight::SingleFlight;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let flight = Arc::new(SingleFlight::<Result<u32, AppError>>::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let spawn = |gate: Option<Arc<tokio::sync::Semaphore>>, value: u32| {
+        let (flight, runs) = (flight.clone(), runs.clone());
+        tokio::spawn(async move {
+            flight
+                .run([2; 32], deadline, Err(AppError::Timeout), || async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    if let Some(gate) = gate {
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok(value)
+                })
+                .await
+        })
+    };
+    let wait_runs = |count: usize| {
+        let runs = runs.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while runs.load(Ordering::SeqCst) < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let never = Arc::new(tokio::sync::Semaphore::new(0));
+    let leader = spawn(Some(never.clone()), 1);
+    wait_runs(1).await;
+    let follower_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let follower = spawn(Some(follower_gate.clone()), 2);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+    // One joined caller runs its own call; it is not registered, so a newcomer starts afresh.
+    wait_runs(2).await;
+    assert_eq!(flight.len(), 0);
+    assert_eq!(spawn(None, 3).await.unwrap().unwrap(), 3);
+    follower_gate.add_permits(1);
+    assert_eq!(follower.await.unwrap().unwrap(), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert_eq!(flight.len(), 0);
+
+    // A joined caller stops at its own deadline; the running call still completes.
+    let flight = SingleFlight::<Result<u32, AppError>>::new();
+    let leader = flight.run(
+        [3; 32],
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Err(AppError::Timeout),
+        || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(1)
+        },
+    );
+    let started = tokio::time::Instant::now();
+    let follower = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        flight
+            .run(
+                [3; 32],
+                started + Duration::from_millis(60),
+                Err(AppError::Timeout),
+                || async { Ok(2) },
+            )
+            .await
+    };
+    let (leader, follower) = tokio::join!(leader, follower);
+    assert_eq!(leader.unwrap(), 1);
+    assert!(matches!(follower, Err(AppError::Timeout)));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(flight.len(), 0);
+    // A completed outcome is never handed to a later caller.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let fetch = |value| move || async move { Ok(value) };
+    assert_eq!(
+        flight
+            .run([3; 32], deadline, Err(AppError::Timeout), fetch(4))
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        flight
+            .run([3; 32], deadline, Err(AppError::Timeout), fetch(5))
+            .await
+            .unwrap(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn identical_anonymous_reads_share_one_rpc_without_response_cache() {
+    // Success and failure are both shared; the cache is disabled (the default).
+    for failed in [false, true] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut reply = if failed {
+            unavailable_reply()
+        } else {
+            Reply::version()
+        };
+        reply.gate = Some(gate.clone());
+        let f = fixture(vec![reply]).await;
+        let cfg = config();
+        assert!(matches!(
+            cfg.response_cache,
+            crate::response_cache::Config::Disabled
+        ));
+        let c = client(&f, cfg);
+        let calls = (0..20)
+            .map(|n| {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    if n % 2 == 0 {
+                        c.call(VERSION, json!({})).await
+                    } else {
+                        c.public_call(crate::peer::Operation::Version {}).await
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        wait_for_requests(&f, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.add_permits(1);
+        for call in calls {
+            match call.await.unwrap() {
+                Ok(value) if !failed => assert_eq!(value["version"], "master-fixture"),
+                Err(AppError::Grpc(14)) if failed => {}
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(f.received.lock().unwrap().len(), 1);
+        let observation = c.observation().await;
+        assert_eq!(observation.grpc_status, Some(if failed { 14 } else { 0 }));
+    }
+}
+
+#[tokio::test]
+async fn ranking_coalescing_is_opt_in_and_private_routes_never_coalesce() {
+    use crate::client::{MUSIC_RANKING, PROFILE, WHOAMI};
+    for coalesce in [false, true] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut replies = vec![Reply::version()];
+        for _ in 0..2 {
+            let mut reply = ranking_reply(1);
+            reply.gate = Some(gate.clone());
+            replies.push(reply);
+        }
+        let f = fixture(replies).await;
+        let mut cfg = account_config();
+        cfg.session_lock = false;
+        cfg.upstream.coalesce_public_reads = coalesce;
+        let c = client(&f, cfg);
+        c.call(VERSION, json!({})).await.unwrap();
+        let calls = (0..2)
+            .map(|_| {
+                let c = c.clone();
+                tokio::spawn(async move { c.call(MUSIC_RANKING, json!({"musicId":"1"})).await })
+            })
+            .collect::<Vec<_>>();
+        wait_for_requests(&f, if coalesce { 2 } else { 3 }).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            f.received.lock().unwrap().len(),
+            if coalesce { 2 } else { 3 }
+        );
+        gate.add_permits(2);
+        for call in calls {
+            let value = call.await.unwrap().unwrap();
+            assert_eq!(value["players"][0]["score"], 1);
+            // A shared ranking never carries the account-relative fields.
+            assert_eq!(value.get("myRank").is_none(), coalesce);
+        }
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut replies = vec![Reply::version()];
+    for _ in 0..2 {
+        let mut reply = empty_profile_reply();
+        reply.gate = Some(gate.clone());
+        replies.push(reply);
+    }
+    for _ in 0..2 {
+        let mut reply = whoami_reply("ranking-account");
+        reply.gate = Some(gate.clone());
+        replies.push(reply);
+    }
+    let f = fixture(replies).await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.coalesce_public_reads = true;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let a = c.clone();
+        calls.push(tokio::spawn(async move {
+            a.call(PROFILE, json!({"playerProfileId":"1"})).await
+        }));
+    }
+    wait_for_requests(&f, 3).await;
+    for _ in 0..2 {
+        let a = c.clone();
+        calls.push(tokio::spawn(async move {
+            a.call_account("default", WHOAMI).await
+        }));
+    }
+    wait_for_requests(&f, 5).await;
+    gate.add_permits(4);
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    assert_eq!(f.received.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn anonymous_slots_let_a_slow_version_overlap_other_anonymous_reads() {
+    use crate::client::ANNOUNCEMENTS;
+    for (session_lock, slots, overlaps) in [
+        (true, None, true),
+        (true, Some(1), false),
+        // Without session_lock only max_inflight bounds anonymous calls, as before.
+        (false, Some(1), true),
+    ] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut version = Reply::version();
+        version.gate = Some(gate.clone());
+        let f = fixture(vec![version, announcements_reply()]).await;
+        let mut cfg = config();
+        cfg.session_lock = session_lock;
+        cfg.upstream.anonymous_max_inflight = slots;
+        let c = client(&f, cfg);
+        let a = c.clone();
+        let slow = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+        wait_for_requests(&f, 1).await;
+        let a = c.clone();
+        let list =
+            tokio::spawn(async move { a.call(ANNOUNCEMENTS, json!({"selectedTab":0})).await });
+        if overlaps {
+            tokio::time::timeout(Duration::from_secs(2), list)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!slow.is_finished());
+            gate.add_permits(1);
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(f.received.lock().unwrap().len(), 1);
+            gate.add_permits(1);
+            list.await.unwrap().unwrap();
+        }
+        slow.await.unwrap().unwrap();
+        assert_eq!(f.received.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn flight_key_covers_protocol_generation_and_asserted_protocol() {
+    let directory = copy_protocol_bundle();
+    let mut cfg = config();
+    cfg.protocol_directory = directory.path().into();
+    let c = GameClient::for_test(cfg);
+    let sha = c.protocol_status().unwrap().sha256;
+    let before = c.test_flight_key(VERSION, None);
+    assert_eq!(before, c.test_flight_key(VERSION, None));
+    assert_ne!(before, c.test_flight_key(VERSION, Some(&sha)));
+    assert_ne!(before, c.test_flight_key(ANNOUNCEMENT, None));
+    edit_version_proto(
+        directory.path(),
+        "string version = 1;",
+        "string version = 1;\n  string extra = 2;",
+    );
+    assert_eq!(c.reload_protocol().await.unwrap().generation, 2);
+    assert_ne!(before, c.test_flight_key(VERSION, None));
 }
 
 #[tokio::test]
@@ -2868,12 +3199,33 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
         "max_inflight",
         "anonymous_attempts",
         "retry_delay_ms",
+        "anonymous_max_inflight",
     ] {
         let input = format!("{field}: 0");
         let policy: crate::config::UpstreamConfig = yaml_serde::from_str(&input).unwrap();
         assert!(policy.validate().is_err(), "{field}");
     }
     assert!(yaml_serde::from_str::<crate::config::UpstreamConfig>("ignored_option: true").is_err());
+    assert_eq!(c.upstream.anonymous_max_inflight, None);
+    assert!(!c.upstream.coalesce_public_reads);
+    assert_eq!(c.upstream.anonymous_slots(), 4);
+    let parse = |input: &str| yaml_serde::from_str::<crate::config::UpstreamConfig>(input).unwrap();
+    for rejected in [
+        "anonymous_max_inflight: 65",
+        "anonymous_max_inflight: 65\nmax_inflight: 128",
+        "anonymous_max_inflight: 3\nmax_inflight: 2",
+    ] {
+        assert!(parse(rejected).validate().is_err(), "{rejected}");
+    }
+    // Omitted, the slot count follows a smaller max_inflight instead of failing validation.
+    let small = parse("max_inflight: 1");
+    assert!(small.validate().is_ok());
+    assert_eq!(small.anonymous_slots(), 1);
+    let serialized = parse("anonymous_max_inflight: 1\ncoalesce_public_reads: true");
+    assert!(serialized.validate().is_ok());
+    assert_eq!(serialized.anonymous_slots(), 1);
+    assert!(serialized.coalesce_public_reads);
+    assert_eq!(parse("anonymous_max_inflight: 64").anonymous_slots(), 64);
 }
 
 fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
@@ -6219,10 +6571,11 @@ async fn node_routing_priorities_cooldown_single_probe_and_terminal_game_errors(
     })
     .await
     .unwrap();
+    // Another key: identical Version calls would join the probe's execution instead.
     for _ in 0..5 {
         assert_eq!(
             front
-                .public_call(crate::peer::Operation::Version {})
+                .public_call(crate::peer::Operation::Announcements { tab: 0 })
                 .await
                 .unwrap()["node"],
             "second"
@@ -6413,46 +6766,97 @@ async fn node_routing_local_priority_tie_and_incoming_peer_never_forward() {
 
 #[tokio::test]
 async fn node_routing_cancelled_request_releases_bounded_admission() {
+    use crate::peer::Operation;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let mode = Arc::new(AtomicUsize::new(4));
-    let seen = Arc::new(AtomicUsize::new(0));
-    let (url, server) = routing_mock("remote", mode.clone(), seen.clone()).await;
-    let mut cfg = config();
-    cfg.node_routing = Some(crate::node_routing::Config {
-        local_priority: None,
-        max_inflight: 1,
-        targets: vec![routing_target("remote", url, 0)],
-        ..Default::default()
-    });
-    let front = GameClient::new(cfg).unwrap();
-    let copy = front.clone();
-    let first =
-        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while seen.load(Ordering::Relaxed) < 1 {
-            tokio::task::yield_now().await;
+    // Announcements waits for the single admission permit; an identical Version joins the
+    // first execution and takes it over when that caller goes away.
+    let operations: [fn() -> Operation; 2] = [
+        || Operation::Announcements { tab: 0 },
+        || Operation::Version {},
+    ];
+    for second_operation in operations {
+        let mode = Arc::new(AtomicUsize::new(4));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (url, server) = routing_mock("remote", mode.clone(), seen.clone()).await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            max_inflight: 1,
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let copy = front.clone();
+        let first = tokio::spawn(async move { copy.public_call(Operation::Version {}).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let copy = front.clone();
+        let second = tokio::spawn(async move { copy.public_call(second_operation()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        mode.store(0, Ordering::Relaxed);
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()["node"],
+            "remote"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn node_routing_coalesces_identical_public_reads_into_one_post() {
+    use crate::peer::Operation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for ranking in [false, true] {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (url, server) =
+            routing_mock("remote", Arc::new(AtomicUsize::new(4)), seen.clone()).await;
+        let mut cfg = config();
+        cfg.upstream.coalesce_public_reads = ranking;
+        // One admission permit and a short deadline: joined callers must not queue for it.
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            max_inflight: 1,
+            timeout_ms: 1000,
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let calls = (0..10)
+            .map(|_| {
+                let front = front.clone();
+                tokio::spawn(async move {
+                    front
+                        .public_call(if ranking {
+                            Operation::MusicRanking { music_id: 1 }
+                        } else {
+                            Operation::Version {}
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        for call in calls {
+            let value = call.await.unwrap().unwrap();
+            assert_eq!(value["node"], "remote");
+            assert_eq!(value.get("myRank").is_none(), ranking);
+            assert_eq!(value.get("myScore").is_none(), ranking);
         }
-    })
-    .await
-    .unwrap();
-    let copy = front.clone();
-    let second =
-        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(seen.load(Ordering::Relaxed), 1);
-    mode.store(0, Ordering::Relaxed);
-    first.abort();
-    assert!(first.await.unwrap_err().is_cancelled());
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()["node"],
-        "remote"
-    );
-    assert_eq!(seen.load(Ordering::Relaxed), 2);
-    server.abort();
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ Authenticated queries first establish the Master version; anonymous RPCs omit ac
 - `src/node_routing.rs`, `src/peer_transport.rs`: public query priorities, passive health and bounded peer calls.
 - `src/deployment.rs`, `src/accounts.rs`: region assembly, account selection and credential reload.
 - `src/response_cache.rs`: bounded memory/Redis cache with opt-in stale refresh.
+- `src/single_flight.rs`: in-process shared execution of identical in-flight reads.
 - `src/asset_dispatch.rs`, `src/asset_outbox.rs`: durable updater dispatch and recovery.
 - `build.rs`, `src/native.rs`: generated Protobuf/JSON codecs and static RPC dispatch.
 - `src/proto_source.rs`: shared source snapshot compiler and semantic fingerprint.

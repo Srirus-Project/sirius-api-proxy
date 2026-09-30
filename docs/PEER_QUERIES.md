@@ -60,7 +60,10 @@ mutation field. Unknown fields/operations fail validation. Request bodies are li
 Each accepted query executes on this node's local GameClient, under its normal admission,
 timeout, account serialization and response-cache policies. It never invokes another node.
 The schema hash is rechecked after acquiring admission and the protocol read barrier, preventing
-a reload from changing a queued request's contract before execution.
+a reload from changing a queued request's contract before execution. Identical concurrent
+queries with the same identity share one local execution like local public reads
+([shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)); each still receives its own
+reply with its own `request_id`, and the wire format is unchanged.
 
 HTTP 200 contains the request identity/id and a typed outcome: `status: success` with `data`,
 or `status: failure` with `kind`. The reply also carries the executor's sanitized `observation`. Failure types are `identity_mismatch`, `unsupported_operation`,

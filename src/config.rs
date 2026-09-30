@@ -81,6 +81,11 @@ pub struct UpstreamConfig {
     /// Total attempts for verified anonymous read RPCs; authenticated reads never replay.
     pub anonymous_attempts: usize,
     pub retry_delay_ms: u64,
+    /// Anonymous calls in flight at once while `session_lock` is true; omitted means
+    /// min(4, `max_inflight`). 1 restores the 1.2.x serialization of anonymous calls.
+    pub anonymous_max_inflight: Option<usize>,
+    /// Also share one execution among identical concurrent ranking reads (one account's result).
+    pub coalesce_public_reads: bool,
 }
 impl Default for UpstreamConfig {
     fn default() -> Self {
@@ -93,6 +98,8 @@ impl Default for UpstreamConfig {
             max_inflight: 64,
             anonymous_attempts: 1,
             retry_delay_ms: 250,
+            anonymous_max_inflight: None,
+            coalesce_public_reads: false,
         }
     }
 }
@@ -110,12 +117,21 @@ impl UpstreamConfig {
             || !(1..=4096).contains(&self.max_inflight)
             || !(1..=5).contains(&self.anonymous_attempts)
             || !(1..=10_000).contains(&self.retry_delay_ms)
+            || self
+                .anonymous_max_inflight
+                .is_some_and(|n| !(1..=64).contains(&n) || n > self.max_inflight)
         {
             return Err(AppError::Config(
                 "upstream request policy exceeds supported bounds",
             ));
         }
         Ok(())
+    }
+    /// Anonymous call slots used while `session_lock` is true.
+    pub fn anonymous_slots(&self) -> usize {
+        self.anonymous_max_inflight
+            .unwrap_or(4)
+            .min(self.max_inflight)
     }
 }
 

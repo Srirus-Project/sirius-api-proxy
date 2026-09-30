@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Identical concurrent Version, server-list and announcement reads share one upstream call
+  (and one peer POST under node routing), even with the response cache disabled; the outcome,
+  errors and timeouts included, answers every joined request, each within its own deadline.
+  Rankings join only with `upstream.coalesce_public_reads: true`. Profiles, decks, private data
+  and named-account calls never do. API and peer wire format are unchanged.
+- The per-region lock that serialized every call without an account under `session_lock: true`
+  is replaced by `upstream.anonymous_max_inflight` (default 4, capped by `max_inflight`), so a
+  slow Version no longer holds back announcement reads. This changes live traffic: up to four
+  anonymous RPCs now overlap. `anonymous_max_inflight: 1` restores the 1.2.x serialization.
+
 ## 1.2.4
 
 Behavior restored from a second comparison with the original (Haruki-Sekai-API `9a53714`),

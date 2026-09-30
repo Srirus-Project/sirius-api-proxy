@@ -202,7 +202,7 @@ Original: `CacheTtlConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:246-298`.
 | --- | --- | --- | --- |
 | `ranking_top100` (1 s) | ADAPTED | `response_cache.route_ttl_ms.event_rankings` (`src/response_cache.rs:11-19`, `:44`, `:56`) | Milliseconds instead of fractional seconds. Sirius also has `song_rankings` and `challenge_rankings`. |
 | `ranking_border` (30 s) | ADAPTED | `event_rankings` | The Sirius protocol has one event ranking RPC (`src/routes.rs:4`), with no separate border call. |
-| `static` (`/system`, `/information`, 300 s) | ADAPTED | `announcements` / `announcement` TTLs | `Version` is never cached. |
+| `static` (`/system`, `/information`, 300 s) | ADAPTED | `announcements` / `announcement` TTLs | `Version` is never cached, but identical concurrent Version calls share one RPC since 1.3.0 ([Decision 11](#decisions)). |
 | `max_stale` (30 s) | ADAPTED | `stale_while_revalidate_ms` (default 0, off; `src/response_cache.rs:42`, `:54`) | Opt-in instead of on by default. |
 
 ## `registry`
@@ -339,6 +339,23 @@ These generic capabilities are intentionally not restored in their original form
    429/503 and uses 409 for an Idempotency-Key conflict, so Sirius resubmits 429/503 (same key,
    one reconciliation interval apart, 10 times) and treats 409 and other 4xx as terminal without
    reading the body. See [ASSET_DISPATCH.md](ASSET_DISPATCH.md#durable-state-and-recovery-boundaries).
+11. **Request coalescing is in-process, keyed by the Sirius protocol identity, and opt-in for
+   rankings.** The original shares one execution among identical in-flight requests with a
+   `OnceCell` map and a pointer-checked drop guard, independent of Redis and shared errors
+   included (`Haruki-Sekai-API@9a53714:src/lib.rs:21-92`, `src/api/apis.rs:131-172`,
+   `:204-237`). Since 1.3.0 Sirius does the same at two points, independent of the response
+   cache: `GameClient::call_selected` and, under node routing, `Router::call`
+   (`src/single_flight.rs`). Differences: the key covers region, environment, endpoint, platform,
+   client version, protocol fingerprint and generation and the fingerprint a peer caller asserted,
+   not a URL; the entry is removed before the outcome is published, so a finished result is never
+   handed to a later caller; each joined caller waits only within its own deadline. Version,
+   server list and announcements always share. Rankings share only with
+   `upstream.coalesce_public_reads`, because in Sirius they spend a game account and one
+   account's failure would answer every joined request (the original has no anonymous calls to
+   distinguish). The Version bootstrap of authenticated calls never joins: it already holds an
+   admission permit and the protocol barrier, and waiting there for a flight that still needs
+   either would deadlock until the deadline. The 1.2.x per-region anonymous call lock is replaced
+   by `upstream.anonymous_max_inflight` (1 restores it).
 
 ## Original fields that were ignored by the original itself
 
@@ -365,7 +382,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | Section | Fields | Read at |
 | --- | --- | --- |
 | Root profile (`src/config.rs:5-70`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
-| `upstream` (`src/config.rs:72-84`) | all | `src/transport.rs:35-66`, `src/client.rs:157-158`, `:1002`, `:1022`, `:1130`, SDK proxy at `:1449-1462` |
+| `upstream` (`src/config.rs:72-89`) | all, including `anonymous_max_inflight` and `coalesce_public_reads` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:136`, `:166-168`, `:581`, `:1108`, `:1128`, `:1236`, SDK proxy at `:1559-1566`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
 | `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
@@ -443,3 +460,9 @@ classification and evidence:
   field was found (`resource_snapshot.network.update_timeout_seconds`) and fixed; none remain.
 - **Examples:** the example test now parses every commented optional block of every shipped
   example.
+
+## Revision for 1.3.0
+
+- **Request coalescing:** new [Decision 11](#decisions). `upstream.anonymous_max_inflight` and
+  `upstream.coalesce_public_reads` are added to the reverse check; the `cache_ttls` `static`
+  row notes that Version is coalesced though never cached.
