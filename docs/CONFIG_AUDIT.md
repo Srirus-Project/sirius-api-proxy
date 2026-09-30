@@ -356,6 +356,21 @@ These generic capabilities are intentionally not restored in their original form
    admission permit and the protocol barrier, and waiting there for a flight that still needs
    either would deadlock until the deadline. The 1.2.x per-region anonymous call lock is replaced
    by `upstream.anonymous_max_inflight` (1 restores it).
+12. **Path faults open a per-region path breaker instead of cooling accounts.** The original has
+   no account health; target faults (network, invalid HTTP status, upstream data and account
+   errors alike) count toward a per-target circuit breaker whose expiry is the half-open probe
+   (`Haruki-Sekai-API@9a53714:src/upstream.rs:185-260`). Sirius keeps account health and the node
+   router's breaker, and since 1.3.0 adds a breaker for the shared upstream path of each region
+   (`src/path_health.rs`), plus one for the Global SDK. A run of transport, protocol, deadline or
+   bare gRPC 14 faults stays the account's while one account saw it, and becomes the path's once
+   a second account or any anonymous call fails in it: the run's account charges are withdrawn
+   (`src/accounts.rs:333-344`, `src/client.rs:508-523`) and the path opens at
+   `account_pool.failure_threshold`, refusing new calls with 503 `upstream_unavailable` before any
+   upstream contact or login (`src/client.rs:561-567`, `:831`, `:919`, `:1053`). Differences:
+   attribution by distinct sources (the original cannot tell an account fault from a path
+   fault), one probe at a time every min(`cooldown_seconds`, 5 s), admission once per logical
+   call, gRPC 8/13 remain account faults, and SDK transient failures never cool an account. No
+   configuration is added.
 
 ## Original fields that were ignored by the original itself
 
@@ -388,7 +403,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
 | `master_database`, `master_sync`, `master_notify`, `node_routing` (+ `transport`), `asset_dispatch`, `response_cache`, `tls`, `access_log`, `logging` | all, including `connection.max_read_connections` (1.2.1) | Cited in the tables above; unchanged in use since 1.2.0 |
 | `client_auth` (`src/client_auth.rs:20-48`) | all | `src/client_auth.rs:84-100`, `:132-145`, `src/client.rs:165-172` |
-| `accounts[]` (`src/accounts.rs:24-34`), `account_pool` (`:35-48`) | all, including `global_identity_file` (1.2.1) | `src/accounts.rs:369-410`, `:277-278`, `:320-350`, `src/client.rs:688`, `:720`, `:766` |
+| `accounts[]` (`src/accounts.rs:24-34`), `account_pool` (`:35-48`) | all, including `global_identity_file` (1.2.1) | `src/accounts.rs:81-101`, `:333-344`, `:346-429`, `:619-650`; path health since 1.3.0: `src/path_health.rs:74-83`, `src/client.rs:569-596` ([Decision 12](#decisions)) |
 | `global_login` (1.2.1, `src/global_account.rs:29-47`) | `sdk_origin`, `sdk_app_key_env`, `sdk_timeout_ms` | `src/client.rs:1445-1471` |
 | | `login_min_interval_seconds`, `max_logins_per_day` | `src/global_account.rs:218-235` |
 | | `aegis_cooldown_seconds`, `concurrent_device_limit` | `src/accounts.rs:330-345` |
@@ -466,3 +481,5 @@ classification and evidence:
 - **Request coalescing:** new [Decision 11](#decisions). `upstream.anonymous_max_inflight` and
   `upstream.coalesce_public_reads` are added to the reverse check; the `cache_ttls` `static`
   row notes that Version is coalesced though never cached.
+- **Path health:** new [Decision 12](#decisions). `account_pool` now also sets the thresholds of
+  the per-region path breaker; its reverse-check citations are updated.

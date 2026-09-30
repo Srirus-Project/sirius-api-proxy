@@ -72,7 +72,9 @@ Account/protocol reload changes generations before subsequent calls can access
 entries. Changed credentials and protocol fingerprints also change keys across
 process restarts. Entries from previous scopes expire naturally without flushing
 an operator's shared database. A cache hit does not count as an upstream health
-success and cannot re-enable a quarantined account. Known maintenance bypasses hits.
+success and cannot re-enable a quarantined account. Known maintenance bypasses hits. Hits
+are served while the region's [upstream path is open](REQUEST_POLICY.md#upstream-path-health):
+lookups come before path admission.
 
 TTL accepts 1..300000 ms. Memory accepts 1..100000 entries, a 1 KiB..1 GiB total
 budget and a 256-byte..8 MiB entry cap no larger than the total. Redis entry caps

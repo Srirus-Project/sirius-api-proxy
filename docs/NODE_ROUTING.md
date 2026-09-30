@@ -44,7 +44,8 @@ All target attempts and admission share one absolute deadline. Request/connect/b
 apply to each HTTP peer attempt. Anonymous reads can continue after target transport/protocol
 failures while budget remains. Authenticated queries continue only when the attempt is known not
 to have executed: connection failure, contract/capability rejection, or an explicit account
-admission rejection before game dispatch. Ambiguous timeout/transport/protocol failures return
+admission rejection before game dispatch, which also covers an executor whose
+[upstream path is open](REQUEST_POLICY.md#upstream-path-health) (no wire change). Ambiguous timeout/transport/protocol failures return
 immediately for authenticated reads. No concurrent hedging or same-target retry is performed by
 the router. The executing node retains its existing local anonymous retry policy.
 Before any target is chosen, identical concurrent public reads (same identity, protocol

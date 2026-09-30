@@ -67,7 +67,8 @@ reply with its own `request_id`, and the wire format is unchanged.
 
 HTTP 200 contains the request identity/id and a typed outcome: `status: success` with `data`,
 or `status: failure` with `kind`. The reply also carries the executor's sanitized `observation`. Failure types are `identity_mismatch`, `unsupported_operation`,
-`account_unavailable`, `unavailable_before_dispatch`, `timeout`, `transport`, `protocol`, `not_found`
+`account_unavailable`, `unavailable_before_dispatch` (no local account, or since 1.3.0 an
+[open upstream path](REQUEST_POLICY.md#upstream-path-health); nothing reached the game), `timeout`, `transport`, `protocol`, `not_found`
 (1.2.2: a Global looked-up player does not exist; terminal, no failover or node cooldown), or
 `game` with `grpc_status`. A pre-1.2.2 caller cannot parse `not_found` and records a protocol
 fault for that node, so upgrade routing callers before or together with their executors.

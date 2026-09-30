@@ -52,10 +52,61 @@ pub(crate) struct Credentials {
     pub(crate) player_id: String,
     pub(crate) credential: String,
 }
+#[derive(Default)]
 struct Health {
+    /// Consecutive transient failures.
     failures: u32,
+    /// The part of `failures` charged as path-class faults during path streak `path_streak`;
+    /// withdrawn when that streak is attributed to the path (see [`crate::path_health`]).
+    path_failures: u32,
+    path_streak: u64,
+    /// Cooldown from a signal: AEGIS_*, CONCURRENT_DEVICE, the login interval or daily cap.
     until: Option<Instant>,
+    /// Cooldown from reaching `failure_threshold`.
+    threshold_until: Option<Instant>,
     disabled: bool,
+}
+impl Health {
+    fn cooldown_until(&self) -> Option<Instant> {
+        self.until.max(self.threshold_until)
+    }
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.path_failures = 0;
+        self.until = None;
+        self.threshold_until = None;
+    }
+    /// A transient failure; reaching the threshold cools the account down. `streak` marks a
+    /// path-class fault charged during that path streak.
+    fn transient(&mut self, policy: &PoolPolicy, streak: Option<u64>) {
+        self.failures = self.failures.saturating_add(1);
+        if let Some(streak) = streak {
+            if self.path_streak != streak {
+                self.path_streak = streak;
+                self.path_failures = 0;
+            }
+            self.path_failures = self.path_failures.saturating_add(1);
+        }
+        if self.failures >= policy.failure_threshold {
+            self.threshold_until =
+                Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
+        }
+    }
+    /// A path-class fault (timeout, transport, protocol, bare gRPC 14), paid as `charge` says.
+    fn path_fault(&mut self, policy: &PoolPolicy, charge: Charge) {
+        if let Charge::Account { streak } = charge {
+            self.transient(policy, streak);
+        }
+    }
+}
+/// Who pays for a path-class fault, decided by [`crate::path_health::PathHealth::charge`] when
+/// the call is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Charge {
+    /// The account; `streak` is the path streak the fault belongs to, if one is in progress.
+    Account { streak: Option<u64> },
+    /// The shared path: the account is not charged.
+    Path,
 }
 pub(crate) enum Source {
     Static(Credentials),
@@ -70,6 +121,8 @@ pub(crate) struct Account {
 }
 /// Game headers for one authenticated call. Built per call; never stored or logged.
 pub(crate) struct Auth {
+    /// Configured account name (not a secret): the source of path-health attribution.
+    pub account: String,
     pub player_id: String,
     pub credential: String,
     /// Global only: the SDK uid sent as `x-player-bid`.
@@ -223,8 +276,10 @@ pub fn validate(config: &Config) -> Result<(), AppError> {
 }
 impl Account {
     pub fn available(&self) -> bool {
-        let h = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        !h.disabled && h.until.is_none_or(|until| until <= Instant::now())
+        let h = self.health();
+        !h.disabled
+            && h.cooldown_until()
+                .is_none_or(|until| until <= Instant::now())
     }
     pub(crate) fn global(&self) -> Option<&GlobalAccount> {
         match &self.source {
@@ -246,6 +301,7 @@ impl Account {
     pub(crate) fn auth(&self) -> Option<Auth> {
         match &self.source {
             Source::Static(c) => Some(Auth {
+                account: self.name.clone(),
                 player_id: c.player_id.clone(),
                 credential: c.credential.clone(),
                 bid: None,
@@ -253,6 +309,7 @@ impl Account {
             Source::Global(g) => {
                 let state = g.state();
                 state.session.as_ref().map(|s| Auth {
+                    account: self.name.clone(),
                     player_id: s.player_id.clone(),
                     credential: s.credential.clone(),
                     bid: Some(g.identity.sdk.uid.clone()),
@@ -270,22 +327,29 @@ impl Account {
         let mut h = self.health();
         h.until = Some(h.until.map_or(until, |current| current.max(until)));
     }
-    /// A transient failure; reaching the threshold cools the account down.
-    pub(crate) fn transient_failure(&self, policy: &PoolPolicy) {
+    /// Withdraws the path-class failures charged during path streak `streak`, which has turned
+    /// out to be the path's fault. The threshold cooldown is lifted if the remaining failures
+    /// are below the threshold; signal cooldowns and `disabled` are never touched.
+    pub(crate) fn revoke_path_failures(&self, streak: u64, policy: &PoolPolicy) {
         let mut h = self.health();
-        h.failures = h.failures.saturating_add(1);
-        if h.failures >= policy.failure_threshold {
-            h.until = Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
+        if h.path_streak != streak || h.path_failures == 0 {
+            return;
+        }
+        h.failures = h.failures.saturating_sub(h.path_failures);
+        h.path_failures = 0;
+        if h.failures < policy.failure_threshold {
+            h.threshold_until = None;
         }
     }
     /// Global: apply a login or call outcome signalled by `x-sirius-error-code` (preferred) or
-    /// the gRPC status.
+    /// the gRPC status. `charge` decides who pays for a path-class fault.
     pub(crate) fn global_signal(
         &self,
         result: &Result<serde_json::Value, AppError>,
         code: Option<&str>,
         policy: &PoolPolicy,
         login: &LoginConfig,
+        charge: Charge,
     ) {
         let Some(g) = self.global() else {
             return;
@@ -293,9 +357,7 @@ impl Account {
         let now = Instant::now();
         let error = match result {
             Ok(_) => {
-                let mut h = self.health();
-                h.failures = 0;
-                h.until = None;
+                self.health().succeeded();
                 let mut s = g.state();
                 s.invalidations = 0;
                 s.last_error_code = None;
@@ -359,7 +421,8 @@ impl Account {
                 }
                 (_, Some(7)) => self.disable(),
                 (AppError::Timeout | AppError::Transport | AppError::Protocol, _)
-                | (_, Some(8 | 13 | 14)) => self.transient_failure(policy),
+                | (_, Some(14)) => self.health().path_fault(policy, charge),
+                (_, Some(8 | 13)) => self.health().transient(policy, None),
                 _ => {}
             },
         }
@@ -437,11 +500,7 @@ impl Pool {
                 source,
                 lock: tokio::sync::Mutex::new(()),
                 active: AtomicUsize::new(0),
-                health: Mutex::new(Health {
-                    failures: 0,
-                    until: None,
-                    disabled: false,
-                }),
+                health: Mutex::new(Health::default()),
             }));
         }
         Ok(Self {
@@ -472,6 +531,12 @@ impl Pool {
             state.attempts = old.attempts.clone();
             state.concurrent_device = old.concurrent_device.clone();
             state.last_login_at = old.last_login_at;
+        }
+    }
+    /// Applies [`Account::revoke_path_failures`] to every account.
+    pub(crate) fn revoke_path_failures(&self, streak: u64, policy: &PoolPolicy) {
+        for account in &self.entries {
+            account.revoke_path_failures(streak, policy);
         }
     }
     pub(crate) fn find(&self, name: &str) -> Option<Arc<Account>> {
@@ -508,13 +573,13 @@ impl Pool {
             .iter()
             .map(|a| {
                 let h = a.health();
-                let cooling = h.until.is_some_and(|t| t > now);
+                let cooling = h.cooldown_until().is_some_and(|t| t > now);
                 let mut status = AccountStatus {
                     name: a.name.clone(),
                     active_calls: a.active.load(Ordering::Relaxed),
                     consecutive_failures: h.failures,
                     cooldown_remaining_seconds: h
-                        .until
+                        .cooldown_until()
                         .map(|t| {
                             let remaining = t.saturating_duration_since(now);
                             remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
@@ -550,15 +615,18 @@ impl Pool {
     }
 }
 impl Lease {
-    pub fn report(
+    /// Applies a call outcome to the account. `charge` decides who pays for a path-class fault.
+    pub(crate) fn report(
         &self,
         result: &Result<serde_json::Value, AppError>,
         code: Option<&str>,
         policy: &PoolPolicy,
         login: Option<&LoginConfig>,
+        charge: Charge,
     ) {
         if let (Some(login), Some(_)) = (login, self.account.global()) {
-            self.account.global_signal(result, code, policy, login);
+            self.account
+                .global_signal(result, code, policy, login, charge);
             return;
         }
         if code == Some("UNDER_MAINTENANCE") {
@@ -567,25 +635,15 @@ impl Lease {
         }
         let mut h = self.account.health();
         match result {
-            Ok(_) => {
-                h.failures = 0;
-                h.until = None;
-            }
+            Ok(_) => h.succeeded(),
             Err(AppError::Grpc(7 | 16)) => {
                 h.disabled = true;
                 h.failures = h.failures.saturating_add(1);
             }
             Err(
-                AppError::Timeout
-                | AppError::Transport
-                | AppError::Protocol
-                | AppError::Grpc(8 | 13 | 14),
-            ) => {
-                h.failures = h.failures.saturating_add(1);
-                if h.failures >= policy.failure_threshold {
-                    h.until = Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
-                }
-            }
+                AppError::Timeout | AppError::Transport | AppError::Protocol | AppError::Grpc(14),
+            ) => h.path_fault(policy, charge),
+            Err(AppError::Grpc(8 | 13)) => h.transient(policy, None),
             _ => {}
         }
     }

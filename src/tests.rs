@@ -2601,6 +2601,7 @@ fn every_error_has_a_stable_code_and_json_body() {
         (AppError::NotFound, 404, "not_found"),
         (AppError::InvalidRequest, 400, "invalid_request"),
         (AppError::AccountUnavailable, 503, "account_unavailable"),
+        (AppError::UpstreamUnavailable, 503, "upstream_unavailable"),
         (AppError::Maintenance(2), 503, "maintenance"),
         (AppError::Grpc(2), 502, "upstream_grpc"),
         (AppError::Grpc(14), 503, "upstream_grpc"),
@@ -2655,6 +2656,520 @@ fn node_health_reports_each_transition_once() {
             "None"
         ]
     );
+}
+#[test]
+fn path_health_attributes_streaks_and_admits_one_probe_at_a_time() {
+    use crate::{
+        accounts::Charge,
+        path_health::{Outcome, PathHealth, Transition},
+    };
+    let policy = crate::accounts::PoolPolicy {
+        failure_threshold: 2,
+        cooldown_seconds: 60,
+    };
+    let fault = Outcome::Fault("upstream_timeout");
+    let path = PathHealth::new(&policy, true);
+    assert_eq!(path.interval(), Duration::from_secs(5));
+    // Faults seen by one account alone stay that account's.
+    for _ in 0..3 {
+        let change = path.record(Some("a"), fault);
+        assert_eq!(change.transition, Transition::None);
+        assert!(change.attributed.is_none());
+    }
+    assert_eq!(path.charge(), Charge::Account { streak: Some(1) });
+    assert_eq!(path.status()["state"], "closed");
+    assert!(path.admit().is_some());
+    // A second account attributes the streak to the path, which opens at the threshold.
+    let change = path.record(Some("b"), fault);
+    assert_eq!(change.transition, Transition::Opened);
+    assert_eq!(change.attributed, Some(1));
+    assert!(path.attributed(1));
+    assert_eq!(path.charge(), Charge::Path);
+    assert_eq!(path.status()["state"], "open");
+    assert!(path.status()["cooldown_remaining_ms"].as_u64().unwrap() > 4000);
+    assert!(path.admit().is_none());
+    // Exactly one probe once the interval has passed; its failure restarts the interval.
+    path.expire_for_test();
+    let probe = path.admit().expect("probe");
+    assert!(path.admit().is_none());
+    assert_eq!(path.status()["state"], "probing");
+    assert_eq!(path.record(None, fault).transition, Transition::ProbeFailed);
+    drop(probe);
+    assert!(path.admit().is_none());
+    // A probe dropped without an outcome releases its slot.
+    path.expire_for_test();
+    drop(path.admit().expect("probe"));
+    let probe = path.admit().expect("probe after release");
+    assert_eq!(
+        path.record(Some("a"), Outcome::Healthy).transition,
+        Transition::Recovered
+    );
+    drop(probe);
+    assert_eq!(
+        path.status(),
+        json!({"state":"closed","failures":0,"attributed":false,"cooldown_remaining_ms":0})
+    );
+    assert_eq!(path.charge(), Charge::Account { streak: None });
+    // The next streak has a new number; an anonymous fault attributes it at once.
+    let change = path.record(None, fault);
+    assert_eq!(change.transition, Transition::None);
+    assert_eq!(change.attributed, Some(2));
+    assert!(!path.attributed(1) && path.attributed(2));
+    assert_eq!(path.record(Some("a"), fault).transition, Transition::Opened);
+    // A fault while open without a probe only extends the interval.
+    assert_eq!(path.record(Some("a"), fault).transition, Transition::None);
+    // The SDK path attributes every fault, whatever its source.
+    let sdk = PathHealth::new(
+        &crate::accounts::PoolPolicy {
+            failure_threshold: 2,
+            cooldown_seconds: 1,
+        },
+        false,
+    );
+    assert_eq!(sdk.interval(), Duration::from_secs(1));
+    assert_eq!(sdk.record(Some("a"), fault).attributed, Some(1));
+    assert_eq!(sdk.record(Some("a"), fault).transition, Transition::Opened);
+}
+#[test]
+fn account_path_charges_are_withdrawn_only_for_their_streak() {
+    use crate::accounts::{Charge, PoolPolicy};
+    let policy = PoolPolicy {
+        failure_threshold: 2,
+        cooldown_seconds: 60,
+    };
+    let mut pool = crate::accounts::Pool::load(&pool_config(), 1).unwrap();
+    let lease = pool.select(Some("one"), false).unwrap();
+    let report = |error: AppError, charge: Charge| {
+        lease.report(&Err(error), None, &policy, None, charge);
+    };
+    let one = |pool: &crate::accounts::Pool| {
+        let status = serde_json::to_value(pool.status()).unwrap()[0].clone();
+        (
+            status["consecutive_failures"].as_u64().unwrap(),
+            status["cooldown_remaining_seconds"].as_u64().unwrap() > 0,
+            status["disabled"].as_bool().unwrap(),
+        )
+    };
+    // gRPC 13 is always the account's; the timeout belongs to path streak 1.
+    report(AppError::Grpc(13), Charge::Account { streak: Some(1) });
+    report(AppError::Timeout, Charge::Account { streak: Some(1) });
+    assert_eq!(one(&pool), (2, true, false));
+    pool.revoke_path_failures(2, &policy);
+    assert_eq!(one(&pool), (2, true, false));
+    pool.revoke_path_failures(1, &policy);
+    assert_eq!(one(&pool), (1, false, false));
+    assert!(lease.account.available());
+    // Nothing is charged while the path pays; charges outside a streak are never withdrawn.
+    report(AppError::Transport, Charge::Path);
+    assert_eq!(one(&pool), (1, false, false));
+    report(AppError::Protocol, Charge::Account { streak: None });
+    pool.revoke_path_failures(1, &policy);
+    assert_eq!(one(&pool), (2, true, false));
+    // Signal cooldowns and disabling are never lifted.
+    lease.report(&Ok(json!({})), None, &policy, None, Charge::Path);
+    assert_eq!(one(&pool), (0, false, false));
+    lease
+        .account
+        .cool_down(std::time::Instant::now() + Duration::from_secs(60));
+    report(AppError::Grpc(14), Charge::Account { streak: Some(3) });
+    pool.revoke_path_failures(3, &policy);
+    assert_eq!(one(&pool), (0, true, false));
+    report(AppError::Grpc(16), Charge::Account { streak: Some(3) });
+    report(AppError::Timeout, Charge::Account { streak: Some(3) });
+    pool.revoke_path_failures(3, &policy);
+    assert_eq!(one(&pool), (1, true, true));
+}
+/// An application log file subscriber made the thread default for the returned guard.
+fn capture_application_log(
+    path: &std::path::Path,
+) -> (
+    tracing::subscriber::DefaultGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing::Dispatch,
+) {
+    let config = crate::application_log::Config {
+        level: crate::application_log::Level::Info,
+        format: crate::access_log::Format::Json,
+        output: crate::access_log::Output::File {
+            path: path.to_path_buf(),
+            rotation: crate::access_log::Rotation::Never,
+            max_files: 1,
+        },
+        queue_capacity: 128,
+    };
+    let (subscriber, guard) = config.subscriber().unwrap();
+    // A second live dispatcher keeps callsite interest from being cached by parallel tests.
+    let second = tracing::Dispatch::new(tracing_subscriber::registry());
+    (tracing::subscriber::set_default(subscriber), guard, second)
+}
+#[tokio::test]
+async fn path_faults_from_two_accounts_open_the_path_and_leave_accounts_healthy() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("application.log");
+    let (default, guard, second) = capture_application_log(&log);
+    let mut cfg = pool_config();
+    cfg.account_pool.failure_threshold = 2;
+    cfg.account_pool.cooldown_seconds = 1;
+    let mut slow = empty_profile_reply();
+    slow.delay = Duration::from_millis(500);
+    let f = fixture(vec![
+        Reply::version(),
+        slow.clone(),
+        slow,
+        empty_profile_reply(),
+    ])
+    .await;
+    let mut c = client(&f, cfg);
+    GameClient::set_test_timeout(&mut c, Duration::from_millis(100));
+    c.call(VERSION, json!({})).await.unwrap();
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    assert!(matches!(profile().await, Err(AppError::Timeout)));
+    // A single account's timeout is still charged to it.
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 1);
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["attributed"], false);
+    assert!(matches!(profile().await, Err(AppError::Timeout)));
+    // The second account's timeout makes it the path's: both accounts stay healthy.
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 0);
+        assert_eq!(account["cooldown_remaining_seconds"], 0);
+    }
+    assert_eq!(status["path"]["state"], "open");
+    assert_eq!(status["path"]["failures"], 2);
+    assert_eq!(status["path"]["attributed"], true);
+    assert!(status.get("sdk_path").is_none());
+    // New calls are refused before any upstream contact.
+    assert!(matches!(
+        profile().await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    let app = api::router(c.clone(), "api".into(), "internal".into());
+    let get = |path: &'static str, token: &'static str| {
+        app.clone().oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+    };
+    let response = get("/api/v1/system", "api").await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        body(response).await,
+        json!({"error":"game upstream is temporarily unreachable","code":"upstream_unavailable"})
+    );
+    let response = get("/internal/v1/accounts", "internal").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let accounts = body(response).await;
+    let path = accounts["path"].as_object().unwrap();
+    assert_eq!(
+        path.keys().collect::<Vec<_>>(),
+        ["attributed", "cooldown_remaining_ms", "failures", "state"]
+    );
+    assert!(!accounts.to_string().contains("player-"));
+    assert!(!accounts.to_string().contains("secret-"));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    // After the probe interval one call goes out; its answer closes the path.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    profile().await.unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+    drop((default, second));
+    drop(guard);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let opened = rows
+        .iter()
+        .find(|row| row["fields"]["event"] == "upstream_path_opened")
+        .expect("opened event");
+    assert_eq!(opened["level"], "WARN");
+    assert_eq!(opened["fields"]["region"], "jp");
+    assert_eq!(opened["fields"]["error_code"], "upstream_timeout");
+    assert_eq!(opened["fields"]["cooldown_ms"], 1000);
+    assert!(rows
+        .iter()
+        .any(|row| row["fields"]["event"] == "upstream_path_recovered"));
+    assert!(!text.contains("\"one\"") && !text.contains("\"two\""));
+    assert!(!text.contains("player-") && !text.contains("secret-"));
+}
+fn grpc_reply(status: &str) -> Reply {
+    let mut reply = empty_profile_reply();
+    reply
+        .trailers
+        .insert("grpc-status", status.parse().unwrap());
+    reply
+}
+fn protocol_failure_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.http_status = 502;
+    reply
+}
+#[tokio::test]
+async fn single_account_path_faults_cool_only_that_account() {
+    let mut cfg = pool_config();
+    cfg.account_pool.cooldown_seconds = 60;
+    let f = fixture(vec![
+        Reply::version(),
+        grpc_reply("14"),
+        empty_profile_reply(),
+        grpc_reply("14"),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    for expected in [Err(AppError::Grpc(14)), Ok(()), Err(AppError::Grpc(14))] {
+        let result = c
+            .call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await
+            .map(|_| ());
+        assert_eq!(format!("{result:?}"), format!("{expected:?}"));
+    }
+    let status = c.account_status().unwrap();
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen[1].1["x-player-id"], "player-one");
+    assert_eq!(seen[2].1["x-player-id"], "player-two");
+    assert_eq!(seen[3].1["x-player-id"], "player-one");
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 2);
+    assert!(
+        status["accounts"][0]["cooldown_remaining_seconds"]
+            .as_u64()
+            .unwrap()
+            > 50
+    );
+    assert_eq!(status["accounts"][1]["consecutive_failures"], 0);
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["failures"], 1);
+}
+#[tokio::test]
+async fn grpc_8_and_13_stay_account_faults_and_never_open_the_path() {
+    let mut cfg = pool_config();
+    cfg.account_pool.failure_threshold = 1;
+    let f = fixture(vec![Reply::version(), grpc_reply("13"), grpc_reply("8")]).await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    for status in [13, 8] {
+        let result = c
+            .call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await;
+        assert!(matches!(result, Err(AppError::Grpc(s)) if s == status));
+    }
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 1);
+        assert!(account["cooldown_remaining_seconds"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["failures"], 0);
+}
+#[tokio::test]
+async fn anonymous_path_faults_open_the_path_without_touching_accounts() {
+    let f = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let c = client(&f, pool_config());
+    for _ in 0..2 {
+        assert!(matches!(
+            c.call(VERSION, json!({})).await,
+            Err(AppError::Protocol)
+        ));
+    }
+    let status = c.account_status().unwrap();
+    assert_eq!(status["path"]["state"], "open");
+    // The bootstrap Version of an authenticated call is refused before contact.
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 0);
+        assert_eq!(account["active_calls"], 0);
+    }
+}
+#[tokio::test]
+async fn application_codes_on_grpc_14_are_answers_not_path_faults() {
+    let f = fixture(vec![
+        unavailable_reply(),
+        unavailable_reply().header("x-sirius-error-code", "AEGIS_SERVER_FULL"),
+        unavailable_reply(),
+        maintenance_reply("14"),
+    ])
+    .await;
+    let c = client(&f, config());
+    let path = || c.account_status().unwrap()["path"].clone();
+    assert!(c.call(VERSION, json!({})).await.is_err());
+    assert_eq!(path()["failures"], 1);
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(path()["failures"], 0);
+    assert!(c.call(VERSION, json!({})).await.is_err());
+    assert_eq!(path()["failures"], 1);
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Maintenance(14))
+    ));
+    assert_eq!(path()["failures"], 0);
+    assert_eq!(path()["state"], "closed");
+}
+#[tokio::test]
+async fn cancelled_calls_and_queue_timeouts_record_no_path_fault() {
+    // A probe cancelled before its deadline records nothing and releases the probe slot.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = Reply::version();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        protocol_failure_reply(),
+        protocol_failure_reply(),
+        blocked,
+        Reply::version(),
+    ])
+    .await;
+    let c = client(&f, config());
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    c.test_path(false).expire_for_test();
+    let a = c.clone();
+    let probe = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    wait_for_requests(&f, 3).await;
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "probing");
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    let path = c.account_status().unwrap()["path"].clone();
+    assert_eq!(
+        (path["state"].as_str(), path["failures"].as_u64()),
+        (Some("open"), Some(2))
+    );
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+    gate.add_permits(1);
+
+    // A call that waits for the account's session lock until its (routed) deadline never
+    // reached the upstream: it is not a path fault.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![Reply::version(), blocked]).await;
+    let mut cfg = account_config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        timeout_ms: 200,
+        ..Default::default()
+    });
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    let a = c.clone();
+    let first = tokio::spawn(async move {
+        a.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await
+    });
+    wait_for_requests(&f, 2).await;
+    assert!(matches!(
+        c.public_call(crate::peer::Operation::Profile { profile_id: 2 })
+            .await,
+        Err(AppError::Timeout)
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["path"]["failures"], 0);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn cache_hits_are_served_while_the_path_is_open() {
+    let f = fixture(vec![
+        announcements_reply(),
+        protocol_failure_reply(),
+        protocol_failure_reply(),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    let cached = c
+        .call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "open");
+    assert_eq!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await
+            .unwrap(),
+        cached
+    );
+    assert!(matches!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":1}))
+            .await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn open_path_answers_peers_unavailable_before_dispatch_and_routing_fails_over() {
+    assert!(matches!(
+        crate::peer::Failure::from(AppError::UpstreamUnavailable),
+        crate::peer::Failure::UnavailableBeforeDispatch {}
+    ));
+    let f = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let c = client(&f, config());
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    let sha = c.protocol_status().unwrap().sha256;
+    assert!(matches!(
+        c.call_peer(VERSION, json!({}), &sha).await,
+        Err(AppError::PeerAccountUnavailable)
+    ));
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    let reply = body(peer_send(app, "peer", request).await).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"unavailable_before_dispatch"}})
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+
+    // A router whose local path is open fails an authenticated read over to the remote.
+    let upstream = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+    let remote = client(&upstream, account_config());
+    let (url, server) = peer_http_server(crate::peer::router(
+        remote,
+        "/internal/v1/peer",
+        "node-secret".into(),
+    ))
+    .await;
+    let local = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let mut cfg = account_config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        targets: vec![routing_target("remote", url, 10)],
+        ..Default::default()
+    });
+    let front = client(&local, cfg);
+    for _ in 0..2 {
+        assert!(front.call(VERSION, json!({})).await.is_err());
+    }
+    assert!(front
+        .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+        .await
+        .is_ok());
+    assert_eq!(local.received.lock().unwrap().len(), 2);
+    assert_eq!(upstream.received.lock().unwrap().len(), 2);
+    assert_eq!(
+        front.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        0
+    );
+    server.abort();
 }
 #[tokio::test]
 async fn framework_client_errors_are_json_without_echoing_input() {
@@ -15350,6 +15865,8 @@ mod global_accounts {
         paths(f).iter().filter(|p| *p == path).count()
     }
 
+    /// Scripted SDK "code" answered with HTTP 502 instead of an envelope (SDK_PROTOCOL).
+    const SDK_HTTP_ERROR: i64 = i64::MIN;
     /// Local OneSDK mock: verifies every signature and answers tourist/cache login.
     type SdkRequests = Arc<Mutex<Vec<(String, HeaderMap, BTreeMap<String, String>)>>>;
     struct SdkMock {
@@ -15396,6 +15913,10 @@ mod global_accounts {
                         .collect::<Vec<_>>();
                     let signed = map.get("sign") == Some(&global_sdk::sign(&unsigned, APP_KEY));
                     let code = scripted.lock().unwrap().pop_front().unwrap_or(0);
+                    if code == SDK_HTTP_ERROR {
+                        use axum::response::IntoResponse;
+                        return axum::http::StatusCode::BAD_GATEWAY.into_response();
+                    }
                     let body = if !signed {
                         json!({"code": -999, "message": "bad sign"})
                     } else if code != 0 {
@@ -15407,7 +15928,7 @@ mod global_accounts {
                         json!({"code": 0, "data": {"uid": map.get("uid").cloned().unwrap_or_default(),
                                "id_token": REFRESHED_ID_TOKEN}})
                     };
-                    axum::Json(body)
+                    axum::response::IntoResponse::into_response(axum::Json(body))
                 }
             },
         );
@@ -16116,6 +16637,77 @@ mod global_accounts {
         c.reload_accounts().await.unwrap();
         c.call(PLAYER_DATA, json!({})).await.unwrap();
         assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_transient_failures_open_the_sdk_path_and_never_cool_the_account() {
+        let e = env(Region::En).await;
+        e.sdk
+            .codes
+            .lock()
+            .unwrap()
+            .extend([SDK_HTTP_ERROR, SDK_HTTP_ERROR]);
+        let c = GameClient::for_test(e.cfg.clone());
+        let sdk_path = |c: &GameClient| c.account_status().unwrap()["sdk_path"].clone();
+        assert_eq!(sdk_path(&c)["state"], "closed");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        let s = status(&c);
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(s["cooldown_remaining_seconds"], 0);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["last_error_code"], "SDK_PROTOCOL");
+        assert_eq!(sdk_path(&c)["failures"], 1);
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(sdk_path(&c)["state"], "open");
+        assert_eq!(status(&c)["consecutive_failures"], 0);
+        // An open SDK path refuses before the SDK request and spends no login.
+        let sdk_requests = e.sdk.requests.lock().unwrap().len();
+        assert_eq!(status(&c)["logins_24h"], 2);
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::UpstreamUnavailable)
+        ));
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), sdk_requests);
+        assert_eq!(status(&c)["logins_24h"], 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
+        // The game path is untouched; a successful probe closes the SDK path.
+        assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+        c.test_path(true).expire_for_test();
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(sdk_path(&c)["state"], "closed");
+        assert_eq!(status(&c)["session_state"], "active");
+    }
+
+    #[tokio::test]
+    async fn open_game_path_refuses_global_calls_before_any_login() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(V, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .extend([(14, ""), (14, "")]);
+        for _ in 0..2 {
+            assert!(matches!(
+                c.call(SERVER_LIST, json!({})).await,
+                Err(AppError::Grpc(14))
+            ));
+        }
+        assert_eq!(c.account_status().unwrap()["path"]["state"], "open");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::UpstreamUnavailable)
+        ));
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
+        assert!(e.sdk.requests.lock().unwrap().is_empty());
+        let s = status(&c);
+        assert_eq!(s["logins_24h"], 0);
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(s["session_state"], "none");
     }
 
     #[tokio::test]

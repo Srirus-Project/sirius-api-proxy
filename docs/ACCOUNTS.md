@@ -45,15 +45,32 @@ is reported to account health once; the default runs each ranking request on its
 selection.
 
 A gRPC permission/authentication failure (7 or 16) disables the selected account until
-successful credential reload. Transport/protocol failures, deadlines and gRPC
-8/13/14 increment its failure count; reaching `failure_threshold` cools it down for
-`cooldown_seconds`. Threshold is 1..100 and cooldown is 1..3600 seconds. A successful
-call clears transient failures. Failures before an authenticated attempt (including
-anonymous bootstrap and queue deadlines) do not penalize the account, and neither does a
-response carrying `UNDER_MAINTENANCE` (whatever its gRPC status; it answers 503 `maintenance`).
-Exhaustion
-returns 503. The failed logical request is never automatically replayed with another
-account; a later request can select another healthy account.
+successful credential reload. gRPC 8/13 increment its failure count; reaching
+`failure_threshold` cools it down for `cooldown_seconds`. Threshold is 1..100 and cooldown is
+1..3600 seconds. A successful call clears transient failures. Failures before an authenticated
+attempt (including anonymous bootstrap and queue deadlines) do not penalize the account, and
+neither does a response carrying `UNDER_MAINTENANCE` (whatever its gRPC status; it answers 503
+`maintenance`). Exhaustion returns 503. The failed logical request is never automatically
+replayed with another account; a later request can select another healthy account.
+
+Path-class faults (transport and protocol failures, deadlines, and gRPC 14 without an
+application code) may belong to the shared upstream path rather than to the account, so each
+region tracks them separately (see
+[REQUEST_POLICY.md](REQUEST_POLICY.md#upstream-path-health)):
+
+- Consecutive path faults form a streak. While every fault of the streak came from one account,
+  each is charged to that account like gRPC 8/13 and can cool it down.
+- A second account, or any anonymous call (Version, announcements, server list and so on),
+  failing in the same streak makes it the path's fault: the streak's charges are withdrawn from
+  every account (lifting a threshold cooldown that no longer holds), later faults of the streak
+  charge no account, and the path opens at `failure_threshold` faults.
+- Any gRPC answer ends the streak. A single-account deployment without anonymous traffic
+  therefore behaves as before; a real outage no longer cools every account.
+
+Withdrawal never lifts signal cooldowns (`AEGIS_*`, `CONCURRENT_DEVICE`, the login interval or
+daily cap), gRPC 8/13 charges or a disabled account. The rule can occasionally excuse a bad
+account whose failure coincided with another's; it then needs `failure_threshold` new failures
+to cool again.
 
 ## Internal management
 
@@ -62,7 +79,7 @@ insert the region after `/internal/v1`, for example `/internal/v1/jp/accounts`.
 
 | Method and path | Behavior |
 | --- | --- |
-| `GET /internal/v1/accounts` | Names, generation, active/queued calls and health; Global accounts add session state; no player IDs or secrets |
+| `GET /internal/v1/accounts` | Names, generation, active/queued calls and health; Global accounts add session state; `path` (and on Global `sdk_path`) reports path health as `{state, failures, attributed, cooldown_remaining_ms}` with `state` `closed`, `open` or `probing`; no player IDs or secrets |
 | `POST /internal/v1/accounts/reload` | Read and validate all configured sources, drain logical calls, then atomically replace the pool |
 | `GET /internal/v1/accounts/{name}/identity` | Query the explicitly selected account's identity (JP: Whoami; Global: the PlayerLogin result) |
 | `GET /internal/v1/accounts/{name}/player-data` | Verify identity (JP) and query private data using the same account and lock |
@@ -173,7 +190,8 @@ A restart or `POST .../accounts/reload` drops the session, and the next request 
 Every login attempt counts toward `login_min_interval_seconds` and `max_logins_per_day`.
 A login that is not allowed yet cools the account down until it is, and the request returns
 503 without contacting the SDK or the game. Login history survives an account reload but not a
-restart.
+restart. While the region's game path or the SDK path is open, a login is refused with 503
+`upstream_unavailable` before the attempt is counted, so an outage spends no login budget.
 
 Signals are read from the `x-sirius-error-code` trailer first, then the gRPC status. The logical
 request that received a signal is never replayed.
@@ -189,7 +207,9 @@ request that received a signal is never replayed.
 | `UNDER_MAINTENANCE` | Recorded as maintenance; no account penalty |
 | gRPC 7 without a code | Disable the account |
 | SDK code 200007 (CAPTCHA), other nonzero SDK codes, a changed uid | Disable the account; complete verification in the official client |
-| Transport, deadline, malformed responses, gRPC 8/13/14 | Transient failure, as for JP |
+| SDK transport failure, deadline or malformed response (`SDK_TRANSPORT`, `SDK_PROTOCOL`) | Recorded as `last_error_code`; counts toward the SDK path, never cools the account (the login interval and daily cap bound retries). `failure_threshold` consecutive failures open the SDK path |
+| gRPC 8/13 | Transient failure, as for JP |
+| Transport, deadline, malformed responses, gRPC 14 without a code | Path-class fault, attributed as for JP |
 
 A disabled account stays disabled until `POST .../accounts/reload` or a restart. Reloading
 re-reads the identity file.

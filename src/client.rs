@@ -20,7 +20,10 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 
-use crate::accounts::Auth;
+use crate::{
+    accounts::{Auth, Charge},
+    path_health::{Outcome, PathHealth, Ticket},
+};
 
 /// Global `PLAYER_NOT_FOUND` on a lookup of another player names the target, not the account's
 /// own player: it must not drop the session or count toward disabling the account.
@@ -102,6 +105,48 @@ pub struct GameClient {
     snapshot_build: Mutex<()>,
     /// Global SDK client, present when an account uses `global_identity_file`.
     sdk: Option<crate::global_sdk::SdkClient>,
+    /// Health of this region's game path, shared by every account and anonymous call.
+    path: PathHealth,
+    /// Global: health of the SDK login path (present with `sdk`).
+    sdk_path: Option<PathHealth>,
+}
+/// One upstream attempt on a path. Its outcome is recorded when it is dropped, so an attempt
+/// abandoned at the logical deadline still counts as a timeout; one cancelled earlier, or never
+/// sent, counts for nothing.
+struct UpstreamAttempt<'a> {
+    client: &'a GameClient,
+    sdk: bool,
+    source: Option<String>,
+    deadline: tokio::time::Instant,
+    sent: bool,
+    /// Explicit outcome; `Some(None)` is neutral.
+    outcome: Option<Option<Outcome>>,
+    /// The response's `x-sirius-error-code` (only `[A-Z0-9_]`).
+    code: Option<String>,
+}
+impl UpstreamAttempt<'_> {
+    fn fault(&mut self, error: &AppError) {
+        self.outcome = Some(Some(Outcome::Fault(error.code())));
+    }
+}
+impl Drop for UpstreamAttempt<'_> {
+    fn drop(&mut self) {
+        let outcome = match self.outcome.take() {
+            Some(outcome) => outcome,
+            None if self.sent && tokio::time::Instant::now() >= self.deadline => {
+                Some(Outcome::Fault(if self.sdk {
+                    crate::global_sdk::SdkError::Transport.code()
+                } else {
+                    AppError::Timeout.code()
+                }))
+            }
+            None => None,
+        };
+        if let Some(outcome) = outcome {
+            self.client
+                .record_path(self.sdk, self.source.as_deref(), outcome);
+        }
+    }
 }
 fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
@@ -139,6 +184,11 @@ impl GameClient {
             .build(connector);
         let accounts = crate::accounts::Pool::load(&config, 1)?;
         let sdk = sdk_client(&config)?;
+        // Path health outlives account and protocol reloads.
+        let path = PathHealth::new(&config.account_pool, true);
+        let sdk_path = sdk
+            .as_ref()
+            .map(|_| PathHealth::new(&config.account_pool, false));
         let cdn_secrets = config
             .cdn_credential_env
             .iter()
@@ -210,6 +260,8 @@ impl GameClient {
             snapshot_http,
             snapshot_build: Mutex::new(()),
             sdk,
+            path,
+            sdk_path,
         }))
     }
     pub(crate) fn client_auth(&self) -> Option<&crate::client_auth::Authenticator> {
@@ -218,6 +270,14 @@ impl GameClient {
     #[cfg(test)]
     pub(crate) fn for_test(config: Config) -> Arc<Self> {
         Self::build(config, true).unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_path(&self, sdk: bool) -> &PathHealth {
+        if sdk {
+            self.sdk_path.as_ref().unwrap()
+        } else {
+            &self.path
+        }
     }
     #[cfg(test)]
     pub(crate) fn set_test_timeout(client: &mut Arc<Self>, duration: Duration) {
@@ -430,11 +490,109 @@ impl GameClient {
         Ok(json!({"snapshot":snapshot,"stale":stale}))
     }
     pub fn account_status(&self) -> Result<Value, AppError> {
-        let pool = self
-            .accounts
-            .lock()
-            .map_err(|_| AppError::AccountUnavailable)?;
-        Ok(json!({"generation": pool.generation, "accounts": pool.status()}))
+        let mut status = {
+            let pool = self
+                .accounts
+                .lock()
+                .map_err(|_| AppError::AccountUnavailable)?;
+            json!({"generation": pool.generation, "accounts": pool.status()})
+        };
+        status["path"] = self.path.status();
+        if let Some(sdk) = &self.sdk_path {
+            status["sdk_path"] = sdk.status();
+        }
+        Ok(status)
+    }
+    /// Records one attempt on the game path (or the SDK path), withdraws the account charges of
+    /// a streak that has just been attributed to the path, and logs transitions.
+    fn record_path(&self, sdk: bool, source: Option<&str>, outcome: Outcome) {
+        let Some(path) = (if sdk {
+            self.sdk_path.as_ref()
+        } else {
+            Some(&self.path)
+        }) else {
+            return;
+        };
+        let change = path.record(source, outcome);
+        if let Some(streak) = change.attributed.filter(|_| !sdk) {
+            if let Ok(pool) = self.accounts.lock() {
+                pool.revoke_path_failures(streak, &self.config.account_pool);
+            }
+        }
+        let region = self.config.region.name();
+        let error_code = match outcome {
+            Outcome::Fault(code) => Some(code),
+            Outcome::Healthy => None,
+        };
+        let cooldown_ms = path.interval().as_millis() as u64;
+        match change.transition {
+            crate::path_health::Transition::None => {}
+            crate::path_health::Transition::Opened => tracing::warn!(
+                event = if sdk { "sdk_path_opened" } else { "upstream_path_opened" },
+                region,
+                error_code,
+                cooldown_ms,
+                "Upstream path reached the failure threshold; refusing calls until a probe succeeds"
+            ),
+            crate::path_health::Transition::ProbeFailed => tracing::warn!(
+                event = if sdk {
+                    "sdk_path_probe_failed"
+                } else {
+                    "upstream_path_probe_failed"
+                },
+                region,
+                error_code,
+                cooldown_ms,
+                "Upstream path probe failed; still refusing calls"
+            ),
+            crate::path_health::Transition::Recovered => tracing::info!(
+                event = if sdk {
+                    "sdk_path_recovered"
+                } else {
+                    "upstream_path_recovered"
+                },
+                region,
+                "Upstream path recovered"
+            ),
+        }
+    }
+    /// Admits a logical call on the game path once; the ticket is then held for the whole call,
+    /// so its bootstrap, retries and prerequisite RPCs continue even if the path opens.
+    fn admit_path<'s>(&'s self, ticket: &mut Option<Ticket<'s>>) -> Result<(), AppError> {
+        if ticket.is_none() {
+            *ticket = Some(self.path.admit().ok_or(AppError::UpstreamUnavailable)?);
+        }
+        Ok(())
+    }
+    /// Applies a call outcome to the leased account, charging path-class faults as the path
+    /// health decides.
+    fn report_lease(
+        &self,
+        lease: &crate::accounts::Lease,
+        result: &Result<Value, AppError>,
+        code: Option<&str>,
+    ) {
+        let charge = self.path.charge();
+        lease.report(
+            result,
+            code,
+            &self.config.account_pool,
+            self.config.global_login.as_ref(),
+            charge,
+        );
+        self.settle_charge(&lease.account, charge);
+    }
+    /// The streak may have been attributed to the path between `charge()` and the charge
+    /// landing; withdraw it then, as the attribution itself would have.
+    fn settle_charge(&self, account: &crate::accounts::Account, charge: Charge) {
+        if let Charge::Account {
+            streak: Some(streak),
+        } = charge
+        {
+            if self.path.attributed(streak) {
+                account.revoke_path_failures(streak, &self.config.account_pool);
+            }
+        }
     }
     pub async fn reload_accounts(&self) -> Result<Value, AppError> {
         let _reload = self.reload_lock.lock().await;
@@ -659,6 +817,9 @@ impl GameClient {
 
             let mut account_attempted = false;
             let result = tokio::time::timeout_at(deadline, async {
+                // Game path admission, taken right before the first upstream contact of this
+                // call; cache hits never need it.
+                let mut path_ticket = None;
                 let protocol = self
                     .protocol
                     .read()
@@ -667,6 +828,7 @@ impl GameClient {
                 if authenticated(route) && !identity_only && self.needs_bootstrap().await {
                     let _bootstrap = self.bootstrap_lock.lock().await;
                     if self.needs_bootstrap().await {
+                        self.admit_path(&mut path_ticket)?;
                         self.execute(&protocol, VERSION, json!({}), None, deadline)
                             .await?;
                     }
@@ -752,6 +914,10 @@ impl GameClient {
                         return Err(AppError::ProtocolDefinition);
                     }
                 }
+                // Global identity with a session is answered without an upstream call.
+                if !(identity_only && account.is_some_and(|a| a.auth().is_some())) {
+                    self.admit_path(&mut path_ticket)?;
+                }
                 let auth = match account {
                     Some(a) if authenticated(route) => {
                         Some(self.account_auth(&protocol, a, deadline).await?)
@@ -787,12 +953,7 @@ impl GameClient {
                 };
                 if account_attempted {
                     if let Some(lease) = &lease {
-                        lease.report(
-                            &response,
-                            code.as_deref(),
-                            &self.config.account_pool,
-                            self.config.global_login.as_ref(),
-                        );
+                        self.report_lease(lease, &response, code.as_deref());
                     }
                     account_attempted = false;
                 }
@@ -819,17 +980,16 @@ impl GameClient {
             .unwrap_or(Err(AppError::Timeout));
             if account_attempted {
                 if let Some(lease) = &lease {
-                    lease.report(
-                        &result,
-                        None,
-                        &self.config.account_pool,
-                        self.config.global_login.as_ref(),
-                    );
+                    self.report_lease(lease, &result, None);
                 }
             }
             result
         }
         .await;
+        // An open path refuses before dispatch: peer callers may fail over safely.
+        if expected_protocol.is_some() && matches!(result, Err(AppError::UpstreamUnavailable)) {
+            return Err(AppError::PeerAccountUnavailable);
+        }
         if matches!(
             result,
             Err(AppError::Timeout | AppError::Transport | AppError::Protocol)
@@ -883,17 +1043,44 @@ impl GameClient {
                 );
                 return Err(AppError::AccountUnavailable);
             }
-            state.attempts.push_back(now);
             (
                 state.sdk.is_none() || state.sdk_stale,
                 state.sdk.clone().unwrap_or_else(|| g.identity.sdk.clone()),
             )
         };
+        // An open SDK path refuses before the attempt is counted: it spends no login. The
+        // caller holds the account's session lock, so no other login starts in between.
+        let _sdk_ticket = if revalidate {
+            Some(
+                self.sdk_path
+                    .as_ref()
+                    .and_then(PathHealth::admit)
+                    .ok_or(AppError::UpstreamUnavailable)?,
+            )
+        } else {
+            None
+        };
+        g.state().attempts.push_back(now);
         let sdk_account = if revalidate {
+            let mut attempt = UpstreamAttempt {
+                client: self,
+                sdk: true,
+                source: None,
+                deadline,
+                sent: true,
+                outcome: None,
+                code: None,
+            };
             let outcome =
                 tokio::time::timeout_at(deadline, sdk.cache_login(&g.identity.device, &base))
                     .await
                     .unwrap_or(Err(crate::global_sdk::SdkError::Transport));
+            attempt.outcome = Some(match &outcome {
+                Err(error) if error.transient() => Some(Outcome::Fault(error.code())),
+                Err(crate::global_sdk::SdkError::Config) => None,
+                _ => Some(Outcome::Healthy),
+            });
+            drop(attempt);
             match outcome {
                 Ok(refreshed) => {
                     let mut state = g.state();
@@ -903,9 +1090,9 @@ impl GameClient {
                 }
                 Err(error) => {
                     g.state().last_error_code = Some(error.code().into());
-                    if error.transient() {
-                        account.transient_failure(policy);
-                    } else {
+                    // Transient failures belong to the SDK path; the login interval and daily
+                    // cap already bound this account's retries.
+                    if !error.transient() {
                         account.disable();
                     }
                     tracing::warn!(
@@ -930,6 +1117,7 @@ impl GameClient {
             &self.config.client_version,
         );
         let login_auth = Auth {
+            account: account.name.clone(),
             player_id: String::new(),
             credential: String::new(),
             bid: Some(sdk_account.uid.clone()),
@@ -943,7 +1131,9 @@ impl GameClient {
         };
         let Some(session) = session else {
             let result = result.and(Err(AppError::Protocol));
-            account.global_signal(&result, code.as_deref(), policy, login);
+            let charge = self.path.charge();
+            account.global_signal(&result, code.as_deref(), policy, login, charge);
+            self.settle_charge(account, charge);
             tracing::warn!(
                 error_code = code.as_deref().unwrap_or("global_login_failed"),
                 account = %account.name,
@@ -972,6 +1162,7 @@ impl GameClient {
             return Err(AppError::AccountUnavailable);
         }
         let auth = Auth {
+            account: account.name.clone(),
             player_id: session.player_id.clone(),
             credential: session.credential.clone(),
             bid: Some(sdk_account.uid.clone()),
@@ -1139,11 +1330,19 @@ impl GameClient {
         auth: Option<&Auth>,
         deadline: tokio::time::Instant,
     ) -> (Result<Value, AppError>, Option<String>) {
-        let mut code = None;
+        let mut attempt = UpstreamAttempt {
+            client: self,
+            sdk: false,
+            source: auth.map(|a| a.account.clone()),
+            deadline,
+            sent: false,
+            outcome: None,
+            code: None,
+        };
         let result = self
-            .execute_once_inner(protocol, route, input, auth, deadline, &mut code)
+            .execute_once_inner(protocol, route, input, auth, deadline, &mut attempt)
             .await;
-        (result, code)
+        (result, attempt.code.take())
     }
     async fn execute_once_inner(
         &self,
@@ -1152,7 +1351,7 @@ impl GameClient {
         input: Value,
         auth: Option<&Auth>,
         deadline: tokio::time::Instant,
-        code: &mut Option<String>,
+        attempt: &mut UpstreamAttempt<'_>,
     ) -> Result<Value, AppError> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1215,15 +1414,18 @@ impl GameClient {
                 .ok_or(AppError::AccountUnavailable)?;
             request = request.header("x-player-bid", bid);
         }
-        let response = self
-            .http
-            .request(
-                request
-                    .body(Full::new(Bytes::from(frame)))
-                    .map_err(|_| AppError::Protocol)?,
-            )
-            .await
-            .map_err(crate::transport::classify)?;
+        let request = request
+            .body(Full::new(Bytes::from(frame)))
+            .map_err(|_| AppError::Protocol)?;
+        attempt.sent = true;
+        let response = match self.http.request(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = crate::transport::classify(error);
+                attempt.fault(&error);
+                return Err(error);
+            }
+        };
         let http_ok = response.status().is_success();
         let mut metadata = response.headers().clone();
         let content_ok = header(&metadata, "content-type")
@@ -1231,10 +1433,15 @@ impl GameClient {
         let mut body = response.into_body();
         let mut bytes = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| AppError::Transport)?;
+            let Ok(frame) = frame else {
+                attempt.fault(&AppError::Transport);
+                return Err(AppError::Transport);
+            };
             if let Some(data) = frame.data_ref() {
                 if bytes.len().saturating_add(data.len()) > self.config.upstream.max_response_bytes
                 {
+                    // The route's own limit, not a path fault.
+                    attempt.outcome = Some(None);
                     return Err(AppError::Protocol);
                 }
                 bytes.extend_from_slice(data);
@@ -1246,7 +1453,15 @@ impl GameClient {
         let status = header(&metadata, "grpc-status")
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|s| *s <= 16);
-        *code = application_code(&metadata);
+        attempt.code = application_code(&metadata);
+        // Any gRPC answer shows the path works, except a bare 14 (UNAVAILABLE) without an
+        // application code; later decode or identity checks concern the call, not the path.
+        attempt.outcome = Some(Some(match status {
+            _ if !http_ok || !content_ok => Outcome::Fault(AppError::Protocol.code()),
+            None => Outcome::Fault(AppError::Protocol.code()),
+            Some(14) if attempt.code.is_none() => Outcome::Fault(AppError::Grpc(14).code()),
+            Some(_) => Outcome::Healthy,
+        }));
         self.observe(&metadata, status).await;
         if !http_ok || !content_ok {
             return Err(AppError::Protocol);
@@ -1254,7 +1469,7 @@ impl GameClient {
         let status = status.ok_or(AppError::Protocol)?;
         if status != 0 {
             // Maintenance is a game-wide state, not an account or node fault (503, no retry).
-            if code.as_deref() == Some("UNDER_MAINTENANCE") {
+            if attempt.code.as_deref() == Some("UNDER_MAINTENANCE") {
                 return Err(AppError::Maintenance(status));
             }
             return Err(AppError::Grpc(status));

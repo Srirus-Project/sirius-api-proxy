@@ -155,7 +155,8 @@ impl SdkError {
             Self::Protocol => "SDK_PROTOCOL",
         }
     }
-    /// Transient failures cool an account down; all others need an operator.
+    /// Transient failures count toward the SDK path health and never cool an account; all
+    /// others need an operator.
     pub fn transient(self) -> bool {
         matches!(self, Self::Transport | Self::Protocol)
     }

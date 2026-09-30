@@ -118,7 +118,8 @@ not request parameters. Protobuf JSON int64/uint64 values are strings; original 
 may contain numeric integers that require a lossless parser.
 
 `/system` returns HTTP 200 with `status: unavailable` for valid upstream business errors;
-network/protocol failures return 502 and timeouts return 504. Other upstream errors map to
+network/protocol failures return 502 and timeouts return 504, and 503 `upstream_unavailable`
+while the [upstream path is open](docs/REQUEST_POLICY.md#upstream-path-health). Other upstream errors map to
 502/503. Invalid caller tokens return 401; an unconfigured game account returns 503.
 Raw credential fields and grpc-message values are not returned to callers.
 
@@ -133,6 +134,7 @@ without echoing the input.
 | `upstream_grpc` | 502 (503 for gRPC 14) | Another game gRPC failure; see `grpc_status` |
 | `upstream_timeout` / `upstream_transport` / `upstream_proxy` / `upstream_protocol` | 504 / 502 | Upstream call failed |
 | `account_unavailable` | 503 | No game account is configured or healthy |
+| `upstream_unavailable` | 503 | The region's game path (or Global SDK path) is failing; refused before contacting it, retry shortly |
 | `node_unavailable`, `peer_account_unavailable`, `snapshot_unavailable`, `master_unavailable`, `auth_unavailable` | 503 | Dependency temporarily unavailable |
 | `not_found` | 404 | Unknown route, Master item or looked-up player |
 | `invalid_request` | 400 (422 for a well-formed JSON body of the wrong shape) | Rejected input |

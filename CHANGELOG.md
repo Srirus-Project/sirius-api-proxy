@@ -11,6 +11,16 @@
   is replaced by `upstream.anonymous_max_inflight` (default 4, capped by `max_inflight`), so a
   slow Version no longer holds back announcement reads. This changes live traffic: up to four
   anonymous RPCs now overlap. `anonymous_max_inflight: 1` restores the 1.2.x serialization.
+- Path outages no longer cool accounts. Transport, protocol, deadline and bare gRPC 14 failures
+  stay an account's only while that account alone fails; once a second account or an anonymous
+  call fails in the same run, the run's charges are withdrawn and, at
+  `account_pool.failure_threshold`, the region's path opens: new calls get 503
+  `upstream_unavailable` (instead of 504/502 per request) before any upstream contact or Global
+  login, peers answer `unavailable_before_dispatch`, and one probe per min(`cooldown_seconds`,
+  5 s) closes it again. Cache hits are still served.
+- Global SDK transport and malformed-response failures no longer cool the account; they open a
+  separate SDK path the same way. `GET /internal/v1/accounts` adds `path` and, on Global,
+  `sdk_path`. No configuration or wire change.
 
 ## 1.2.4
 

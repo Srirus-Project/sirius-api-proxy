@@ -138,7 +138,11 @@ impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
         match error {
             AppError::UnsupportedRegionOperation => Self::UnsupportedOperation {},
-            AppError::PeerAccountUnavailable => Self::UnavailableBeforeDispatch {},
+            // An open upstream path refuses before any game contact (defense in depth: the
+            // executor already maps it to PeerAccountUnavailable).
+            AppError::PeerAccountUnavailable | AppError::UpstreamUnavailable => {
+                Self::UnavailableBeforeDispatch {}
+            }
             AppError::AccountUnavailable => Self::AccountUnavailable {},
             AppError::Timeout => Self::Timeout {},
             AppError::Transport | AppError::Proxy => Self::Transport {},

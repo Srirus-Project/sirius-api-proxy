@@ -13,6 +13,7 @@ mod rijndael;
 mod tests;
 
 mod native;
+mod path_health;
 mod proto_source;
 mod routes;
 mod single_flight;

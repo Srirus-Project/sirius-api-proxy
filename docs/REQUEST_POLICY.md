@@ -64,6 +64,42 @@ process only (not in Redis). A joined request can receive a response to an RPC s
 round trip before it arrived. The Version bootstrap of authenticated calls never joins, since
 it already holds admission and the protocol barrier.
 
+## Upstream path health
+
+Each region tracks the health of its game path (endpoint, proxy and network) apart from account
+health, reusing `account_pool.failure_threshold` and `cooldown_seconds`; there is no separate
+configuration. Global profiles with accounts track the SDK login path the same way.
+
+- A sent attempt is a path fault when it gets no usable gRPC answer: a transport or proxy
+  failure, a non-2xx or non-gRPC response, a missing gRPC status, gRPC 14 without an
+  application code, or abandonment at the logical deadline. Any other gRPC status, including
+  14 with `UNDER_MAINTENANCE` or `AEGIS_*`, is an answer and resets the count. Attempts never
+  sent, cancelled by the caller before the deadline, or over the route's response limit do not
+  count, and neither do waits for admission, a session lock or an anonymous slot.
+- A run of faults becomes the path's once it involves two accounts or any anonymous call (every
+  SDK fault is the SDK path's); the attribution rule and its effect on accounts are in
+  [ACCOUNTS.md](ACCOUNTS.md). An attributed run of `failure_threshold` faults opens the path.
+- While the path is open, a new logical call is refused with 503 `upstream_unavailable` before
+  any upstream contact: before the Version bootstrap, before a Global SDK request or
+  PlayerLogin (so no login is counted), before the RPC. A peer executor answers
+  `unavailable_before_dispatch`, so routers fail over even authenticated reads. Response cache
+  hits and a Global identity answered from an existing session are still served.
+- After min(`cooldown_seconds`, 5 s), one call at a time is let through as a probe. Any gRPC
+  answer closes the path; another fault restarts the interval.
+- Admission is decided once per logical call. An admitted call keeps going (its bootstrap,
+  anonymous retries and JP identity check) even if the path opens meanwhile, so the
+  [retry policy](#retry-boundaries) is unchanged.
+
+State is in memory, per region and per process; it survives account and protocol reloads.
+`GET /internal/v1/accounts` reports it as `path` (and `sdk_path`). Transitions are logged
+once each: `upstream_path_opened` and `upstream_path_probe_failed` (warn, with `region`,
+`error_code` and `cooldown_ms`, the probe interval) and `upstream_path_recovered` (info);
+the SDK path uses `sdk_path_opened`, `sdk_path_probe_failed` and `sdk_path_recovered`. Account
+names are never logged.
+
+A slow route that times out on two accounts (for example a large ranking lookup) also opens
+the path for one probe interval; before 1.3.0 it cooled both accounts for `cooldown_seconds`.
+
 ## Retry boundaries
 
 Retries are opt-in via `anonymous_attempts > 1`. Only the verified anonymous Version,

@@ -31,6 +31,9 @@ pub enum AppError {
     NotFound,
     #[error("no game account is currently available")]
     AccountUnavailable,
+    /// The region's game path (or Global SDK path) is failing; refused before upstream contact.
+    #[error("game upstream is temporarily unreachable")]
+    UpstreamUnavailable,
     #[error("upstream request timed out")]
     Timeout,
     #[error("upstream transport failed")]
@@ -65,6 +68,7 @@ impl AppError {
             Self::AuthUnavailable => "auth_unavailable",
             Self::NotFound => "not_found",
             Self::AccountUnavailable => "account_unavailable",
+            Self::UpstreamUnavailable => "upstream_unavailable",
             Self::Timeout => "upstream_timeout",
             Self::Transport => "upstream_transport",
             Self::Proxy => "upstream_proxy",
@@ -89,6 +93,7 @@ impl IntoResponse for AppError {
             Self::NodeUnavailable
             | Self::PeerAccountUnavailable
             | Self::AccountUnavailable
+            | Self::UpstreamUnavailable
             | Self::SnapshotUnavailable
             | Self::MasterUnavailable
             | Self::AuthUnavailable
