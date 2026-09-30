@@ -205,8 +205,10 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
 
-Tests use local fixtures and do not require the game servers. Release archives include the
-runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
+Tests use local fixtures and do not require the game servers. The optional per-stage latency
+measurement is the ignored `perf_stages` test; see
+[measuring codec cost](docs/PROTO_RELOAD.md#measuring-codec-cost) for its release-build command.
+Release archives include the runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
 Repository visibility and workflow activation are separate from preparing a release.
 
 For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).

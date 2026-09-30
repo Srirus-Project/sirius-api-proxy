@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Development: the ignored `perf_stages` test prints per-stage latency (min, median, p90) for
+  native versus dynamic decoding and encoding on every JP and Global route, the Master import
+  stages (SHA-256, Rijndael, gunzip, JSON parse and validation, snapshot install), Master and
+  registry reads, and memory response-cache serialization. It runs only on request
+  (`cargo test --release --locked perf_stages -- --ignored --nocapture --test-threads=1`),
+  asserts no timings and changes no runtime behavior or configuration.
 - Master table reads (`/master-data/tables/{name}`, `snapshots/{id}/tables/{name}/{hash}`,
   `database/by-hash/{hash}/tables/{name}` and the standalone registry's table route) are admitted
   through 16 process-wide permits, held until a 200 body is sent. After waiting 5 s in FIFO order

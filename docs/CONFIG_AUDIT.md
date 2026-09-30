@@ -237,7 +237,7 @@ Original: `AssetUpdaterInfo`, `Haruki-Sekai-API@07da6b80:src/config.rs:508-513`.
 | --- | --- | --- | --- |
 | `CONFIG_PATH` (`Haruki-Sekai-API@07da6b80:src/config.rs:591`) | ADAPTED | `SIRIUS_CONFIG_PATH`, default `sirius-api-config.yaml` (`src/main.rs:47-50`, `:180-181`, `:290-291`, `:444-445`) | `registry-serve` and `master-db-import` / `master-db-migrate` take their config path from argv (`src/main.rs:5-10`, `:73-81`). |
 | `RUST_LOG` (`Haruki-Sekai-API@07da6b80:src/logging.rs:28`) | ADAPTED | Ignored on purpose; use `logging.level` | `docs/APPLICATION_LOG.md:39`. |
-| `BENCH_*` (`Haruki-Sekai-API@07da6b80:src/bin/bench_profile.rs:178-337`), `HARUKI_BENCH_*` (`Haruki-Sekai-API@07da6b80:src/updater/master_stream.rs:628-732`) | NOT_APPLICABLE | none | Benchmarks for Sekai profile and master ingest. |
+| `BENCH_*` (`Haruki-Sekai-API@07da6b80:src/bin/bench_profile.rs:178-337`), `HARUKI_BENCH_*` (`Haruki-Sekai-API@07da6b80:src/updater/master_stream.rs:628-732`) | NOT_APPLICABLE | none; the ignored `perf_stages` test (`src/tests.rs`) measures Sirius codec, Master, registry and cache stages without environment variables or configuration | Benchmarks for Sekai profile and master ingest. See [Decisions](#decisions). |
 | `HARUKI_TEST_REGISTRY_DSN` (`Haruki-Sekai-API@07da6b80:src/registry/state.rs:1025`) | ADAPTED | `SIRIUS_TEST_POSTGRES_PORT` / `SIRIUS_TEST_POSTGRES_PASSWORD`; `SIRIUS_TEST_REDIS_SERVER` and `SIRIUS_TEST_GPG_PROGRAM` enable other optional tests (`src/tests.rs`) | Test-only. Never read by the service. |
 
 Other environment reads in Sirius:
@@ -582,6 +582,18 @@ These generic capabilities are intentionally not restored in their original form
    fall back to each other); manifests, history and bundles are not admitted, bundles keeping
    their own two permits. The count and wait are fixed like the bundle gate, and no `Retry-After`
    is sent, because `master_sync` does not read it. No configuration surface.
+28. **Benchmarks are one manual ignored test, not a binary or environment-configured harness.**
+   The original ships a `bench_profile` binary that calls live Sekai profiles under `BENCH_*`
+   variables and summarizes stage percentiles and a CPU pipeline
+   (`Haruki-Sekai-API@9a53714:src/bin/bench_profile.rs:73-148`, `:437-475`), plus an ignored
+   master ingest memory probe sized by `HARUKI_BENCH_*`
+   (`Haruki-Sekai-API@9a53714:src/updater/master_stream.rs:614-732`). Sirius has the
+   `#[ignore]` test `perf_stages` (`src/tests.rs`): native versus dynamic codec for every JP and
+   Global route, the Master import stages (SHA-256, Rijndael, gunzip, JSON parse and
+   validation, snapshot install), Master and registry reads, and memory response-cache
+   serialization, all on deterministic local fixtures. It prints min, median and p90 and never
+   asserts timings. There is no live mode, no network, PostgreSQL or Redis, no new dependency,
+   and no production stage tracing. No configuration or environment surface.
 
 ## Original fields that were ignored by the original itself
 
@@ -740,3 +752,5 @@ classification and evidence:
   (size + SHA-256) instead of reparsing JSON; serving reads still validate. No field is added.
 - **Table read admission:** new [Decision 27](#decisions). Master table reads pass 16 fixed
   process-wide permits with a 5 s wait; no field is added.
+- **Stage measurement:** new [Decision 28](#decisions). The `BENCH_*` / `HARUKI_BENCH_*` row
+  names the ignored `perf_stages` test; no field or variable is added.

@@ -17,7 +17,24 @@ load executable code. Transport remains binary Protobuf over HTTP/2 gRPC in both
 Unknown enum numbers can require a dynamic JSON fallback within a native generation because
 pbjson cannot represent them. The fallback uses the same pinned schema and validates the
 input; binary decode errors still fail. `codec: native` describes the preferred path, not a
-promise that every input avoids reflection. Performance differences have not been benchmarked.
+promise that every input avoids reflection.
+
+### Measuring codec cost
+
+The ignored `perf_stages` test (`src/tests.rs`) decodes the same payload for every exposed
+JP and Global route with the native bundle and with a dynamic twin of the same pool, after
+checking that both produce equal JSON. Top-level lists are widened to 100 entries, so rankings
+and announcements carry realistic list lengths. It also times encoding, Master import stages,
+Master and registry reads and memory response-cache serialization. It prints min, median and p90
+per stage and never asserts timings:
+
+```sh
+cargo test --release --locked perf_stages -- --ignored --nocapture --test-threads=1
+```
+
+Use a release build; a debug build prints a warning and its numbers are not representative.
+The first release build is slow (thin LTO, one codegen unit). Numbers depend on the host and
+are not recorded in the repository.
 
 ## Bundle layout
 

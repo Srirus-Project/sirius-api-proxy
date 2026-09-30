@@ -23352,3 +23352,338 @@ async fn json_client_errors_drops_content_encoding() {
         json!({"error":"not found","code":"not_found"})
     );
 }
+
+// Per-stage latency measurement (manual; never asserts timings).
+//
+// Run with `cargo test --release --locked perf_stages -- --ignored --nocapture
+// --test-threads=1`. Numbers depend on the host and are not recorded in the repository.
+// Deliberately excluded: loopback HTTP/2 end to end (scheduler and loopback noise; functional
+// tests cover the behavior), response compression (a tower layer inside that round trip), live
+// game or CDN traffic, PostgreSQL and Redis (they would measure a server and the network), and
+// production stage tracing or metrics, which would need configuration and log-field review.
+
+/// Samples until `min_samples` and 500 ms are both reached (at most 10 000 samples) and prints
+/// min, median and p90. `input` runs outside the timed region, and so does dropping the output.
+/// `bytes` is the payload the stage handles (the inflated JSON for gunzip); 0 prints no rate.
+fn perf_measure<I, O>(
+    label: &str,
+    bytes: usize,
+    min_samples: usize,
+    mut input: impl FnMut() -> I,
+    mut run: impl FnMut(I) -> O,
+) {
+    use std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    };
+    // Slow stages (few samples) warm up once; fast stages three times.
+    for _ in 0..if min_samples <= 3 { 1 } else { 3 } {
+        black_box(run(black_box(input())));
+    }
+    let mut samples = Vec::new();
+    let mut total = Duration::ZERO;
+    while samples.len() < 10_000
+        && (samples.len() < min_samples || total < Duration::from_millis(500))
+    {
+        let value = black_box(input());
+        let started = Instant::now();
+        let output = black_box(run(value));
+        let elapsed = started.elapsed();
+        drop(output);
+        samples.push(elapsed);
+        total += elapsed;
+    }
+    samples.sort();
+    let micros = |d: Duration| d.as_secs_f64() * 1e6;
+    let median = samples[samples.len() / 2];
+    let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)];
+    let rate = if bytes > 0 {
+        format!(
+            "{:>9.1}",
+            bytes as f64 / (1 << 20) as f64 / median.as_secs_f64()
+        )
+    } else {
+        format!("{:>9}", "-")
+    };
+    println!(
+        "{label:<64} {:>6} {bytes:>10} {:>11.1} {:>11.1} {:>11.1} {rate}",
+        samples.len(),
+        micros(samples[0]),
+        micros(median),
+        micros(p90),
+    );
+}
+
+/// A deterministic Master-like JSON array of about `bytes` bytes. A seeded xorshift token per
+/// row keeps gzip from compressing it far better than real tables do.
+fn perf_table(bytes: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = b"[".to_vec();
+    let mut i = 0u64;
+    while out.len() < bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if i > 0 {
+            out.push(b',');
+        }
+        let id = seed * 1_000_000 + i;
+        out.extend(
+            format!(
+                r#"{{"id":{id},"name":"fixture 中文 {i}","assetBundleName":"{state:016x}","startAt":"17000000000{i}","rewards":[{{"type":1,"id":{id},"count":3}}],"flags":[true,false],"rate":1.5}}"#
+            )
+            .bytes(),
+        );
+        i += 1;
+    }
+    out.push(b']');
+    out
+}
+
+/// Repeats every array that has no array above it to 100 elements, so ranking and
+/// announcement lists grow while nested lists stay at one element (no exponential growth).
+fn perf_widen(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .flat_map(|item| std::iter::repeat_n(item, 100))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, perf_widen(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+#[test]
+#[ignore = "manual per-stage latency measurement; run with --release -- --ignored --nocapture"]
+fn perf_stages() {
+    use crate::{
+        master::{Entry, MasterDecoder},
+        master_registry as registry,
+        protocol::{ProtocolBundle, ProtocolStatus},
+        region::Region,
+        rijndael::Rijndael256,
+        routes::{EVENT_RANKING, GLOBAL_ROUTES, ROUTES},
+    };
+    use std::{hint::black_box, io::Read};
+    let none = || ();
+    println!(
+        "sirius-api-proxy {} perf_stages: debug_assertions={} parallelism={}",
+        env!("CARGO_PKG_VERSION"),
+        cfg!(debug_assertions),
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+    );
+    if cfg!(debug_assertions) {
+        println!("debug build: numbers are not representative, use --release");
+    }
+    println!(
+        "{:<64} {:>6} {:>10} {:>11} {:>11} {:>11} {:>9}",
+        "stage", "n", "bytes", "min_us", "median_us", "p90_us", "MiB/s"
+    );
+
+    // Master import, stage by stage, on a table the size of the largest real one. The encrypted
+    // file is built backwards from decryption, so every stage runs on valid input.
+    let large = perf_table(1536 * 1024, 1);
+    let encrypted = encrypted_master_body(&large);
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let iv = [0u8; 32];
+    let cipher = Rijndael256::new(&key);
+    let plaintext = cipher.decrypt(&encrypted[32..], &iv).unwrap();
+    let compressed = &plaintext[32..];
+    let entry = Entry {
+        name: "MasterPerfLarge.bin".into(),
+        size: encrypted.len() as u64,
+        hash: registry::digest(&encrypted),
+    };
+    let decoder = MasterDecoder::new(&key, iv);
+    assert_eq!(decoder.decode(&entry, &encrypted).unwrap(), large);
+    perf_measure("master.sha256", encrypted.len(), 20, none, |_| {
+        <sha2::Sha256 as sha2::Digest>::digest(black_box(&encrypted))
+    });
+    // Paid once per MasterDecoder: the key schedule rebuilds the S-boxes each time.
+    perf_measure("master.rijndael_key_schedule", 0, 20, none, |_| {
+        Rijndael256::new(black_box(&key))
+    });
+    perf_measure(
+        "master.rijndael_cbc",
+        encrypted.len() - 32,
+        20,
+        none,
+        |_| cipher.decrypt(black_box(&encrypted[32..]), &iv),
+    );
+    perf_measure("master.gunzip", large.len(), 20, none, |_| {
+        // Bounded like MasterDecoder::decode (64 MiB limit plus one byte).
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(black_box(compressed))
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut json)
+            .unwrap();
+        json
+    });
+    perf_measure("master.json_value", large.len(), 20, none, |_| {
+        serde_json::from_slice::<Value>(black_box(&large)).unwrap()
+    });
+    perf_measure("master.json_validate", large.len(), 20, none, |_| {
+        crate::master::validate_json(black_box(&large)).unwrap()
+    });
+    perf_measure("master.decode", encrypted.len(), 20, none, |_| {
+        decoder.decode(&entry, black_box(&encrypted)).unwrap()
+    });
+
+    // Snapshot install and reads: one 1.5 MiB table plus 40 of 240 KiB (about 11 MiB, like the
+    // real data). Each install sample gets a fresh directory; creating and removing it is untimed.
+    let mut tables = vec![("MasterPerfLarge".to_owned(), large.clone())];
+    tables.extend((0..40).map(|i| (format!("MasterPerf{i:02}"), perf_table(240 * 1024, i + 2))));
+    let tables: Vec<(&str, &[u8])> = tables
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let total: usize = tables.iter().map(|(_, bytes)| bytes.len()).sum();
+    perf_measure(
+        "master.install_snapshot",
+        total,
+        3,
+        || tempfile::tempdir().unwrap(),
+        |temp| {
+            install_plain_master(&temp.path().join("master"), "perf-v1", None, &tables);
+            temp
+        },
+    );
+    let installed = tempfile::tempdir().unwrap();
+    let dir = installed.path().join("master");
+    install_plain_master(&dir, "perf-v1", None, &tables);
+    let snapshot = registry::current_snapshot(&dir).unwrap();
+    let digest = registry::digest(&large);
+    assert_eq!(
+        crate::master::read_current_in(&dir, Some("MasterPerfLarge"), Region::Jp)
+            .unwrap()
+            .bytes,
+        large
+    );
+    assert_eq!(
+        registry::table(&dir, Region::Jp, &snapshot, "MasterPerfLarge", &digest)
+            .unwrap()
+            .bytes,
+        large
+    );
+    let status = crate::master::read_current_in(&dir, None, Region::Jp).unwrap();
+    perf_measure(
+        "master.read_current_status",
+        status.bytes.len(),
+        20,
+        none,
+        |_| crate::master::read_current_in(&dir, None, Region::Jp).unwrap(),
+    );
+    perf_measure(
+        "master.read_current_table_large",
+        large.len(),
+        20,
+        none,
+        |_| crate::master::read_current_in(&dir, Some("MasterPerfLarge"), Region::Jp).unwrap(),
+    );
+    let manifest = registry::manifest(&dir, None, registry_scope()).unwrap();
+    perf_measure("registry.manifest", manifest.bytes.len(), 20, none, |_| {
+        registry::manifest(&dir, None, registry_scope()).unwrap()
+    });
+    perf_measure("registry.table_pinned_large", large.len(), 20, none, |_| {
+        registry::table(&dir, Region::Jp, &snapshot, "MasterPerfLarge", &digest).unwrap()
+    });
+
+    // Native versus dynamic codec on the same pool: the twin differs only in its codec label,
+    // so both rows run the full production decode, JSON conversion included.
+    let mut ranking = None;
+    for (family, directory, routes) in [
+        ("jp", crate::config::default_protocol_directory(), ROUTES),
+        ("global", "protocol/global/1.0.1".into(), GLOBAL_ROUTES),
+    ] {
+        let native = ProtocolBundle::load(&directory).unwrap();
+        assert_eq!(native.status.codec, "native");
+        let dynamic = ProtocolBundle {
+            pool: native.pool.clone(),
+            status: ProtocolStatus {
+                codec: "dynamic",
+                ..native.status.clone()
+            },
+        };
+        let mut inputs = Vec::new();
+        for route in routes {
+            let method = crate::protocol::method(&native.pool, route).unwrap();
+            inputs.push(populated_proto(method.input(), 6, false));
+            let output = perf_widen(populated_proto(method.output(), 6, false));
+            let bytes = DynamicMessage::deserialize(method.output(), output)
+                .unwrap()
+                .encode_to_vec();
+            let decoded = native.decode(route, &bytes).unwrap();
+            assert_eq!(decoded, dynamic.decode(route, &bytes).unwrap(), "{route}");
+            let name = route.rsplit_once('.').map_or(*route, |(_, name)| name);
+            for (codec, bundle) in [("native", &native), ("dynamic", &dynamic)] {
+                perf_measure(
+                    &format!("codec.{family}.{name}.decode.{codec}"),
+                    bytes.len(),
+                    20,
+                    none,
+                    |_| bundle.decode(route, black_box(&bytes)).unwrap(),
+                );
+            }
+            if family == "jp" && *route == EVENT_RANKING {
+                ranking = Some(decoded);
+            }
+        }
+        for (codec, bundle) in [("native", &native), ("dynamic", &dynamic)] {
+            perf_measure(
+                &format!("codec.{family}.encode_all_routes.{codec}"),
+                0,
+                20,
+                || inputs.clone(),
+                |inputs| {
+                    routes
+                        .iter()
+                        .zip(inputs)
+                        .map(|(route, input)| bundle.encode(route, input).unwrap())
+                        .collect::<Vec<_>>()
+                },
+            );
+        }
+    }
+
+    // Memory response cache: put clones and serializes the Value, a hit parses it back.
+    let value = ranking.unwrap();
+    let cache = crate::response_cache::Cache::new(crate::response_cache::Config::Memory {
+        ttl_ms: 60_000,
+        stale_while_revalidate_ms: 0,
+        route_ttl_ms: BTreeMap::new(),
+        max_entries: 1024,
+        max_bytes: 64 << 20,
+        max_entry_bytes: 8 << 20,
+    })
+    .unwrap();
+    let key = "perf:event_ranking".to_owned();
+    let serialized = serde_json::to_vec(&value).unwrap();
+    futures::executor::block_on(cache.put_route(EVENT_RANKING, key.clone(), &value));
+    assert_eq!(
+        futures::executor::block_on(cache.get(&key)).as_ref(),
+        Some(&value)
+    );
+    perf_measure(
+        "cache.put",
+        serialized.len(),
+        20,
+        || key.clone(),
+        |key| futures::executor::block_on(cache.put_route(EVENT_RANKING, key, black_box(&value))),
+    );
+    perf_measure("cache.get_hit", serialized.len(), 20, none, |_| {
+        futures::executor::block_on(cache.get(black_box(&key))).unwrap()
+    });
+    perf_measure("cache.value_to_vec", serialized.len(), 20, none, |_| {
+        serde_json::to_vec(black_box(&value)).unwrap()
+    });
+    perf_measure("cache.from_slice", serialized.len(), 20, none, |_| {
+        serde_json::from_slice::<Value>(black_box(&serialized)).unwrap()
+    });
+}
