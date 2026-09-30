@@ -7061,23 +7061,28 @@ async fn asset_dispatch_status_counts_busy_retries_and_transport_errors() {
 }
 #[test]
 fn asset_dispatch_failure_codes_cover_worker() {
-    let source = include_str!("asset_dispatch.rs");
+    let checkout = include_str!("asset_dispatch.rs");
     let known = crate::asset_dispatch::FAILURE_CODES;
     let unique: std::collections::HashSet<_> = known.iter().collect();
     assert_eq!(unique.len(), known.len());
     assert!(!known.contains(&"other"));
-    let mut used = std::collections::HashSet::new();
-    let compact: String = source.split_whitespace().collect();
-    for literal in compact.split("self.fail(&key,&entry,\"").skip(1) {
-        used.insert(literal.split('"').next().unwrap());
+    // Windows checkouts are CRLF: check both line endings whatever this checkout uses.
+    let crlf = lf(checkout).replace('\n', "\r\n");
+    for source in [checkout, crlf.as_str()] {
+        let source = &lf(source);
+        let mut used = std::collections::HashSet::new();
+        let compact: String = source.split_whitespace().collect();
+        for literal in compact.split("self.fail(&key,&entry,\"").skip(1) {
+            used.insert(literal.split('"').next().unwrap());
+        }
+        let start = source.find("fn rejected_submission").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        for literal in source[start..end].split("Some(\"").skip(1) {
+            used.insert(literal.split('"').next().unwrap());
+        }
+        // Every persisted literal is known, and no known code is stale.
+        assert_eq!(used, known.iter().copied().collect());
     }
-    let start = source.find("fn rejected_submission").unwrap();
-    let end = start + source[start..].find("\n}\n").unwrap();
-    for literal in source[start..end].split("Some(\"").skip(1) {
-        used.insert(literal.split('"').next().unwrap());
-    }
-    // Every persisted literal is known, and no known code is stale.
-    assert_eq!(used, known.iter().copied().collect());
 }
 #[test]
 fn outbox_refusal_returns_only_sending_entries_to_pending() {
@@ -14251,11 +14256,10 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
                 .content_sha256,
         );
     }
-    let app = api::router(
-        GameClient::new(cfg.clone()).unwrap(),
-        "read".into(),
-        "admin".into(),
-    );
+    let table_gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let mut client = GameClient::new(cfg.clone()).unwrap();
+    GameClient::set_test_table_gate(&mut client, table_gate.clone());
+    let app = api::router(client, "read".into(), "admin".into());
     let request = |path: String, etag: Option<String>| {
         let app = app.clone();
         async move {
@@ -14317,6 +14321,18 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
             .0,
         304
     );
+    assert_eq!(table_gate.available(), 1);
+    // A 200 keeps the table permit until its body is taken; meanwhile table reads are refused.
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(&table_path, "read", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    assert_eq!(table_gate.available(), 0);
+    assert_eq!(request(table_path.clone(), None).await.0, 503);
+    drop(held);
+    assert_eq!(table_gate.available(), 1);
     assert_eq!(
         request(
             format!(
@@ -15637,6 +15653,128 @@ async fn master_table_admission_cancelled_request_releases_permit() {
         200
     );
     assert_eq!(gate.available(), 1);
+}
+/// Through hyper, a 200 keeps its permit while a client that does not read leaves the body
+/// unsent. `oneshot` never polls the body, so it cannot see hyper drop a body at its end.
+#[tokio::test]
+async fn master_table_admission_holds_permit_until_the_connection_takes_the_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Larger than loopback socket buffers and hyper's write buffer together.
+    const SIZE: usize = 32 * 1024 * 1024;
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let admitted = gate.clone();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || {
+            let gate = admitted.clone();
+            async move {
+                let admission = gate.admit().await.unwrap();
+                admission.attach(axum::response::Response::new(axum::body::Body::from(
+                    vec![b'x'; SIZE],
+                )))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    let mut stream = socket.connect(address).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut status = [0u8; 12];
+    stream.read_exact(&mut status).await.unwrap();
+    assert_eq!(&status, b"HTTP/1.1 200");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        gate.available(),
+        0,
+        "released while the body was still queued"
+    );
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    let head_end = rest.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&rest[..head_end]).to_ascii_lowercase();
+    assert!(
+        head.contains(&format!("content-length: {SIZE}\r\n")),
+        "{head}"
+    );
+    assert_eq!(rest.len() - head_end, SIZE);
+    assert!(rest[head_end..].iter().all(|b| *b == b'x'));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.available() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+/// The database table route admits before it contacts PostgreSQL: a listener that drops every
+/// connection stands in for the database, and records the free permits at each attempt.
+#[tokio::test]
+async fn master_database_table_admission_precedes_the_read() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(200));
+    let database = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut connection = master_database_config();
+    connection.port = database.local_addr().unwrap().port();
+    connection.password_env = format!("SIRIUS_TEST_ADMISSION_DB_{}", uuid::Uuid::new_v4().simple());
+    connection.read_timeout_seconds = Some(2);
+    std::env::set_var(&connection.password_env, "unused-password");
+    let (attempts, mut attempted) = tokio::sync::mpsc::unbounded_channel();
+    let observed = gate.clone();
+    let acceptor = tokio::spawn(async move {
+        loop {
+            let (socket, _) = database.accept().await.unwrap();
+            attempts.send(observed.available()).unwrap();
+            drop(socket);
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.master_directory = Some(directory.path().to_path_buf());
+    cfg.master_database = Some(crate::master_database_worker::Config {
+        connection,
+        interval_seconds: 86400,
+    });
+    let mut client = GameClient::new(cfg).unwrap();
+    GameClient::set_test_table_gate(&mut client, gate.clone());
+    let app = api::router(client, "read".into(), "admin".into());
+    let hash = "a".repeat(64);
+    let table = format!("/api/v1/master-data/database/by-hash/{hash}/tables/MasterFixture");
+    let manifest = format!("/api/v1/master-data/database/by-hash/{hash}/manifest");
+    // Saturated: the table read waits out the gate and never reaches the database.
+    let held = gate.admit().await.unwrap();
+    let started = std::time::Instant::now();
+    let (status, headers, bytes) = conditional_get(&app, &table, "read", None).await;
+    assert_eq!(status, 503);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(headers.get("etag").is_none());
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["code"], "master_unavailable");
+    assert!(attempted.try_recv().is_err());
+    // Malformed requests are rejected before they could queue.
+    let started = std::time::Instant::now();
+    let malformed = format!("/api/v1/master-data/database/by-hash/{hash}/tables/..");
+    assert_eq!(conditional_get(&app, &malformed, "read", None).await.0, 400);
+    assert!(started.elapsed() < Duration::from_millis(200));
+    // Manifests are not admitted: they reach the database with the gate still saturated.
+    assert_eq!(conditional_get(&app, &manifest, "read", None).await.0, 503);
+    assert_eq!(attempted.recv().await, Some(0));
+    drop(held);
+    while attempted.try_recv().is_ok() {}
+    // Admitted: the permit is held while the database is contacted, and the error releases it.
+    assert_eq!(conditional_get(&app, &table, "read", None).await.0, 503);
+    assert_eq!(gate.available(), 1);
+    let mut seen = Vec::new();
+    while let Ok(available) = attempted.try_recv() {
+        seen.push(available);
+    }
+    assert!(!seen.is_empty() && seen.iter().all(|a| *a == 0), "{seen:?}");
+    acceptor.abort();
 }
 #[tokio::test]
 async fn registry_service_table_admission() {

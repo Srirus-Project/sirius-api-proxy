@@ -1,10 +1,11 @@
 //! Bounds decoded Master table bytes held for reads and responses.
 //!
 //! Every table read loads, hashes and checks a whole file (up to `master_registry::MAX_JSON`)
-//! and keeps the bytes until the client has received them. A process-wide gate admits at most
-//! `TABLE_READS` of them: about 24 MB with real tables of about 1.5 MB, 16 x 64 MiB in theory.
-//! Waiters queue in FIFO order for `TABLE_WAIT`, then answer 503 `master_unavailable`. A 200
-//! keeps its permit until the body is sent or dropped, so slow clients hold permits; any other
+//! and keeps the bytes until the connection has taken the last of them. A process-wide gate
+//! admits at most `TABLE_READS` of them: about 24 MB with real tables of about 1.5 MB, 16 x 64
+//! MiB in theory. Waiters queue in FIFO order for `TABLE_WAIT`, then answer 503
+//! `master_unavailable`. A 200 hands its body over in `CHUNK` copies and keeps its permit until
+//! the last one is taken or the body is dropped, so slow clients hold permits; any other
 //! response releases it at once. Manifests, history and bundles (which have their own gate) are
 //! not admitted here. Nothing is configurable.
 use crate::error::AppError;
@@ -12,6 +13,7 @@ use axum::{
     body::{Body, Bytes, HttpBody},
     response::Response,
 };
+use bytes::Buf;
 use hyper::body::{Frame, SizeHint};
 use std::{
     pin::Pin,
@@ -19,7 +21,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
     },
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -27,6 +29,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const TABLE_READS: usize = 16;
 const TABLE_WAIT: Duration = Duration::from_secs(5);
 const WARN_EVERY_SECS: u64 = 60;
+/// Largest data frame handed to the connection. hyper queues a frame whole and drops the body
+/// once it reports its end, so one frame holding the table would release the permit while the
+/// table still waits on a client that does not read. Smaller frames are only polled as the
+/// connection drains its write buffer, and copies keep a queued tail from pinning the whole
+/// table after the permit is gone.
+const CHUNK: usize = 64 * 1024;
 static TABLES: LazyLock<Gate> = LazyLock::new(|| Gate {
     permits: Arc::new(Semaphore::new(TABLE_READS)),
     wait: TABLE_WAIT,
@@ -102,6 +110,7 @@ impl Admission {
             parts,
             Body::new(Held {
                 inner,
+                pending: Bytes::new(),
                 _permit: self,
             }),
         )
@@ -118,6 +127,8 @@ pub(crate) fn attach(admission: Option<Admission>, response: Response) -> Respon
 /// Forwards `size_hint` too, so the response keeps its Content-Length.
 struct Held {
     inner: Body,
+    /// The rest of an oversized data frame, handed on in `CHUNK` copies.
+    pending: Bytes,
     _permit: Admission,
 }
 impl HttpBody for Held {
@@ -127,12 +138,37 @@ impl HttpBody for Held {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+        let this = self.get_mut();
+        if this.pending.is_empty() {
+            match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) if data.len() > CHUNK => this.pending = data,
+                    Ok(data) => return Poll::Ready(Some(Ok(Frame::data(data)))),
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                other => return Poll::Ready(other),
+            }
+        }
+        let n = this.pending.len().min(CHUNK);
+        let chunk = Bytes::copy_from_slice(&this.pending[..n]);
+        this.pending.advance(n);
+        if this.pending.is_empty() {
+            // Free the table now; only copies stay queued once the permit is released.
+            this.pending = Bytes::new();
+        }
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.pending.is_empty() && self.inner.is_end_stream()
     }
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        let inner = self.inner.size_hint();
+        let pending = self.pending.len() as u64;
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower() + pending);
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper + pending);
+        }
+        hint
     }
 }

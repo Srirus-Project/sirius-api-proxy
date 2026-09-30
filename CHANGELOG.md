@@ -18,7 +18,8 @@
   asserts no timings and changes no runtime behavior or configuration.
 - Master table reads (`/master-data/tables/{name}`, `snapshots/{id}/tables/{name}/{hash}`,
   `database/by-hash/{hash}/tables/{name}` and the standalone registry's table route) are admitted
-  through 16 process-wide permits, held until a 200 body is sent. After waiting 5 s in FIFO order
+  through 16 process-wide permits, held until the connection has taken the last 64 KiB piece of
+  a 200 body (a client that does not read keeps its permit). After waiting 5 s in FIFO order
   they answer 503 `master_unavailable`; 304s and errors release at once, Content-Length is kept,
   and manifests, history and bundles are unaffected. No configuration.
 - Master tables are validated as JSON without building an in-memory document (the same

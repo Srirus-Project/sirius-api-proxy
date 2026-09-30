@@ -93,14 +93,16 @@ CURRENT-relative table reads.
 ### Table read admission
 
 Every table read loads, hashes and checks the whole file before answering, then keeps its bytes
-until the client has received them. Table reads therefore pass a fixed admission gate:
+until the connection has taken the last of them. Table reads therefore pass a fixed admission gate:
 `/master-data/tables/{name}`, `/master-data/snapshots/{id}/tables/{name}/{hash}`,
 `/master-data/database/by-hash/{hash}/tables/{name}` and the standalone registry's table route.
 One proxy process has 16 permits shared by all its regions; a standalone registry process has
 its own 16. A read that finds none waits in FIFO order for up to 5 s and then answers 503
 `master_unavailable`, logged at most once a minute as `master_read_busy` so operators can tell
-it from an integrity 503. A 200 keeps its permit until the body is sent or the client
-disconnects; a 304 or an error releases it at once. Content-Length is unchanged.
+it from an integrity 503. A 200 hands its body to the connection in 64 KiB copies, which the
+connection takes only as its write buffer drains, and keeps its permit until it has taken the
+last one or the client disconnects; a 304 or an error releases it at once. After release a connection still holds at most its own write buffer (a few hundred KiB of
+copies), never the table. Content-Length is unchanged.
 
 This bounds decoded table bytes held for reads and responses to about 24 MB with real tables of
 about 1.5 MB, 16 × 64 MiB in theory. Slow or stalled authenticated clients hold their permits
