@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Node routing: authenticated public reads (profile, event ranking and deck, music and challenge
+  ranking) now fail over to the next node when a peer answers HTTP 400, 401, 404, 405, 413, 415
+  or 422, which executors 1.2.0 and later send only before dispatch (wrong peer token, route or
+  region not served, rolling-upgrade contract skew). Such answers still count as target
+  failures and cool the node down; other statuses stay terminal. No wire, configuration or
+  error-code change.
+- `node_target_failed`, `node_cooldown_started` and `node_probe_failed` carry the peer's HTTP
+  `status` when it answered one.
 - Development: the ignored `perf_stages` test prints per-stage latency (min, median, p90) for
   native versus dynamic decoding and encoding on every JP and Global route, the Master import
   stages (SHA-256, Rijndael, gunzip, JSON parse and validation, snapshot install), Master and

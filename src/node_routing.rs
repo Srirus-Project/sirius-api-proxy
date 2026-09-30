@@ -209,7 +209,14 @@ pub(crate) fn test_transitions(config: &Config, outcomes: &[bool]) -> Vec<String
         })
         .collect()
 }
-fn log_transition(node: &str, transition: Transition, error: Option<&AppError>, config: &Config) {
+/// `status` is the peer's HTTP status when it answered one (a bare number, never a body).
+fn log_transition(
+    node: &str,
+    transition: Transition,
+    error: Option<&AppError>,
+    status: Option<u16>,
+    config: &Config,
+) {
     let error_code = error.map(AppError::code);
     match transition {
         Transition::None => {}
@@ -217,6 +224,7 @@ fn log_transition(node: &str, transition: Transition, error: Option<&AppError>, 
             event = "node_cooldown_started",
             node,
             error_code,
+            status,
             cooldown_ms = config.cooldown_ms,
             "Node reached the failure threshold; cooling down"
         ),
@@ -224,6 +232,7 @@ fn log_transition(node: &str, transition: Transition, error: Option<&AppError>, 
             event = "node_probe_failed",
             node,
             error_code,
+            status,
             cooldown_ms = config.cooldown_ms,
             "Node probe failed; cooldown extended"
         ),
@@ -377,6 +386,7 @@ impl Router {
             let Some(permit) = target.admit() else {
                 continue;
             };
+            let mut status = None;
             let (execution, definitely_not_executed) = if let Some(remote) = &target.remote {
                 match remote.call(&request, deadline).await {
                     Ok(reply) => {
@@ -402,7 +412,10 @@ impl Router {
                         )
                     }
                     Err(error) => {
-                        let safe = error.definitely_not_sent();
+                        let safe = error.definitely_not_sent() || error.rejected_before_dispatch();
+                        if let peer_transport::Error::Status(code) = &error {
+                            status = Some(*code);
+                        }
                         let error = match error {
                             peer_transport::Error::Timeout | peer_transport::Error::NotSent => {
                                 AppError::Timeout
@@ -450,14 +463,19 @@ impl Router {
                 &target.name,
                 transition,
                 execution.result.as_ref().err(),
+                status,
                 &self.config,
             );
+            // Authenticated reads fail over only when the attempt provably did not execute: a
+            // connection-level not-sent error, a typed pre-dispatch outcome, or a peer HTTP
+            // status the executor answers only before dispatch (`PRE_DISPATCH_STATUSES`).
             let stop = !definitely_not_executed && crate::client::authenticated(route);
             if target_fault {
                 tracing::debug!(
                     event = "node_target_failed",
                     node = target.name.as_str(),
                     error_code = execution.result.as_ref().err().map(AppError::code),
+                    status,
                     failover = !stop,
                     "Node call failed"
                 );

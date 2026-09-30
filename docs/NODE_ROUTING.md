@@ -43,10 +43,21 @@ region. A region's dedicated peer credential may be shared among its cooperating
 All target attempts and admission share one absolute deadline. Request/connect/body bounds still
 apply to each HTTP peer attempt. Anonymous reads can continue after target transport/protocol
 failures while budget remains. Authenticated queries continue only when the attempt is known not
-to have executed: connection failure, contract/capability rejection, or an explicit account
+to have executed: connection failure, contract/capability rejection, an explicit account
 admission rejection before game dispatch, which also covers an executor whose
-[upstream path is open](REQUEST_POLICY.md#upstream-path-health) (no wire change). Ambiguous timeout/transport/protocol failures return
-immediately for authenticated reads. No concurrent hedging or same-target retry is performed by
+[upstream path is open](REQUEST_POLICY.md#upstream-path-health) (no wire change), or, since
+1.3.0, an HTTP 400, 401, 404, 405, 413, 415 or 422 answer from the peer route, which a Sirius
+executor (1.2.0 onward) sends only before dispatch
+([pre-dispatch statuses](PEER_QUERIES.md#pre-dispatch-http-statuses)). A wrong peer token, a
+peer route or region the node does not serve (including a 1.1.x node or a `regional_paths`
+mismatch), and an operation an older executor does not know during a rolling upgrade are
+therefore served by the next node. These answers still count as target failures and cool the
+node down; their body is never read, and `upstream_transport` is returned if no node completes.
+Ambiguous timeout/transport/protocol failures and every other peer HTTP status (3xx, 403, 408,
+409, 429 and 5xx included) return immediately for authenticated reads. This assumes that an
+HTTP intermediary between nodes answers those seven statuses only while receiving a request,
+never after forwarding it; nginx, Caddy, Cloudflare and Envoy report upstream-phase failures as
+502/503/504. No concurrent hedging or same-target retry is performed by
 the router. The executing node retains its existing local anonymous retry policy.
 Before any target is chosen, identical concurrent public reads (same identity, protocol
 generation and operation; rankings only with `upstream.coalesce_public_reads`) share one routed
@@ -76,7 +87,9 @@ startup), `node_cooldown_started` and `node_probe_failed` (warn, with `cooldown_
 `node_recovered` (info) and `node_unavailable` (warn, for each call that no node completed,
 including every call while all nodes cool down). Every target
 failure is also logged at debug as `node_target_failed` with `failover` (whether another node is
-tried).
+tried). Since 1.3.0 `node_target_failed`, `node_cooldown_started` and `node_probe_failed` also
+carry the peer's HTTP `status` when it answered a non-200 one (a number, never its body), so a
+401 or 404 misconfiguration is visible without debug logging.
 
 ## Scope
 

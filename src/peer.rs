@@ -157,6 +157,9 @@ impl From<AppError> for Failure {
     }
 }
 
+/// No layer that can answer a `peer_transport::PRE_DISPATCH_STATUSES` status after the handler
+/// starts (timeout, compression, admission, panic catching) may wrap this router: 1.3.0 callers
+/// fail authenticated reads over on those statuses.
 pub fn router(client: Arc<GameClient>, prefix: &str, token: String) -> Router {
     Router::new()
         .nest(
@@ -171,6 +174,9 @@ pub fn router(client: Arc<GameClient>, prefix: &str, token: String) -> Router {
         )
         .with_state(client)
 }
+/// HTTP errors are returned only before `call_peer`. Once it is invoked, every outcome must be
+/// HTTP 200 with a typed `Failure`, because callers treat `PRE_DISPATCH_STATUSES` from this
+/// route as proof of non-execution.
 async fn query(
     State(client): State<Arc<GameClient>>,
     Json(request): Json<Request>,

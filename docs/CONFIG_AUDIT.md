@@ -177,6 +177,11 @@ Sirius adds `timeout_ms`, `max_inflight`, `failure_threshold`, `cooldown_ms` and
 (`src/node_routing.rs:17-27`). These are validated even when `targets` is empty (`:58-70`) and
 have no effect until a target exists. They are never silently accepted with invalid values. Peer transport ignores ambient proxies (`src/peer_transport.rs:105`).
 
+Failover differs on purpose: the original fails over on any non-2xx peer answer for every
+request, while Sirius fails authenticated reads over only when the attempt provably did not
+execute, including a fixed set of pre-dispatch HTTP statuses since 1.3.0
+([Decision 29](#decisions)).
+
 ### `servers.<region>.master_sync`
 
 Original: `MasterSyncConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:195-244`.
@@ -595,6 +600,23 @@ These generic capabilities are intentionally not restored in their original form
    asserts timings. There is no live mode, no network, PostgreSQL or Redis, no new dependency,
    and no production stage tracing. No configuration or environment surface.
 
+29. **Peer HTTP statuses fail over authenticated reads only when they prove non-execution.**
+   The original carries every node-level answer on HTTP 200 and treats any other status from
+   `/internal/sekai-api` as a `NetworkError` target fault, failing over for every request and
+   keeping up to 200 bytes of the body in the error
+   (`Haruki-Sekai-API@9a53714:src/upstream.rs:48-50`, `:282-294`, `:186-214`). Sirius fails
+   anonymous reads over on any target fault, but authenticated reads (profile, event ranking and
+   deck, music and challenge ranking) only on a connection-level not-sent error, a typed
+   pre-dispatch outcome, or one of `PRE_DISPATCH_STATUSES` = 400, 401, 404, 405, 413, 415, 422
+   (`src/peer_transport.rs:55-70`, `src/node_routing.rs:415`, `:469-472`), because a replayed
+   authenticated read costs a second account request. Those seven are the only statuses a
+   1.2.0+ executor answers on the peer route, all before dispatch: bearer rejection, routing,
+   the body limit and the JSON extractor or parameter checks; every dispatched query answers
+   200 (`src/peer.rs:160-230`, [PEER_QUERIES.md](PEER_QUERIES.md#pre-dispatch-http-statuses)).
+   3xx, 403, 408, 409, 429 and 5xx stay ambiguous because an intermediary can produce them after
+   forwarding. The status still counts as a target fault, the body is never read, and node
+   routing events carry the bare `status`. No wire change and no configuration surface.
+
 ## Original fields that were ignored by the original itself
 
 The original structs accept unknown keys, so these keys parsed without error but had no effect.
@@ -754,3 +776,5 @@ classification and evidence:
   process-wide permits with a 5 s wait; no field is added.
 - **Stage measurement:** new [Decision 28](#decisions). The `BENCH_*` / `HARUKI_BENCH_*` row
   names the ignored `perf_stages` test; no field or variable is added.
+- **Peer status failover:** new [Decision 29](#decisions) and a note under
+  `servers.<region>.upstreams[]`. No field is added.

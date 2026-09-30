@@ -7789,6 +7789,302 @@ async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
     assert!(f.received.lock().unwrap().is_empty());
 }
 
+#[test]
+fn peer_transport_pre_dispatch_statuses_are_exactly_the_executor_rejections() {
+    use crate::peer_transport::{Error, PRE_DISPATCH_STATUSES};
+    for status in 100..=599 {
+        assert_eq!(
+            Error::Status(status).rejected_before_dispatch(),
+            PRE_DISPATCH_STATUSES.contains(&status)
+        );
+        // The request was submitted; only the executor's answer proves non-execution.
+        assert!(!Error::Status(status).definitely_not_sent());
+    }
+    for status in [200, 204, 307, 403, 408, 409, 429, 500, 502, 503, 504] {
+        assert!(!Error::Status(status).rejected_before_dispatch());
+    }
+    for error in [Error::Timeout, Error::Transport, Error::Protocol] {
+        assert!(!error.rejected_before_dispatch());
+    }
+}
+/// The peer executor as `server::serve` exposes it: access log inside, `json_client_errors`
+/// outside.
+fn peer_executor_app(c: Arc<GameClient>, directory: &std::path::Path) -> axum::Router {
+    let log =
+        crate::access_log::AccessLog::new(access_log_config(directory.join("access.log"))).unwrap();
+    crate::error::json_client_errors(log.wrap(crate::peer::router(
+        c,
+        "/internal/v1/peer",
+        "peer".into(),
+    )))
+}
+/// Sends every request shape a single-region executor rejects before dispatch and returns the
+/// statuses it answered.
+async fn peer_rejection_statuses(
+    app: axum::Router,
+    token: &str,
+    identity: crate::peer::Identity,
+) -> std::collections::BTreeSet<u16> {
+    let path = "/internal/v1/peer/query";
+    let bearer = format!("Bearer {token}");
+    let valid = peer_request(identity.clone(), json!({"type":"version"}));
+    let with = |key: &str, value: Value| {
+        let mut request = valid.clone();
+        request[key] = value;
+        serde_json::to_vec(&request).unwrap()
+    };
+    let operation =
+        |operation: Value| serde_json::to_vec(&peer_request(identity.clone(), operation)).unwrap();
+    let json_bytes = serde_json::to_vec(&valid).unwrap();
+    let mut oversized = valid.clone();
+    oversized["operation"]["padding"] = json!("X".repeat(17000));
+    let auth = Some(bearer.as_str());
+    let cases = vec![
+        ("POST", path, None, true, json_bytes.clone(), 401),
+        (
+            "POST",
+            path,
+            Some("Bearer wrong"),
+            true,
+            json_bytes.clone(),
+            401,
+        ),
+        ("GET", path, auth, false, vec![], 405),
+        (
+            "POST",
+            "/internal/v1/jp/peer/query",
+            auth,
+            true,
+            json_bytes.clone(),
+            404,
+        ),
+        (
+            "POST",
+            "/internal/v1/peer/other",
+            auth,
+            true,
+            json_bytes.clone(),
+            404,
+        ),
+        ("POST", path, auth, false, json_bytes.clone(), 415),
+        ("POST", path, auth, true, b"{\"request_id\":".to_vec(), 400),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with("request_id", json!("not-a-uuid")),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with(
+                "request_id",
+                json!(uuid::Uuid::new_v4().simple().to_string()),
+            ),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"profile","profile_id":0})),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"announcements","tab":3})),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with("extra", json!("SECRET-INPUT")),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"rpc","path":VERSION})),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"profile","profile_id":"SECRET-INPUT"})),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            serde_json::to_vec(&oversized).unwrap(),
+            413,
+        ),
+    ];
+    let mut statuses = std::collections::BTreeSet::new();
+    for (method, uri, authorization, json_type, bytes, expected) in cases {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        if json_type {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(bytes)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{method} {uri}");
+        let value = body(response).await;
+        assert!(value["code"].is_string());
+        assert!(!value.to_string().contains("SECRET"));
+        statuses.insert(expected);
+    }
+    statuses
+}
+#[tokio::test]
+async fn peer_executor_non_200_statuses_occur_only_before_dispatch() {
+    use crate::{
+        deployment::DeploymentConfig, peer_transport::PRE_DISPATCH_STATUSES, region::Region,
+    };
+    let expected = PRE_DISPATCH_STATUSES
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    let f = fixture(vec![]).await;
+    let c = client(&f, config());
+    let observed = peer_rejection_statuses(
+        peer_executor_app(c.clone(), directory.path()),
+        "peer",
+        c.peer_identity().unwrap(),
+    )
+    .await;
+    // The constant and the executor cannot drift apart.
+    assert_eq!(observed, expected);
+    assert!(f.received.lock().unwrap().is_empty());
+
+    // The deployed router, with the access log and compression enabled, answers the same.
+    let mut cfg = regional_config(Region::Jp);
+    let name = format!("SIRIUS_TEST_PEER_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, "dedicated-peer");
+    cfg.peer_token_env = Some(name);
+    cfg.access_log = Some(access_log_config(directory.path().join("deployed.log")));
+    cfg.http_compression = Some(crate::http_compression::Config { enabled: true });
+    let identity = GameClient::new(cfg.clone())
+        .unwrap()
+        .peer_identity()
+        .unwrap();
+    let app = crate::error::json_client_errors(
+        DeploymentConfig::Single(Box::new(cfg))
+            .prepare()
+            .unwrap()
+            .router,
+    );
+    assert_eq!(
+        peer_rejection_statuses(app, "dedicated-peer", identity).await,
+        expected
+    );
+}
+#[tokio::test]
+async fn peer_executor_answers_200_for_every_dispatched_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut game = Reply::version();
+    game.trailers.insert("grpc-status", "14".parse().unwrap());
+    game.trailers
+        .insert("grpc-message", "SECRET_MUST_NOT_ESCAPE".parse().unwrap());
+    let mut unavailable = Reply::version();
+    unavailable.http_status = 503;
+    let mut slow = Reply::version();
+    slow.delay = Duration::from_millis(300);
+    let cases = vec![
+        (
+            vec![Reply::version()],
+            config(),
+            json!({"type":"version"}),
+            json!({"status":"success"}),
+        ),
+        (
+            vec![game],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"game","grpc_status":14}),
+        ),
+        (
+            vec![maintenance_reply("2")],
+            config(),
+            json!({"type":"announcements","tab":0}),
+            json!({"type":"game","grpc_status":2}),
+        ),
+        (
+            vec![unavailable],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"protocol"}),
+        ),
+        (
+            vec![slow],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"timeout"}),
+        ),
+        (
+            vec![
+                Reply::version(),
+                application_error_reply("2", "PLAYER_NOT_FOUND"),
+            ],
+            strict_single_account_config(),
+            json!({"type":"profile","profile_id":1}),
+            json!({"type":"not_found"}),
+        ),
+    ];
+    for (replies, cfg, operation, expected) in cases {
+        let f = fixture(replies).await;
+        let mut c = client(&f, cfg);
+        GameClient::set_test_timeout(&mut c, Duration::from_millis(100));
+        let request = peer_request(c.peer_identity().unwrap(), operation);
+        let response = peer_send(peer_executor_app(c, directory.path()), "peer", request).await;
+        assert_eq!(response.status(), 200, "{expected}");
+        let reply = body(response).await;
+        if expected["status"] == "success" {
+            assert_eq!(reply["outcome"]["status"], "success");
+        } else {
+            assert_eq!(reply["outcome"]["kind"], expected);
+        }
+        assert!(!reply.to_string().contains("SECRET"));
+        assert!(!reply.to_string().contains("must-not-leak"));
+        assert!(!f.received.lock().unwrap().is_empty());
+    } // A game endpoint that refuses the connection after dispatch began.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config();
+    cfg.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let c = GameClient::for_test(cfg);
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    let response = peer_send(peer_executor_app(c, directory.path()), "peer", request).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        body(response).await["outcome"]["kind"],
+        json!({"type":"transport"})
+    );
+}
+
 async fn peer_http_server(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -8420,6 +8716,141 @@ async fn node_routing_does_not_replay_ambiguous_authenticated_query_but_can_skip
     );
     a.abort();
     b.abort();
+}
+/// A peer that answers `status` with a body that must never be read or forwarded.
+async fn status_mock(
+    status: u16,
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    peer_http_server(axum::Router::new().route(
+        "/internal/v1/peer/query",
+        axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(json!({"secret":"never-forward"})),
+                )
+            }
+        }),
+    ))
+    .await
+}
+#[tokio::test]
+async fn node_routing_authenticated_read_fails_over_after_pre_dispatch_peer_status() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for &status in crate::peer_transport::PRE_DISPATCH_STATUSES {
+        let first_seen = Arc::new(AtomicUsize::new(0));
+        let (first, a) = status_mock(status, first_seen.clone()).await;
+        let (second, b) = routing_mock(
+            "second",
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            targets: vec![
+                routing_target("first", first, 0),
+                routing_target("second", second, 10),
+            ],
+            failure_threshold: 1,
+            cooldown_ms: 60000,
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let result = front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await
+            .unwrap();
+        assert_eq!(result["node"], "second", "{status}");
+        assert_eq!(first_seen.load(Ordering::Relaxed), 1);
+        let nodes = front.node_status();
+        assert!(!result.to_string().contains("never-forward"));
+        assert!(!nodes.to_string().contains("never-forward"));
+        // Still a target fault: the node counts it and cools down.
+        assert_eq!(nodes["targets"][0]["name"], "first");
+        assert_eq!(nodes["targets"][0]["failures"], 1);
+        assert!(
+            nodes["targets"][0]["cooldown_remaining_ms"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        a.abort();
+        b.abort();
+    }
+}
+#[tokio::test]
+async fn node_routing_ambiguous_peer_statuses_stay_terminal_for_authenticated_reads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for status in [307, 403, 408, 409, 429, 500, 502, 503, 504] {
+        let second_seen = Arc::new(AtomicUsize::new(0));
+        let (first, a) = status_mock(status, Arc::new(AtomicUsize::new(0))).await;
+        let (second, b) =
+            routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            targets: vec![
+                routing_target("first", first, 0),
+                routing_target("second", second, 10),
+            ],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        assert!(
+            matches!(
+                front
+                    .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+                    .await,
+                Err(AppError::Transport)
+            ),
+            "{status}"
+        );
+        assert_eq!(second_seen.load(Ordering::Relaxed), 0);
+        // Anonymous reads already fail over on any target fault.
+        assert_eq!(
+            front
+                .public_call(crate::peer::Operation::Version {})
+                .await
+                .unwrap()["node"],
+            "second"
+        );
+        a.abort();
+        b.abort();
+    }
+}
+#[tokio::test]
+async fn node_routing_real_executor_token_or_path_mismatch_fails_over_to_local() {
+    // 401: another credential; 404: the executor serves regional paths only.
+    for (prefix, token) in [
+        ("/internal/v1/peer", "other-node-secret"),
+        ("/internal/v1/jp/peer", "node-secret"),
+    ] {
+        let upstream = fixture(vec![]).await;
+        let remote = client(&upstream, account_config());
+        let (url, server) =
+            peer_http_server(crate::peer::router(remote, prefix, token.into())).await;
+        let local = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+        let mut cfg = account_config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: Some(10),
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = client(&local, cfg);
+        assert!(front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await
+            .is_ok());
+        assert!(upstream.received.lock().unwrap().is_empty());
+        assert_eq!(local.received.lock().unwrap().len(), 2);
+        assert_eq!(front.node_status()["targets"][0]["failures"], 1);
+        server.abort();
+    }
 }
 #[tokio::test]
 async fn node_routing_total_deadline_stops_before_next_target_and_recovers_admission() {

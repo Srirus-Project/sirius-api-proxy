@@ -52,10 +52,20 @@ pub enum Error {
     #[error("invalid peer response; execution is uncertain")]
     Protocol,
 }
+/// HTTP statuses a Sirius executor (1.2.0 onward) answers on the peer route only before its
+/// handler dispatches a game call: bearer rejection (401), a route or method it does not serve
+/// (404, 405), the 16 KiB body limit (413), the content type (415) and malformed, invalid or
+/// untyped request bodies (400, 422). Every dispatched query answers 200 with a typed outcome.
+pub const PRE_DISPATCH_STATUSES: &[u16] = &[400, 401, 404, 405, 413, 415, 422];
 impl Error {
     /// Only these failures prove that this transport did not submit the query.
     pub fn definitely_not_sent(&self) -> bool {
         matches!(self, Self::Config | Self::NotSent | Self::Connect)
+    }
+    /// The query was submitted, but the executor provably rejected it before game dispatch.
+    /// Assumes no intermediary synthesizes these statuses after forwarding the request.
+    pub fn rejected_before_dispatch(&self) -> bool {
+        matches!(self, Self::Status(s) if PRE_DISPATCH_STATUSES.contains(s))
     }
 }
 pub struct Client {
