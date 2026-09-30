@@ -15,6 +15,8 @@ Master CDN downloads have their separate existing limits.
 | `retry_delay_ms` | 250 | 1..10000 |
 | `anonymous_max_inflight` | omitted: min(4, `max_inflight`) | 1..64 and at most `max_inflight` |
 | `coalesce_public_reads` | false | `true` also shares identical ranking reads |
+| `http2_keepalive_interval_ms` | omitted: min(10000, `timeout_ms` / 2); off when `timeout_ms` < 4000 and neither keepalive key is set | 0 disables keepalive, otherwise 1000..300000 |
+| `http2_keepalive_timeout_ms` | omitted: min(5000, `timeout_ms` / 4) | 1000..60000; not with interval 0 |
 
 A logical call includes admission wait, per-account session or anonymous slot wait, protocol activation
 wait, anonymous Version bootstrap, optional identity verification, retries and the
@@ -35,6 +37,32 @@ peer and cache-refresh calls of those routes) no longer share one regional lock:
 announcement read. `anonymous_max_inflight: 1` restores the 1.2.x serialization. The Version
 bootstrap of an authenticated call stays single-flight under its own lock and does not take
 an anonymous slot. With `session_lock: false` only `max_inflight` bounds anonymous calls.
+
+## Connection liveness
+
+Game RPCs share pooled HTTP/2 connections. A connection that silently stops delivering packets
+(a dropped NAT entry, a dead proxy tunnel) is detected with HTTP/2 PING frames instead of every
+call on it waiting for its whole deadline:
+
+- A PING is sent only while a call is open and the connection has received nothing for
+  `http2_keepalive_interval_ms`; a call that starts on a connection already silent that long
+  pings at once. Idle connections are never pinged and are closed after 90 s unused, so a busy,
+  healthy connection sends almost no PINGs.
+- A PING not acknowledged within `http2_keepalive_timeout_ms` closes the connection. Calls in
+  flight on it fail as `upstream_transport` (502) about interval + timeout after the connection
+  went quiet (at most 15 s with the defaults) instead of `upstream_timeout` (504) at the
+  deadline, and the next call opens a new connection. The failure is a path fault like any
+  transport failure (see [path health](#upstream-path-health)).
+- Verified anonymous reads with `anonymous_attempts > 1` may retry on a new connection inside
+  the same deadline; authenticated calls are never replayed. A request is resent automatically
+  only when it was never written to a connection.
+
+When either key is set explicitly, interval + timeout must be less than `timeout_ms`, so a dead
+connection fails the call before its deadline. The derived values sum to at most three quarters
+of `timeout_ms`; they are not used below a 1-second acknowledgement (`timeout_ms` < 4000), which
+keeps such configurations exactly as in 1.2.x. `http2_keepalive_interval_ms: 0` turns PINGs off
+for an upstream that objects to them. The official client also configures HTTP/2 keepalive on
+its connections.
 
 ## Shared in-flight reads
 

@@ -75,6 +75,8 @@ upstream:
   retry_delay_ms: 250
   # anonymous_max_inflight: 4 # 1 restores serialized anonymous calls
   # coalesce_public_reads: false # true also shares identical concurrent ranking reads
+  # http2_keepalive_interval_ms: 10000 # 0 disables; see docs/REQUEST_POLICY.md
+  # http2_keepalive_timeout_ms: 5000
 
 # Public announcement/ranking response cache; defaults to disabled.
 # See docs/RESPONSE_CACHE.md for memory/Redis, per-route TTL and opt-in stale-while-revalidate.

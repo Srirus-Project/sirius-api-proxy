@@ -3715,6 +3715,7 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
         "anonymous_attempts",
         "retry_delay_ms",
         "anonymous_max_inflight",
+        "http2_keepalive_timeout_ms",
     ] {
         let input = format!("{field}: 0");
         let policy: crate::config::UpstreamConfig = yaml_serde::from_str(&input).unwrap();
@@ -3741,6 +3742,47 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
     assert_eq!(serialized.anonymous_slots(), 1);
     assert!(serialized.coalesce_public_reads);
     assert_eq!(parse("anonymous_max_inflight: 64").anonymous_slots(), 64);
+    // HTTP/2 keepalive: derived from timeout_ms, off below a 1 s acknowledgement unless set.
+    let seconds = |a: u64, b: u64| Some((Duration::from_secs(a), Duration::from_secs(b)));
+    assert_eq!(c.upstream.http2_keepalive(), seconds(10, 5));
+    assert_eq!(c.upstream.http2_keepalive_interval_ms, None);
+    assert_eq!(c.upstream.http2_keepalive_timeout_ms, None);
+    let tight = parse("timeout_ms: 3000");
+    assert!(tight.validate().is_ok());
+    assert_eq!(tight.http2_keepalive(), None);
+    assert_eq!(parse("timeout_ms: 8000").http2_keepalive(), seconds(4, 2));
+    assert_eq!(
+        parse("timeout_ms: 300000").http2_keepalive(),
+        seconds(10, 5)
+    );
+    for rejected in [
+        "http2_keepalive_interval_ms: 999",
+        "http2_keepalive_interval_ms: 300001",
+        "http2_keepalive_timeout_ms: 999",
+        "http2_keepalive_timeout_ms: 60001",
+        "http2_keepalive_interval_ms: 10000\ntimeout_ms: 12000",
+        "http2_keepalive_timeout_ms: 1000\ntimeout_ms: 2000",
+        "http2_keepalive_interval_ms: 0\nhttp2_keepalive_timeout_ms: 2000",
+        "http2_keepalive_interval_ms: 300000\ntimeout_ms: 300000",
+    ] {
+        assert!(parse(rejected).validate().is_err(), "{rejected}");
+    }
+    for (accepted, expected) in [
+        ("http2_keepalive_interval_ms: 0", None),
+        ("http2_keepalive_interval_ms: 0\ntimeout_ms: 100", None),
+        (
+            "http2_keepalive_interval_ms: 5000\nhttp2_keepalive_timeout_ms: 2000",
+            seconds(5, 2),
+        ),
+        (
+            "http2_keepalive_interval_ms: 1000\nhttp2_keepalive_timeout_ms: 1000\ntimeout_ms: 2001",
+            seconds(1, 1),
+        ),
+    ] {
+        let policy = parse(accepted);
+        assert!(policy.validate().is_ok(), "{accepted}");
+        assert_eq!(policy.http2_keepalive(), expected, "{accepted}");
+    }
 }
 
 fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
@@ -4202,6 +4244,200 @@ async fn tunnel_proxy(response: Vec<u8>, forward: bool, delay: Duration) -> Tunn
         }
     });
     TunnelProxy { url, seen, task }
+}
+/// A plain TCP relay whose open connections can be blackholed: `freeze` makes every connection
+/// open at that moment drop bytes both ways without closing; later connections forward normally.
+struct BlackholeRelay {
+    url: String,
+    accepts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Client-to-server bytes read, forwarded or not.
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    open: Arc<Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for BlackholeRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl BlackholeRelay {
+    fn freeze(&self) {
+        for frozen in self.open.lock().unwrap().iter() {
+            frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn accepts(&self) -> usize {
+        self.accepts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn sent(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+async fn blackhole_relay(target: &str) -> BlackholeRelay {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn pump(
+        mut from: impl AsyncRead + Unpin,
+        mut to: impl AsyncWrite + Unpin,
+        frozen: Arc<AtomicBool>,
+        count: Option<Arc<AtomicUsize>>,
+    ) {
+        let mut buffer = vec![0; 16384];
+        while let Ok(n @ 1..) = from.read(&mut buffer).await {
+            if let Some(count) = &count {
+                count.fetch_add(n, Ordering::SeqCst);
+            }
+            if !frozen.load(Ordering::SeqCst) && to.write_all(&buffer[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+    let target: std::net::SocketAddr = target.strip_prefix("http://").unwrap().parse().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(Mutex::new(Vec::new()));
+    let (accepted, counted, registered) = (accepts.clone(), sent.clone(), open.clone());
+    let task = tokio::spawn(async move {
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let frozen = Arc::new(AtomicBool::new(false));
+            registered.lock().unwrap().push(frozen.clone());
+            let upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+            let (client_read, client_write) = client.into_split();
+            let (upstream_read, upstream_write) = upstream.into_split();
+            tokio::spawn(pump(
+                client_read,
+                upstream_write,
+                frozen.clone(),
+                Some(counted.clone()),
+            ));
+            tokio::spawn(pump(upstream_read, client_write, frozen, None));
+        }
+    });
+    BlackholeRelay {
+        url,
+        accepts,
+        sent,
+        open,
+        task,
+    }
+}
+fn keepalive_config(target: &BlackholeRelay, interval_ms: u64, timeout_ms: u64) -> Config {
+    let mut cfg = config();
+    cfg.endpoint = target.url.clone();
+    cfg.upstream.timeout_ms = timeout_ms;
+    cfg.upstream.http2_keepalive_interval_ms = Some(interval_ms);
+    if interval_ms != 0 {
+        cfg.upstream.http2_keepalive_timeout_ms = Some(1_000);
+    }
+    cfg.upstream.validate().unwrap();
+    cfg
+}
+#[tokio::test]
+async fn upstream_http2_keepalive_detects_blackholed_connection_before_deadline() {
+    let f = fixture(vec![Reply::version(), Reply::version(), Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let c = GameClient::for_test(keepalive_config(&relay, 1_000, 10_000));
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 1);
+    relay.freeze();
+    let started = std::time::Instant::now();
+    // A missed PING acknowledgement closes the connection: a transport failure (502), not the
+    // deadline's 504.
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Transport)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(3_500));
+    // The dead connection left the pool; the next call reconnects.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 2);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn keepalive_failure_retries_only_verified_anonymous_reads() {
+    let f = fixture(vec![Reply::version(), Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let mut cfg = keepalive_config(&relay, 1_000, 10_000);
+    cfg.upstream.anonymous_attempts = 2;
+    cfg.upstream.retry_delay_ms = 1;
+    let c = GameClient::for_test(cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    relay.freeze();
+    // The retry runs on a fresh connection inside the same logical call.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 2);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+
+    let f = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let mut cfg = account_config();
+    cfg.endpoint = relay.url.clone();
+    cfg.upstream = keepalive_config(&relay, 1_000, 10_000).upstream;
+    cfg.upstream.anonymous_attempts = 2;
+    let c = GameClient::for_test(cfg);
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    profile().await.unwrap();
+    relay.freeze();
+    assert!(matches!(profile().await, Err(AppError::Transport)));
+    // Authenticated calls are never replayed.
+    assert_eq!(relay.accepts(), 1);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 1);
+    assert_eq!(status["accounts"][0]["disabled"], false);
+}
+#[tokio::test]
+async fn keepalive_does_not_ping_idle_connections_or_kill_slow_live_replies() {
+    let mut slow = Reply::version();
+    slow.delay = Duration::from_millis(2_500);
+    let f = fixture(vec![Reply::version(), slow]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let c = GameClient::for_test(keepalive_config(&relay, 1_000, 10_000));
+    c.call(VERSION, json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent = relay.sent();
+    // Longer than interval + acknowledgement timeout: an idle connection is left alone.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert_eq!(relay.sent(), sent);
+    // A live connection acknowledges PINGs, so a slow reply is not cut off.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 1);
+    assert!(relay.sent() > sent);
+}
+#[tokio::test]
+async fn keepalive_disabled_keeps_previous_behaviour() {
+    let f = fixture(vec![Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let cfg = keepalive_config(&relay, 0, 1_500);
+    assert!(cfg.upstream.http2_keepalive().is_none());
+    let c = GameClient::for_test(cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    relay.freeze();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Timeout)
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(1_400));
+}
+#[tokio::test]
+async fn default_keepalive_client_completes_calls() {
+    // Guards the mandatory hyper timer: keepalive without one panics on the first connection.
+    let cfg = config();
+    assert_eq!(
+        cfg.upstream.http2_keepalive(),
+        Some((Duration::from_secs(10), Duration::from_secs(5)))
+    );
+    let f = fixture(vec![Reply::version()]).await;
+    let c = client(&f, cfg);
+    assert_eq!(
+        c.call(VERSION, json!({})).await.unwrap()["version"],
+        "master-fixture"
+    );
 }
 fn proxy_policy(url: &str) -> crate::config::UpstreamConfig {
     let name = format!("TEST_PROXY_{}", uuid::Uuid::new_v4().simple());

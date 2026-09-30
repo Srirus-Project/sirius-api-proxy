@@ -21,6 +21,12 @@
 - Global SDK transport and malformed-response failures no longer cool the account; they open a
   separate SDK path the same way. `GET /internal/v1/accounts` adds `path` and, on Global,
   `sdk_path`. No configuration or wire change.
+- A dead or blackholed game connection is detected by HTTP/2 PING within about interval +
+  acknowledgement timeout (15 s by default) while a call is open on it: the call fails as 502
+  `upstream_transport` instead of 504 `upstream_timeout` at the deadline, and the next call
+  reconnects. Idle connections are not pinged. New keys `upstream.http2_keepalive_interval_ms`
+  (0 disables) and `upstream.http2_keepalive_timeout_ms`; profiles with `timeout_ms` below 4000
+  keep the 1.2.x behavior unless a key is set. API and peer wire format are unchanged.
 
 ## 1.2.4
 

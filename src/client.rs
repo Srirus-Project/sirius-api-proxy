@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::{header::HeaderMap, Request};
 use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioTimer},
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
@@ -179,9 +182,20 @@ impl GameClient {
         };
         let connector =
             crate::transport::TlsConnector::new(connector, config.upstream.connect_timeout_ms);
-        let http = Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build(connector);
+        // The timer is always set: hyper panics if keepalive runs without one. PINGs go out
+        // only while a call is open on a connection silent for the interval; a missed
+        // acknowledgement closes the connection (Transport) so the next call reconnects.
+        let mut http = Client::builder(TokioExecutor::new());
+        http.http2_only(true)
+            .timer(TokioTimer::new())
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Duration::from_secs(90));
+        if let Some((interval, ack)) = config.upstream.http2_keepalive() {
+            http.http2_keep_alive_interval(interval)
+                .http2_keep_alive_timeout(ack)
+                .http2_keep_alive_while_idle(false);
+        }
+        let http = http.build(connector);
         let accounts = crate::accounts::Pool::load(&config, 1)?;
         let sdk = sdk_client(&config)?;
         // Path health outlives account and protocol reloads.

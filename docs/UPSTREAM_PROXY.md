@@ -41,6 +41,9 @@ bounds DNS/TCP, proxy TLS/CONNECT and origin TLS together, including connection
 pool establishment. The logical `timeout_ms` remains the overall call deadline.
 A connection timeout is a transport failure (502); an expired logical deadline is
 504. Anonymous transport retries still share the original logical deadline.
+`connect_timeout_ms` bounds only establishment: once a tunnel is up, the HTTP/2 PINGs of
+[connection liveness](REQUEST_POLICY.md#connection-liveness) travel end to end inside the
+origin TLS connection, so a tunnel that dies later is detected like a dead direct connection.
 
 CONNECT responses are limited to 16 KiB and 128 headers per response. At most four
 informational responses precede the final result; 101 is rejected. Successful 2xx

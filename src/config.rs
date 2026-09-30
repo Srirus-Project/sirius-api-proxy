@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use serde::Deserialize;
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +86,12 @@ pub struct UpstreamConfig {
     pub anonymous_max_inflight: Option<usize>,
     /// Also share one execution among identical concurrent ranking reads (one account's result).
     pub coalesce_public_reads: bool,
+    /// HTTP/2 PING interval while a call is open on a silent connection; omitted means
+    /// min(10000, `timeout_ms` / 2) and 0 disables keepalive (see `http2_keepalive`).
+    pub http2_keepalive_interval_ms: Option<u64>,
+    /// Wait for a PING acknowledgement before closing the connection; omitted means
+    /// min(5000, `timeout_ms` / 4).
+    pub http2_keepalive_timeout_ms: Option<u64>,
 }
 impl Default for UpstreamConfig {
     fn default() -> Self {
@@ -100,6 +106,8 @@ impl Default for UpstreamConfig {
             retry_delay_ms: 250,
             anonymous_max_inflight: None,
             coalesce_public_reads: false,
+            http2_keepalive_interval_ms: None,
+            http2_keepalive_timeout_ms: None,
         }
     }
 }
@@ -120,12 +128,51 @@ impl UpstreamConfig {
             || self
                 .anonymous_max_inflight
                 .is_some_and(|n| !(1..=64).contains(&n) || n > self.max_inflight)
+            || (self.http2_keepalive_timeout_ms.is_some()
+                && self.http2_keepalive_interval_ms == Some(0))
+            || self
+                .http2_keepalive_interval_ms
+                .is_some_and(|v| v != 0 && !(1_000..=300_000).contains(&v))
+            || self
+                .http2_keepalive_timeout_ms
+                .is_some_and(|v| !(1_000..=60_000).contains(&v))
+            || self.explicit_keepalive_misses_deadline()
         {
             return Err(AppError::Config(
                 "upstream request policy exceeds supported bounds",
             ));
         }
         Ok(())
+    }
+    /// HTTP/2 keepalive (PING interval, acknowledgement timeout) for the game connection pool.
+    /// Derived values sum to at most 3/4 of `timeout_ms`, so a dead connection fails a call
+    /// before its deadline; they stay off below a 1 s acknowledgement (`timeout_ms` < 4000)
+    /// unless a key is set, which keeps 1.2.x tight-deadline configurations unchanged.
+    pub(crate) fn http2_keepalive(&self) -> Option<(Duration, Duration)> {
+        if self.http2_keepalive_interval_ms == Some(0) {
+            return None;
+        }
+        let interval = self
+            .http2_keepalive_interval_ms
+            .unwrap_or((self.timeout_ms / 2).min(10_000));
+        let ack = self
+            .http2_keepalive_timeout_ms
+            .unwrap_or((self.timeout_ms / 4).min(5_000));
+        let explicit =
+            self.http2_keepalive_interval_ms.is_some() || self.http2_keepalive_timeout_ms.is_some();
+        if !explicit && ack < 1_000 {
+            return None;
+        }
+        Some((Duration::from_millis(interval), Duration::from_millis(ack)))
+    }
+    /// Explicit keepalive values must detect a dead connection before the logical deadline.
+    fn explicit_keepalive_misses_deadline(&self) -> bool {
+        let explicit =
+            self.http2_keepalive_interval_ms.is_some() || self.http2_keepalive_timeout_ms.is_some();
+        explicit
+            && self.http2_keepalive().is_some_and(|(interval, ack)| {
+                (interval + ack).as_millis() >= u128::from(self.timeout_ms)
+            })
     }
     /// Anonymous call slots used while `session_lock` is true.
     pub fn anonymous_slots(&self) -> usize {

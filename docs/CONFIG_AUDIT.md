@@ -371,6 +371,22 @@ These generic capabilities are intentionally not restored in their original form
    fault), one probe at a time every min(`cooldown_seconds`, 5 s), admission once per logical
    call, gRPC 8/13 remain account faults, and SDK transient failures never cool an account. No
    configuration is added.
+13. **Game connections use HTTP/2 PING keepalive, not TCP keepalive.** The original enables only
+   TCP keepalive on its game client (`Haruki-Sekai-API@9a53714:src/client/sekai_client.rs:49-54`),
+   which the kernel acts on after minutes. Sirius's game client multiplexes calls over pooled
+   HTTP/2 connections whose idle timer is renewed by every call, so a blackholed connection kept
+   every call on it waiting for its deadline (504, not retried, charged like any timeout). Since
+   1.3.0 the pool sends HTTP/2 PINGs with `while_idle` off (`src/client.rs:188-198`): only while
+   a call is open on a connection silent for `upstream.http2_keepalive_interval_ms`, and a missed
+   acknowledgement within `http2_keepalive_timeout_ms` closes the connection, failing its calls
+   as `upstream_transport` (502) so the next call reconnects. Differences: defaults are derived
+   from `timeout_ms` (min(10 s, 1/2) and min(5 s, 1/4)) so interval + timeout stays below the
+   deadline and every 1.2.x configuration still validates; they stay off below a 1 s
+   acknowledgement (`timeout_ms` < 4000) unless a key is set; explicit values must sum to less
+   than `timeout_ms`; `http2_keepalive_interval_ms: 0` turns them off. The official game client
+   configures `Http2KeepAliveInterval`/`Http2KeepAliveTimeout` on its HTTP/2 handler (no
+   `WhileIdle`), so PINGs during an open call match its behavior. Peer, SDK, CDN and Git clients
+   are unchanged.
 
 ## Original fields that were ignored by the original itself
 
@@ -397,7 +413,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | Section | Fields | Read at |
 | --- | --- | --- |
 | Root profile (`src/config.rs:5-70`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
-| `upstream` (`src/config.rs:72-89`) | all, including `anonymous_max_inflight` and `coalesce_public_reads` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:136`, `:166-168`, `:581`, `:1108`, `:1128`, `:1236`, SDK proxy at `:1559-1566`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
+| `upstream` (`src/config.rs:72-95`) | all, including `anonymous_max_inflight`, `coalesce_public_reads`, `http2_keepalive_interval_ms` and `http2_keepalive_timeout_ms` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:171`, `:184`, keepalive at `:188-198` (derived by `src/config.rs:151-167`), `:230-232`, `:753`, `:1313`, `:1333`, `:1455`, SDK proxy at `:1788-1800`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
 | `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
@@ -483,3 +499,6 @@ classification and evidence:
   row notes that Version is coalesced though never cached.
 - **Path health:** new [Decision 12](#decisions). `account_pool` now also sets the thresholds of
   the per-region path breaker; its reverse-check citations are updated.
+- **Connection liveness:** new [Decision 13](#decisions). `upstream.http2_keepalive_interval_ms` and
+  `upstream.http2_keepalive_timeout_ms` are added to the reverse check, whose `upstream` line
+  references are updated.
