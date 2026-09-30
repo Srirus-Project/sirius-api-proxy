@@ -27,6 +27,9 @@ regions:
       state_directory: "data/jp/master-git"
       layout: "indented_root"
       branch: "main"
+      # Seconds for all Git commands of one publication attempt (default 120, 10-600).
+      # Raise it for a large first push over a slow link.
+      timeout_seconds: 300
       commit:
         author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
       remote:

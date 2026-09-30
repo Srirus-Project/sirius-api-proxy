@@ -21,6 +21,9 @@ pub struct Config {
     /// Published branch, locally and on the remote.
     #[serde(default = "branch")]
     pub branch: String,
+    /// Seconds for all Git commands of one publication attempt (10–600).
+    #[serde(default = "timeout")]
+    pub timeout_seconds: u64,
 }
 fn interval() -> u64 {
     300
@@ -28,20 +31,27 @@ fn interval() -> u64 {
 fn branch() -> String {
     master_git::DEFAULT_BRANCH.into()
 }
+fn timeout() -> u64 {
+    master_git::DEFAULT_TIMEOUT_SECONDS
+}
 impl Config {
     pub fn options(&self) -> master_git::Options {
         master_git::Options {
             layout: self.layout,
             branch: self.branch.clone(),
+            timeout_seconds: self.timeout_seconds,
         }
     }
     pub fn validate(&self, game: &GameConfig) -> Result<(), AppError> {
         self.commit
             .validate()
             .map_err(|_| AppError::Config("invalid Master Git commit policy"))?;
-        self.options()
-            .validate()
-            .map_err(|_| AppError::Config("invalid Master Git branch"))?;
+        self.options().validate().map_err(|error| match error {
+            master_git::Error::TimeoutConfig => {
+                AppError::Config("invalid Master Git timeout_seconds")
+            }
+            _ => AppError::Config("invalid Master Git branch"),
+        })?;
         if !cfg!(any(unix, windows))
             || !game.region.master_supported()
             || self.state_directory.as_os_str().is_empty()
@@ -191,6 +201,8 @@ impl Worker {
                     master_git::Error::AssetVersion => "asset_version_unavailable",
                     // Produced only by the explicit `master-git-adopt` command, never here.
                     master_git::Error::NotAdoptable => "not_adoptable",
+                    // Rejected by `Config::validate` before the worker starts.
+                    master_git::Error::TimeoutConfig => "timeout_config",
                 };
                 self.game.record_master_git(json!({"status":"failed","checked_at":chrono::Utc::now(),"error_code":code,"last_success":self.last_success})).await;
                 tracing::warn!(

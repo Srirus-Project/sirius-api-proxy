@@ -192,13 +192,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|g| g.commit.clone())
             .unwrap_or_default();
-        let options = config
+        let mut options = config
             .master_git
             .as_ref()
             .map(|g| g.options())
             .unwrap_or_default();
-        // Adoption reads only the scope, layout and branch: no Master directory, commit
-        // policy or configured remote.
+        options
+            .apply_timeout_override(
+                std::env::var_os("SIRIUS_MASTER_GIT_TIMEOUT_SECONDS").as_deref(),
+            )
+            .map_err(|_| "SIRIUS_MASTER_GIT_TIMEOUT_SECONDS must be an integer from 10 to 600")?;
+        // Adoption reads only the scope, layout, branch and time budget: no Master
+        // directory, commit policy or configured remote.
         if adopt {
             let adoption = sirius_api_proxy::master_git::adopt_with_options(
                 std::path::Path::new(&args[1]),

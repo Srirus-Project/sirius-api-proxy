@@ -348,8 +348,10 @@ previous commit. This describes the default `native` layout; see
 reference update commits the new tree; failed validation leaves the prior reference unchanged.
 A cancelled/failed command may leave unreachable Git objects, and loss of the response at the
 reference update is ambiguous: rerun the identical operation to inspect/reuse the committed tree.
-The source CURRENT pointer is never changed by Git publication. Git commands share a 120-second
-budget after local preparation; synchronous local reads can exceed that preparation time.
+The source CURRENT pointer is never changed by Git publication. All Git commands of one
+publication attempt (init, ref reads, remote check, hashing, commit, signing, push and
+verification) share one deadline, `master_git.timeout_seconds` (default 120; range 10–600). It
+starts after local preparation; synchronous local reads can exceed that preparation time.
 
 By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and are unsigned.
 The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
@@ -381,8 +383,16 @@ remote-ref query must confirm exactly the submitted commit before `remote_verifi
 is returned. `changed` refers to creation of a local commit, not whether network work occurred.
 Remote races, errors and timeouts produce an error, never a false publication receipt. The
 source Master CURRENT pointer is independent and is never rolled back by Git failures. All
-Git work, including checks, commit creation, push and acknowledgement, shares the existing
-120-second budget after local preparation.
+Git work, including checks, commit creation, push and acknowledgement, shares the single
+`master_git.timeout_seconds` budget after local preparation. HTTP(S) remote transfers also
+abort once they stay below 1000 bytes/s for 30 seconds (`http.lowSpeedLimit`/`lowSpeedTime`),
+which fails a stalled transfer as a Git error before the budget runs out. This does not bound
+connection setup; the total deadline does.
+
+Set `SIRIUS_MASTER_GIT_TIMEOUT_SECONDS` (an integer from 10 to 600, digits only) to override the
+profile's `master_git.timeout_seconds` for one `master-git-commit`, `master-git-push` or
+`master-git-adopt` run, for example for a large first push. An invalid value fails before any
+Git command and is not echoed. Precedence is the variable, then the profile, then 120.
 
 For HTTP authorization, set `SIRIUS_MASTER_GIT_AUTHORIZATION` externally to a complete single
 header value such as `Authorization: Bearer …` or `Authorization: Basic …`. Do not put credentials
@@ -410,7 +420,8 @@ create (for example a README), publication keeps failing with `remote_history`. 
 command makes the remote branch the local managed branch so publication can continue. Argument
 and environment handling (`SIRIUS_MASTER_GIT_AUTHORIZATION`, `SIRIUS_MASTER_GIT_PROXY_URL`,
 HTTPS or explicit `file://` only) are exactly those of `master-git-push`. It reads the profile's
-region, environment, platform, `master_git.layout` and `master_git.branch`; it does not need
+region, environment, platform, `master_git.layout`, `master_git.branch` and
+`master_git.timeout_seconds` (adoption shares one such budget); it does not need
 `master_directory` and ignores `master_git.commit`, `state_directory`, `interval_seconds` and
 `remote`. The state directory follows the same ownership rules: a missing or empty directory is
 initialized for the profile's scope, and a foreign non-empty directory or another scope's state
@@ -461,8 +472,12 @@ directories and shared remotes. Git tokens must be distinct per region.
 leave the feature disabled. See the commented single-profile example configuration.
 
 The worker reconciles CURRENT at startup, after successful in-process Master installations,
-and every `interval_seconds` (default 300; range 10–86400). Polling also discovers CLI imports
-and retries failed publication. Git and consumer notifications use independent wake signals.
+and every `interval_seconds` (default 300; range 10–86400), measured after each attempt ends, so
+cycles never overlap. `timeout_seconds` (default 120; range 10–600) bounds the Git commands of
+each attempt; a larger budget holds the state lock and the `running` status longer when the
+remote stalls, while shutdown still cancels at once. A small budget can make a large first push
+or a slow signer fail every cycle; the failure is safe and the next cycle reconciles. Polling
+also discovers CLI imports and retries failed publication. Git and consumer notifications use independent wake signals.
 Intermediate installations may coalesce into the latest snapshot. Keep the managed state
 across restarts: Git refs are durable, while displayed last-success status is rebuilt at startup.
 

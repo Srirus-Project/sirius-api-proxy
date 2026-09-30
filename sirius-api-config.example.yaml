@@ -149,6 +149,7 @@ response_cache:
 # master_git:
 #   state_directory: ./data/master-git
 #   interval_seconds: 300
+#   timeout_seconds: 120 # all Git commands of one publication attempt, 10-600
 #   # native (default): exact tables + sirius-publication.json. indented_root: every table
 #   # re-indented at the repository root plus version.json {dataVersion, assetVersion};
 #   # requires recorded asset-version provenance (see docs/MASTER_REGISTRY.md).

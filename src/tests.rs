@@ -10447,6 +10447,7 @@ async fn master_git_worker_publishes_on_start_and_update_with_independent_notifi
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
+        timeout_seconds: 120,
         remote: None,
     });
     let prepared = crate::deployment::DeploymentConfig::Single(Box::new(cfg.clone()))
@@ -10527,6 +10528,7 @@ async fn master_git_worker_periodically_retries_rejected_push_preserving_install
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: url::Url::from_directory_path(&remote).unwrap().to_string(),
@@ -10582,6 +10584,7 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: "https://git.example/repo.git".into(),
@@ -10633,6 +10636,19 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
     cfg.master_git.as_mut().unwrap().interval_seconds = 9;
     assert!(cfg.validate().is_err());
     cfg.master_git.as_mut().unwrap().interval_seconds = 10;
+    let game = GameClient::new(cfg.clone()).unwrap();
+    for (timeout, valid) in [(9, false), (10, true), (600, true), (601, false)] {
+        cfg.master_git.as_mut().unwrap().timeout_seconds = timeout;
+        assert_eq!(cfg.validate().is_ok(), valid, "{timeout}");
+        assert_eq!(GameClient::new(cfg.clone()).is_ok(), valid, "{timeout}");
+        let game = game.clone();
+        assert_eq!(
+            crate::master_git_worker::Worker::new(&cfg, game).is_ok(),
+            valid,
+            "{timeout}"
+        );
+    }
+    cfg.master_git.as_mut().unwrap().timeout_seconds = 120;
     cfg.master_directory = None;
     assert!(cfg.validate().is_err());
     std::env::remove_var(name);
@@ -10664,6 +10680,7 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: format!("{origin}/repository.git"),
@@ -10697,6 +10714,258 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
             .is_ok()
     );
     server.abort();
+}
+
+#[test]
+fn master_git_timeout_defaults_and_bounds() {
+    use crate::master_git;
+    assert_eq!(master_git::Options::default().timeout_seconds, 120);
+    let parsed: crate::master_git_worker::Config =
+        yaml_serde::from_str("state_directory: x").unwrap();
+    assert_eq!(parsed.timeout_seconds, 120);
+    assert_eq!(parsed.options().timeout_seconds, 120);
+    let configured: crate::master_git_worker::Config =
+        yaml_serde::from_str("state_directory: x\ntimeout_seconds: 600").unwrap();
+    assert_eq!(configured.options().timeout_seconds, 600);
+    assert!(yaml_serde::from_str::<crate::master_git_worker::Config>(
+        "state_directory: x\ntimeout: 30"
+    )
+    .is_err());
+    assert!(yaml_serde::from_str::<crate::master_git_worker::Config>(
+        "state_directory: x\ntimeout_seconds: -1"
+    )
+    .is_err());
+    for (timeout, valid) in [
+        (0, false),
+        (9, false),
+        (10, true),
+        (600, true),
+        (601, false),
+    ] {
+        let options = master_git::Options {
+            timeout_seconds: timeout,
+            ..Default::default()
+        };
+        if valid {
+            assert!(options.validate().is_ok(), "{timeout}");
+        } else {
+            assert!(
+                matches!(options.validate(), Err(master_git::Error::TimeoutConfig)),
+                "{timeout}"
+            );
+        }
+    }
+    // The branch is still checked first and keeps its own error.
+    let invalid_branch = master_git::Options {
+        branch: "a..b".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        invalid_branch.validate(),
+        Err(master_git::Error::LayoutConfig)
+    ));
+}
+
+#[test]
+fn master_git_timeout_env_override_is_strict() {
+    use crate::master_git;
+    use std::ffi::OsStr;
+    let mut options = master_git::Options::default();
+    options.apply_timeout_override(None).unwrap();
+    assert_eq!(options.timeout_seconds, 120);
+    for (value, expected) in [("10", 10), ("600", 600), ("120", 120)] {
+        options
+            .apply_timeout_override(Some(OsStr::new(value)))
+            .unwrap();
+        assert_eq!(options.timeout_seconds, expected);
+    }
+    options.timeout_seconds = 75;
+    for value in [
+        "9", "601", "0", "", " 60", "60 ", "+60", "-60", "60s", "1e2", "0600", "060", "1000",
+        "６０",
+    ] {
+        assert!(
+            matches!(
+                options.apply_timeout_override(Some(OsStr::new(value))),
+                Err(master_git::Error::TimeoutConfig)
+            ),
+            "{value:?}"
+        );
+        assert_eq!(options.timeout_seconds, 75, "{value:?}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(matches!(
+            options.apply_timeout_override(Some(OsStr::from_bytes(b"6\xff"))),
+            Err(master_git::Error::TimeoutConfig)
+        ));
+        assert_eq!(options.timeout_seconds, 75);
+    }
+}
+
+#[test]
+fn master_git_remote_options_bound_low_speed_without_credentials() {
+    let name = format!("SIRIUS_GIT_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, "Authorization: Bearer lowspeed-secret");
+    let remote = crate::master_git::Remote {
+        url: "https://git.example/repo.git".into(),
+        authorization_env: Some(name.clone()),
+        proxy_url_env: None,
+        allow_http: true,
+        allow_file: false,
+    };
+    assert!(remote.validate().is_ok());
+    let options: Vec<String> = remote
+        .options_for_test()
+        .into_iter()
+        .map(|o| o.into_string().unwrap())
+        .collect();
+    for setting in ["http.lowSpeedLimit=1000", "http.lowSpeedTime=30"] {
+        assert!(
+            options
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == setting),
+            "{setting}"
+        );
+    }
+    assert!(options
+        .iter()
+        .all(|o| !o.contains("lowspeed-secret") && !o.contains("Bearer")));
+    let mentions: Vec<_> = options.iter().filter(|o| o.contains(&name)).collect();
+    assert_eq!(mentions.len(), 1);
+    assert!(mentions[0].starts_with("--config-env=http."));
+    std::env::remove_var(name);
+}
+
+#[tokio::test]
+async fn master_git_invalid_timeout_fails_before_state_is_created() {
+    use crate::master_git;
+    let (root, _, source, _) = registry_fixture();
+    let state = root.path().join("git");
+    let options = master_git::Options {
+        timeout_seconds: 5,
+        ..Default::default()
+    };
+    let policy = master_git::CommitPolicy::default();
+    assert!(matches!(
+        master_git::commit_with_options(&source, &state, registry_scope(), &policy, &options).await,
+        Err(master_git::Error::TimeoutConfig)
+    ));
+    let remote = master_git::Remote {
+        url: url::Url::from_directory_path(root.path().join("remote.git"))
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        proxy_url_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let options = master_git::Options {
+        timeout_seconds: 601,
+        ..Default::default()
+    };
+    assert!(matches!(
+        master_git::adopt_with_options(&state, registry_scope(), &remote, &options).await,
+        Err(master_git::Error::TimeoutConfig)
+    ));
+    assert!(!state.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_configured_budget_bounds_stalled_remote() {
+    use crate::master_git;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let hits = hits.clone();
+        move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let (root, _, source, _) = registry_fixture();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let state = root.path().join("git");
+    let remote = master_git::Remote {
+        url: format!("{origin}/repository.git"),
+        authorization_env: None,
+        proxy_url_env: None,
+        allow_http: true,
+        allow_file: false,
+    };
+    let options = master_git::Options {
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let result = master_git::publish_with_options(
+        &source,
+        &state,
+        registry_scope(),
+        &remote,
+        &master_git::CommitPolicy::default(),
+        &options,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(result, Err(master_git::Error::Git)));
+    // The configured 10 s budget fired: not the 120 s default and not the 30 s low-speed
+    // window.
+    assert!(
+        elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(25),
+        "{elapsed:?}"
+    );
+    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    // The remote check failed before any commit, and the state lock was released.
+    assert_eq!(adopt_local_ref(&state, "master-data"), None);
+    assert!(master_git::commit(&source, &state, registry_scope())
+        .await
+        .is_ok());
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_large_budget_publishes_and_adopts_over_file_remote() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    // 600 s is the git_process ceiling for one command, and is accepted.
+    let options = master_git::Options {
+        timeout_seconds: 600,
+        ..Default::default()
+    };
+    let published = master_git::publish_with_options(
+        &source,
+        &root.path().join("git"),
+        registry_scope(),
+        &remote,
+        &master_git::CommitPolicy::default(),
+        &options,
+    )
+    .await
+    .unwrap();
+    assert!(published.changed && published.remote_verified);
+    let adoption = master_git::adopt_with_options(
+        &root.path().join("adopted"),
+        registry_scope(),
+        &remote,
+        &options,
+    )
+    .await
+    .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, published.commit);
 }
 
 #[cfg(unix)]
@@ -14644,6 +14913,7 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     let options = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: "main".into(),
+        ..Default::default()
     };
     let policy = master_git::CommitPolicy::default();
     let commit = |options: master_git::Options| {
@@ -14763,6 +15033,7 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
         let invalid = master_git::Options {
             layout: master_git::Layout::IndentedRoot,
             branch: branch.into(),
+            ..Default::default()
         };
         assert!(
             matches!(commit(invalid).await, Err(master_git::Error::LayoutConfig)),
@@ -14797,6 +15068,7 @@ async fn master_git_indented_root_pushes_configured_branch_to_remote() {
     let options = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: "release/main".into(),
+        ..Default::default()
     };
     install_plain_master(
         &source,
@@ -15238,10 +15510,12 @@ async fn master_git_adopt_checks_region_scope_and_layout() {
     let indented = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: "main".into(),
+        ..Default::default()
     };
     let native_on_indented_branch = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: master_git::DEFAULT_BRANCH.into(),
+        ..Default::default()
     };
     let mut en = registry_scope();
     en.region = Region::En;
@@ -15281,6 +15555,7 @@ async fn master_git_adopt_checks_region_scope_and_layout() {
     let native_main = master_git::Options {
         layout: master_git::Layout::Native,
         branch: "main".into(),
+        ..Default::default()
     };
     assert!(matches!(
         master_git::adopt_with_options(
@@ -15564,6 +15839,7 @@ async fn master_git_worker_reports_missing_asset_version_and_retries_after_insta
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
+        timeout_seconds: 120,
         remote: None,
     });
     let game = GameClient::new(cfg.clone()).unwrap();
@@ -15804,6 +16080,7 @@ async fn master_sync_propagates_owner_asset_version_without_redownloading_tables
         &crate::master_git::Options {
             layout: crate::master_git::Layout::IndentedRoot,
             branch: "main".into(),
+            ..Default::default()
         },
     )
     .await
@@ -16055,6 +16332,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         let options = master_git::Options {
             layout: master_git::Layout::IndentedRoot,
             branch: "main".into(),
+            ..Default::default()
         };
         let policy = master_git::CommitPolicy::default();
         let receipt = master_git::commit_with_options(

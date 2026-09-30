@@ -56,6 +56,12 @@
   `NotAdoptable`). It never pushes; the next publication continues on the adopted head, and
   manually added files leave the next tree. Publication, configuration and the worker are
   unchanged (the worker never adopts).
+- `master_git.timeout_seconds` (default 120, range 10–600) sets the single time budget for all
+  Git commands of one publication or adoption attempt, previously fixed at 120 s.
+  `SIRIUS_MASTER_GIT_TIMEOUT_SECONDS` overrides it for one `master-git-commit`, `-push` or
+  `-adopt` run. HTTP(S) Git transfers now also abort after 30 s below 1000 bytes/s. The Git
+  status endpoint reserves the static error code `timeout_config` for an invalid budget, which
+  configuration validation already rejects. Omitting the field keeps 1.2.x behavior.
 
 ## 1.2.4
 

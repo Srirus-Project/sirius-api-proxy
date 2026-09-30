@@ -32,6 +32,8 @@ pub enum Error {
     AssetVersion,
     #[error("Master Git remote branch is absent or has no recognizable publication for this scope and layout")]
     NotAdoptable,
+    #[error("invalid Master Git time budget")]
+    TimeoutConfig,
 }
 /// Repository tree layout of a publication commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
@@ -44,27 +46,59 @@ pub enum Layout {
     IndentedRoot,
 }
 pub const DEFAULT_BRANCH: &str = "master-data";
-/// Publication layout and target branch (`refs/heads/<branch>` locally and remotely).
+pub const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const TIMEOUT_SECONDS: std::ops::RangeInclusive<u64> = 10..=600;
+/// Publication layout, target branch (`refs/heads/<branch>` locally and remotely) and time
+/// budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     pub layout: Layout,
     pub branch: String,
+    /// Budget in seconds for all Git commands of one publication or adoption attempt after
+    /// local preparation (10..=600).
+    pub timeout_seconds: u64,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             layout: Layout::Native,
             branch: DEFAULT_BRANCH.into(),
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
         }
     }
 }
 impl Options {
     pub fn validate(&self) -> Result<(), Error> {
-        if valid_branch(&self.branch) {
-            Ok(())
-        } else {
+        if !valid_branch(&self.branch) {
             Err(Error::LayoutConfig)
+        } else if !TIMEOUT_SECONDS.contains(&self.timeout_seconds) {
+            Err(Error::TimeoutConfig)
+        } else {
+            Ok(())
         }
+    }
+    /// Apply an explicit override such as `SIRIUS_MASTER_GIT_TIMEOUT_SECONDS`: `None` keeps
+    /// the current budget; otherwise 1-3 ASCII digits without sign, padding or unit, in
+    /// 10..=600. A rejected value leaves the budget unchanged and is never echoed.
+    pub fn apply_timeout_override(&mut self, value: Option<&std::ffi::OsStr>) -> Result<(), Error> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let seconds = value
+            .to_str()
+            .filter(|v| {
+                (1..=3).contains(&v.len())
+                    && !v.starts_with('0')
+                    && v.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| TIMEOUT_SECONDS.contains(s))
+            .ok_or(Error::TimeoutConfig)?;
+        self.timeout_seconds = seconds;
+        Ok(())
+    }
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(self.timeout_seconds)
     }
     fn reference(&self) -> String {
         format!("refs/heads/{}", self.branch)
@@ -628,7 +662,7 @@ async fn commit_internal(
             .await
             .map_err(|_| Error::Snapshot)??;
     prepared.owned.policy = policy.clone();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = options.deadline();
     let parent = initialize(&prepared.owned, deadline).await?;
     if let Some(remote) = remote {
         check_remote(&prepared.owned, remote, parent.as_deref(), deadline).await?;
@@ -879,6 +913,9 @@ impl Remote {
             "credential.helper=",
             "http.extraHeader=",
             "core.hooksPath=/dev/null",
+            // Abort an HTTP(S) transfer stalled below 1000 B/s for 30 s inside the budget.
+            "http.lowSpeedLimit=1000",
+            "http.lowSpeedTime=30",
         ] {
             args.extend(["-c".into(), option.into()]);
         }
@@ -895,6 +932,10 @@ impl Remote {
             args.push(format!("--config-env=http.{}.extraHeader={name}", self.url).into());
         }
         args
+    }
+    #[cfg(test)]
+    pub(crate) fn options_for_test(&self) -> Vec<OsString> {
+        self.options()
     }
 }
 async fn network(
@@ -1073,7 +1114,7 @@ pub async fn adopt_with_options(
             .await
             .map_err(|_| Error::Snapshot)??
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = options.deadline();
     let local = initialize(&owned, deadline).await?;
     let head = remote_head(&owned, remote, deadline)
         .await?
@@ -1284,11 +1325,5 @@ pub(crate) async fn advance_for_test(
     old: Option<&str>,
 ) -> Result<(), Error> {
     let owned = own(destination, &scope, options)?;
-    advance(
-        &owned,
-        new,
-        old,
-        tokio::time::Instant::now() + Duration::from_secs(120),
-    )
-    .await
+    advance(&owned, new, old, options.deadline()).await
 }
