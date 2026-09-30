@@ -1,6 +1,7 @@
 use sirius_api_proxy::{client::GameClient, deployment::DeploymentConfig};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    sirius_api_proxy::api::mark_started();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "registry-serve") {
         if args.len() != 2 {

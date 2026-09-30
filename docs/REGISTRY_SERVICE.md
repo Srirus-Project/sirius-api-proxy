@@ -26,8 +26,8 @@ stay short. A database outage or an expired read returns 503; there is no file f
 ## Routes and consumers
 
 All Master reads require exactly one `Authorization: Bearer ...` header. Missing, incorrect
-and duplicate headers return 401. `/health` is public and reports process liveness only;
-it does not assert that Master data or the database is ready. Game and internal proxy
+and duplicate headers return 401. `/health` is public and reports process liveness, version and
+`uptime_secs` (whole seconds since process start) only; it does not assert that Master data or the database is ready. Game and internal proxy
 routes are absent.
 
 | Route under `/api/v1/master-data` | Meaning |

@@ -413,6 +413,25 @@ async fn http_auth_scope_validation_and_rpc_allowlist_block_before_upstream() {
             "{path}"
         );
     }
+    let health = app
+        .clone()
+        .oneshot(
+            Request::get("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let health: Value =
+        serde_json::from_slice(&health.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["service"], "sirius-api-proxy");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert!(health["uptime_secs"].is_u64());
+    // Liveness only: no readiness, account, Master or upstream data joins the body.
+    let mut keys: Vec<_> = health.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["service", "status", "uptime_secs", "version"]);
     assert!(matches!(
         c.call("/app.player.PlayerService/Register", json!({}))
             .await,
@@ -2149,7 +2168,12 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
     }
-    assert_eq!(request(&app, "/health", "", "GET").await.0, 200);
+    let (status, health) = request(&app, "/health", "", "GET").await;
+    assert_eq!(status, 200);
+    assert_eq!(health["service"], "sirius-api-proxy");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    let (_, again) = request(&app, "/health", "", "GET").await;
+    assert!(again["uptime_secs"].as_u64().unwrap() >= health["uptime_secs"].as_u64().unwrap());
     for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let n = region.name();
         let (status, body) = request(
@@ -13820,13 +13844,19 @@ async fn standalone_registry_files_auth_integrity_scope_and_real_consumer() {
             status
         );
     }
-    let health = app
-        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let health: Value =
-        serde_json::from_slice(&to_bytes(health.into_body(), 1024).await.unwrap()).unwrap();
-    assert_eq!(health["service"], "sirius-master-registry");
+    let health = |app: axum::Router| async move {
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 1024).await.unwrap())
+            .unwrap()
+    };
+    let first = health(app.clone()).await;
+    assert_eq!(first["service"], "sirius-master-registry");
+    assert_eq!(first["version"], env!("CARGO_PKG_VERSION"));
+    let second = health(app).await;
+    assert!(second["uptime_secs"].as_u64().unwrap() >= first["uptime_secs"].as_u64().unwrap());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("invalid.yaml");
     std::fs::write(&path, vec![b' '; 65537]).unwrap();
@@ -21425,4 +21455,22 @@ fn dockerfile_caches_dependencies_before_sources() {
     ] {
         assert!(entries.contains(&input), "{input}");
     }
+}
+
+#[test]
+fn health_uptime_counts_from_first_mark_and_never_decreases() {
+    api::mark_started();
+    let started = api::started_at();
+    api::mark_started();
+    assert_eq!(api::started_at(), started);
+    let t = std::time::Instant::now();
+    assert_eq!(api::uptime_secs_between(t, t + Duration::from_secs(90)), 90);
+    assert_eq!(
+        api::uptime_secs_between(t, t + Duration::from_millis(1999)),
+        1
+    );
+    assert_eq!(api::uptime_secs_between(t + Duration::from_secs(5), t), 0);
+    let first = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
+    let second = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
+    assert!(second >= first);
 }

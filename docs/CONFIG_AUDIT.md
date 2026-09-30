@@ -495,6 +495,14 @@ These generic capabilities are intentionally not restored in their original form
    context whitelist keeps local configuration, `*.env` and private files out of the builder.
    CI reuse of release binaries is not adopted: main pushes build `VERSION=dev` images and
    publish nothing, so there is no artifact to reuse.
+21. **`/health` uptime counts from `main()` and stays liveness only.** The original starts its
+   `uptime_secs` clock when the API router is built and reports it only on the API server
+   (`Haruki-Sekai-API@9a53714:src/api/routes.rs:20-44`). Sirius records a monotonic `Instant`
+   as the first statement of `main()` (`src/main.rs`, `src/api.rs` `mark_started`), so the
+   value includes configuration loading and bind time, and shares one `health_body` across the
+   single-profile, multi-region and registry servers (`src/registry_service.rs`). The body is
+   exactly `status`, `service`, `version` and `uptime_secs`: no wall-clock start time and no
+   readiness, account, Master or upstream state. No field is added.
 
 ## Original fields that were ignored by the original itself
 
@@ -637,3 +645,5 @@ classification and evidence:
 - **Dispatch worker status:** new [Decision 18](#decisions). The `asset_updater_servers[]` rows
   point to the status route and their moved `src/asset_dispatch.rs` references are refreshed.
   No field is added.
+- **Health uptime:** new [Decision 21](#decisions). `/health` adds `uptime_secs` and remains
+  liveness only. No field is added.

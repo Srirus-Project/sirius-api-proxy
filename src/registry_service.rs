@@ -219,7 +219,12 @@ impl Config {
         } else {
             "/api/v1/master-data".into()
         };
-        let mut router = Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-master-registry","version":env!("CARGO_PKG_VERSION")}))})).nest(&prefix,routes);
+        let mut router = Router::new()
+            .route(
+                "/health",
+                get(|| async { crate::api::health_body("sirius-master-registry") }),
+            )
+            .nest(&prefix, routes);
         if let Some(token) = internal_token {
             let internal = Router::new()
                 .route("/master-data/updater", get(owner_status))

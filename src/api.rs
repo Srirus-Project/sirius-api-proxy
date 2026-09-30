@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub(crate) async fn authorize(
     State(token): State<Arc<str>>,
@@ -64,8 +64,36 @@ pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String
     ))
 }
 
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+fn started() -> Instant {
+    *STARTED.get_or_init(Instant::now)
+}
+/// Records the process start reported as `/health` `uptime_secs`; `main()` calls this first.
+/// Later calls keep the first instant. Without `main()` (library or test use) the clock starts
+/// at the first `health_router()` build or `health_body()` call.
+pub fn mark_started() {
+    started();
+}
+#[cfg(test)]
+pub(crate) fn started_at() -> Instant {
+    started()
+}
+/// Whole seconds from `start` to `now`, truncated; 0 if `now` is earlier.
+pub(crate) fn uptime_secs_between(start: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(start).as_secs()
+}
+/// The `/health` body shared by the API, multi-region and registry servers: liveness only.
+pub(crate) fn health_body(service: &'static str) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": service,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime_secs_between(started(), Instant::now()),
+    }))
+}
 pub fn health_router() -> Router {
-    Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-api-proxy","version":env!("CARGO_PKG_VERSION")}))}))
+    started();
+    Router::new().route("/health", get(|| async { health_body("sirius-api-proxy") }))
 }
 
 pub fn router_at(

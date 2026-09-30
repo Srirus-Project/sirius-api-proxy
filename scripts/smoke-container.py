@@ -55,6 +55,7 @@ with tempfile.TemporaryDirectory() as tmp:
             else:
                 raise RuntimeError("Container failed to become healthy")
             assert health["version"] == version
+            assert type(health["uptime_secs"]) is int and health["uptime_secs"] >= 0
             protocol = json.loads(docker("exec", container, "wget", "-qO-", "--header",
                 "Authorization: Bearer smoke-internal-token", "http://127.0.0.1:9999/internal/v1/protocol"))
             assert protocol["codec"] == "native"

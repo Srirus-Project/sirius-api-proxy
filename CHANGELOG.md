@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `/health` (single-profile, multi-region and registry servers) adds `uptime_secs`: whole
+  seconds since the process entered `main()`, on a monotonic clock, reset on restart. The key is
+  additive and `/health` stays liveness only, with no readiness, account or upstream data.
 - Identical concurrent Version, server-list and announcement reads share one upstream call
   (and one peer POST under node routing), even with the response cache disabled; the outcome,
   errors and timeouts included, answers every joined request, each within its own deadline.

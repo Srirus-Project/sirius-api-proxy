@@ -98,7 +98,7 @@ a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) i
 
 | Route | Token | Result |
 | --- | --- | --- |
-| `GET /health` | None | Process health and service version, not upstream availability |
+| `GET /health` | None | Process liveness, service version and `uptime_secs` (whole seconds since process start, monotonic; resets on restart), not upstream availability |
 | `GET /api/v1/system` | API | Region, supported RPCs, version and availability observation |
 | `GET /api/v1/regions` | API | Region capabilities, including reserved CN |
 | `GET /api/v1/servers` | API | Global server list; JP returns 501 |

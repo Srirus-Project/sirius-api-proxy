@@ -23,7 +23,8 @@ Paths remain relative to the process working directory, as in single-region mode
 All existing resource suffixes are available under each region's prefix. Operations a
 region does not support (for example `servers` on JP) return 501 without an upstream call. There is no implicit default
 region route in this mode: `/api/v1/system` and unconfigured regions return 404.
-Health is unauthenticated process liveness, not proof that every game server is ready.
+Health is unauthenticated process liveness, not proof that every game server is ready. Its
+`uptime_secs` counts whole seconds since the process started, shared by all regions.
 
 Each region owns its client, protocol generation, observations, snapshot, game account
 and session lock. Protocol reload affects only the selected region. Master workers

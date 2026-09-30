@@ -120,6 +120,7 @@ with tempfile.TemporaryDirectory() as tmp:
             else:
                 raise RuntimeError("Packaged server did not start")
             assert code == 200 and health["version"] == m["version"]
+            assert type(health["uptime_secs"]) is int and health["uptime_secs"] >= 0
             assert request("/internal/v1/protocol")[0] == 401
             assert request("/internal/v1/protocol", env["SIRIUS_API_TOKEN"])[0] == 401
             code, protocol = request("/internal/v1/protocol", env["SIRIUS_INTERNAL_TOKEN"])
