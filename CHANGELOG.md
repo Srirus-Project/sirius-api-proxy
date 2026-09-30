@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.3.0
+
+The remaining batches of the second comparison with the original (Haruki-Sekai-API `9a53714`), adapted
+rather than copied: upstream robustness, Master publication and storage operations, smaller
+improvements and hardening. Includes everything in 1.2.4.
 
 - Node routing: authenticated public reads (profile, event ranking and deck, music and challenge
   ranking) now fail over to the next node when a peer answers HTTP 400, 401, 404, 405, 413, 415
