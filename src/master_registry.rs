@@ -244,8 +244,7 @@ fn inventory(directory: &Path, source: &Manifest) -> Result<Inventory, MasterErr
                 if total > MAX_TOTAL {
                     return Err(MasterError::Limit);
                 }
-                serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .map_err(|_| MasterError::Format)?;
+                master::validate_json(&bytes).map_err(|_| MasterError::Format)?;
                 files.push(file(name, &bytes));
             }
             files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -318,6 +317,27 @@ pub fn table(
     table: &str,
     expected_hash: &str,
 ) -> Result<Document, MasterError> {
+    table_read(root, region, snapshot, table, expected_hash, true)
+}
+/// For unchanged polls only. An indexed table whose length and SHA-256 match was validated
+/// as JSON before its index was written, so only legacy unindexed tables are parsed again.
+pub(crate) fn table_intact(
+    root: &Path,
+    region: Region,
+    snapshot: &str,
+    table: &str,
+    expected_hash: &str,
+) -> bool {
+    table_read(root, region, snapshot, table, expected_hash, false).is_ok()
+}
+fn table_read(
+    root: &Path,
+    region: Region,
+    snapshot: &str,
+    table: &str,
+    expected_hash: &str,
+    validate_indexed: bool,
+) -> Result<Document, MasterError> {
     if !master::safe_component(table) || !hash_valid(expected_hash) {
         return Err(MasterError::NotFound);
     }
@@ -335,14 +355,16 @@ pub fn table(
         return Err(MasterError::Integrity);
     }
     // The check above proved `expected_hash` is the digest of these bytes.
-    verify_indexed_digest(
+    let indexed = verify_indexed_digest(
         &directory,
         &source,
         table,
         bytes.len() as u64,
         expected_hash,
     )?;
-    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
+    if validate_indexed || !indexed {
+        master::validate_json(&bytes).map_err(|_| MasterError::Format)?;
+    }
     Ok(Document {
         etag: format!("\"{expected_hash}\""),
         version: source.version,
@@ -351,13 +373,14 @@ pub fn table(
 }
 /// Strengthens ordinary table reads as well; absent indexes preserve 1.1 compatibility.
 /// `size`/`sha256` describe bytes the caller already read, so they are hashed only once.
+/// `Ok(true)` means the index exists and matched; `Ok(false)` is a legacy unindexed snapshot.
 pub(crate) fn verify_indexed_digest(
     directory: &Path,
     source: &Manifest,
     table: &str,
     size: u64,
     sha256: &str,
-) -> Result<(), MasterError> {
+) -> Result<bool, MasterError> {
     let path = directory.join("tables.json");
     match fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -372,11 +395,11 @@ pub(crate) fn verify_indexed_digest(
             if entry.size != size || entry.sha256 != sha256 {
                 return Err(MasterError::Integrity);
             }
+            Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 /// Installed with the snapshot before CURRENT changes. The predecessor is the last

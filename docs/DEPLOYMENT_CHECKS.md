@@ -22,7 +22,8 @@ account-dependent queries are needed; registration is not part of this service.
    snapshot must exist and have `stale: false` before the asset updater can use it.
 
 Master updates verify the manifest, every table and the final version before publication.
-Failures preserve the previous CURRENT; unchanged validated versions are not redownloaded.
+Failures preserve the previous CURRENT; unchanged validated versions are not redownloaded
+(their tables are checked against the snapshot index, or parsed again for legacy snapshots).
 CDN requests have 10-second connection and 60-second total timeouts. Each update has a
 600-second deadline. Background intervals range from 60 to 86400 seconds and do not overlap.
 `/internal/v1/master-data/updater` describes the last check, not continuous upstream health.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Master tables are validated as JSON without building an in-memory document (the same
+  accepted and rejected inputs, recursion limit, UTF-8 and number checks), which lowers
+  per-read memory and CPU on registry, pinned, bundle, import and database table reads.
+- Unchanged CDN and sync polls no longer reparse tables whose byte length and SHA-256 match the
+  snapshot index (`tables.json`), which is written only after the tables were validated;
+  legacy 1.1 snapshots without an index are still parsed, and serving reads still validate.
 - New Master Git commits end with a second paragraph holding one trailer,
   `Sirius-Content-SHA256: <content_sha256>`, the scoped content identity served at
   `by-hash/{content_sha256}/manifest`. The subject, tree, manifest, receipt and adoption are

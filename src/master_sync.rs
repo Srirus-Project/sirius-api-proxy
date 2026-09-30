@@ -274,14 +274,13 @@ impl Syncer {
                 current.content_sha256 == target_hash
                     && current.resource_version == target_resource
                     && current.files.iter().all(|f| {
-                        master_registry::table(
+                        master_registry::table_intact(
                             &output,
                             scope_region,
                             &current.snapshot,
                             f.name.trim_end_matches(".json"),
                             &f.sha256,
                         )
-                        .is_ok()
                     })
             });
             (writer, current, unchanged)

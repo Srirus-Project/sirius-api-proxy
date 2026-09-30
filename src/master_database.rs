@@ -774,7 +774,7 @@ impl Reader {
             {
                 return Err(Error::Integrity);
             }
-            serde_json::from_slice::<serde_json::Value>(&data).map_err(|_| Error::Integrity)?;
+            crate::master::validate_json(&data).map_err(|_| Error::Integrity)?;
             data
         } else {
             manifest_bytes

@@ -371,12 +371,9 @@ impl MasterUpdater {
                 return None;
             }
             // A missing/truncated table triggers a full repair instead of an unchanged result.
+            // Indexed tables are checked by length and SHA-256; legacy ones are parsed again.
             for table in status["tables"].as_array()? {
-                let document =
-                    master::read_current_in(&output, Some(table.as_str()?), region).ok()?;
-                if document.version != version
-                    || serde_json::from_slice::<Value>(&document.bytes).is_err()
-                {
+                if !master::current_table_intact(&output, table.as_str()?, region, &version) {
                     return None;
                 }
             }

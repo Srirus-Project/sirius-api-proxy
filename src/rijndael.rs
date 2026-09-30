@@ -88,6 +88,11 @@ impl Rijndael256 {
         }
         state
     }
+    /// Raw single-block decryption, so tests can build CBC input for a chosen plaintext.
+    #[cfg(test)]
+    pub(crate) fn decrypt_block(&self, block: &[u8; 32]) -> [u8; 32] {
+        self.block(block)
+    }
     pub(crate) fn decrypt(&self, encrypted: &[u8], iv: &[u8; 32]) -> Result<Vec<u8>, MasterError> {
         if encrypted.is_empty() || !encrypted.len().is_multiple_of(32) {
             return Err(MasterError::Cipher);

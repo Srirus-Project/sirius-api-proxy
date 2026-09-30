@@ -129,7 +129,7 @@ where
                 if bytes.len() as u64 != file.size || registry::digest(&bytes) != file.sha256 {
                     return Err(io::Error::other("invalid table"));
                 }
-                serde_json::from_slice::<serde_json::Value>(&bytes)
+                crate::master::validate_json(&bytes)
                     .map_err(|_| io::Error::other("invalid table"))?;
                 archive.append(&format!("tables/{}", file.name), &bytes)?;
                 Ok::<_, io::Error>(archive)

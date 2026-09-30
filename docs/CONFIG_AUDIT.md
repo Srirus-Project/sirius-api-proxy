@@ -516,7 +516,7 @@ These generic capabilities are intentionally not restored in their original form
    pointer files answer public `no-cache` with a strong ETag and `Last-Modified`, and return
    304 before reading the file (`Haruki-Sekai-API@9a53714:src/registry/http.rs:19-25,581-601`).
    Sirius hashes the bytes it serves from one pinned CURRENT after the region and `tables.json`
-   checks (`src/master.rs` `read_current_checked`), then shares the pinned routes' matcher
+   checks (`src/master.rs` `read_current_inner`), then shares the pinned routes' matcher
    (`src/api.rs` `master_document`, `registry_document`), so a 304 never hides corruption. It
    sends `private, no-cache` like the manifest and no `Last-Modified`, whose file times differ
    per node and per reimport. No configuration surface.
@@ -556,6 +556,19 @@ These generic capabilities are intentionally not restored in their original form
    lines; signatures cover it. Sirius never reads it back: adoption still matches the subject
    and verifies the tree. Existing commits are not rewritten and no commit is created only to
    add a trailer. No configuration surface.
+26. **Unchanged polls trust the snapshot index instead of reparsing JSON; serving reads still
+   validate.** The original streams its large Sekai tables through a transcoder
+   (`Haruki-Sekai-API@9a53714:src/updater/master_stream.rs:1-124`); Sirius tables are small, so
+   no streaming transcode is adopted. Every check that used to build and discard a JSON tree now
+   walks the value once without keeping it (`src/master.rs` `validate_json`), with the same
+   accepted and rejected inputs as parsing into a tree (recursion limit, UTF-8 and escapes,
+   number range); `IgnoredAny` is refused because it skips those checks. Unchanged CDN and sync
+   polls (`src/master_update.rs`, `src/master_sync.rs`) accept an indexed table whose length and
+   SHA-256 match `tables.json`, which is written after its tables were validated
+   (`src/master.rs` `current_table_intact`, `src/master_registry.rs` `table_intact`); legacy
+   unindexed tables are parsed again. This is the trust the `/master-data` current read already
+   extends; pinned, bundle, Git and database reads still reject invalid JSON. No configuration
+   surface.
 
 ## Original fields that were ignored by the original itself
 
@@ -710,3 +723,5 @@ classification and evidence:
   `/master-data` reads; no field is added.
 - **Git content trailer:** new [Decision 25](#decisions). New Master Git commits add a
   `Sirius-Content-SHA256` trailer; no field is added.
+- **JSON validation:** new [Decision 26](#decisions). Unchanged polls trust the snapshot index
+  (size + SHA-256) instead of reparsing JSON; serving reads still validate. No field is added.

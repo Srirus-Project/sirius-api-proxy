@@ -142,12 +142,17 @@ filesystem publication is not preemptible; filesystem stalls may exceed the netw
 
 The consumer pins the owner's scoped manifest, validates its content identity, verifies cached
 local tables before reuse, and downloads missing or corrupt files through pinned digest URLs.
-All files must match their declared byte length and SHA-256 and parse as JSON before publication.
+All files must match their declared byte length and SHA-256 and validate as JSON before
+publication.
 A second manifest check rejects owner content changes during the transfer. New owner snapshot
 UUIDs with identical content are accepted. The consumer creates its own local snapshot UUID and
 receipt (`source: registry`), retaining the same content identity. It can serve the same read
-protocol to downstream consumers. Unchanged polls still verify every installed table, allowing
-local corruption to be detected and repaired. Previous snapshots are retained.
+protocol to downstream consumers. Unchanged polls still verify every installed table's byte
+length and SHA-256 against the snapshot index (`tables.json`), whose tables were validated as
+JSON before the index was written, so local corruption is still detected and repaired without
+reparsing every table. Tables of legacy snapshots without an index are parsed again. Serving
+reads (pinned tables, bundles, Git and database exports) always validate the JSON. Previous
+snapshots are retained.
 
 The existing filesystem writer lock excludes imports/CDN updates/other consumers. Shutdown
 cancels outstanding synchronization; a blocking preparation may finish, but cannot publish

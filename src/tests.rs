@@ -8822,6 +8822,12 @@ fn master_registry_corruption_and_legacy_snapshots_have_explicit_integrity_behav
     .is_ok());
     std::fs::write(path.join("MasterFixture.json"), b"invalid JSON").unwrap();
     assert!(registry::manifest(&output, None, registry_scope()).is_err());
+    // The legacy inventory also validates UTF-8 inside strings, not just JSON structure.
+    std::fs::write(path.join("MasterFixture.json"), b"{\"items\":\"\xff\"}").unwrap();
+    assert!(matches!(
+        registry::manifest(&output, None, registry_scope()),
+        Err(master::MasterError::Format)
+    ));
 }
 #[cfg(unix)]
 #[test]
@@ -9180,6 +9186,291 @@ fn master_current_digest_matches_bytes_and_index_verification() {
     ));
     std::fs::remove_file(directory.join("tables.json")).unwrap();
     assert!(verify(size + 1, &"0".repeat(64)).is_ok());
+}
+fn json_nested_arrays(depth: usize) -> Vec<u8> {
+    ["[".repeat(depth), "]".repeat(depth)].concat().into_bytes()
+}
+fn json_nested_objects(depth: usize) -> Vec<u8> {
+    ["{\"a\":".repeat(depth), "1".into(), "}".repeat(depth)]
+        .concat()
+        .into_bytes()
+}
+#[test]
+fn master_json_validator_matches_value_parser() {
+    use crate::master::validate_json;
+    let agree = |bytes: &[u8]| {
+        assert_eq!(
+            validate_json(bytes).is_ok(),
+            serde_json::from_slice::<serde_json::Value>(bytes).is_ok(),
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
+    };
+    let mut corpus: Vec<Vec<u8>> = [
+        &b"\"\xff\""[..],
+        b"{\"\xff\":1}",
+        b"\"\\ud800\"",
+        b"{\"\\udc00\":1}",
+        b"\"\\ud83d\\ude00\"",
+        b"1e400",
+        b"[-1e400]",
+        b"1.7976931348623157e308",
+        b"18446744073709551615",
+        b"18446744073709551616",
+        b"-9223372036854775809",
+        b"123456789012345678901234567890",
+        b"-0",
+        b"{\"a\":1,\"a\":2}",
+        b"\"a\x01b\"",
+        b"\"\\x\"",
+        b"\"\\u12\"",
+        b"01",
+        b"-",
+        b"1.",
+        b".5",
+        b"NaN",
+        b"\xef\xbb\xbf{}",
+        b"",
+        b" \n\t ",
+        b"{} \n",
+        b"{} x",
+        b"[1,]",
+        b"{\"a\":1,}",
+        b"{\"a\" 1}",
+        b"{1:2}",
+        b"[true,false,null]",
+        b"tru",
+    ]
+    .iter()
+    .map(|bytes| bytes.to_vec())
+    .collect();
+    for depth in [127, 128, 129, 200_000] {
+        corpus.push(json_nested_arrays(depth));
+        corpus.push(json_nested_objects(depth));
+    }
+    for bytes in &corpus {
+        agree(bytes);
+    }
+    assert!(validate_json(&json_nested_arrays(127)).is_ok());
+    assert!(validate_json(&json_nested_objects(127)).is_ok());
+    for depth in [128, 200_000] {
+        assert!(validate_json(&json_nested_arrays(depth)).is_err());
+        assert!(validate_json(&json_nested_objects(depth)).is_err());
+    }
+    for invalid in [&b"1e400"[..], b"\"\xff\"", b"{\"\xff\":1}", b"\"\\ud800\""] {
+        assert!(validate_json(invalid).is_err());
+    }
+    assert!(validate_json(b"{\"a\":1,\"a\":2}").is_ok());
+    // IgnoredAny skips these unchecked; the differential above would catch a regression to it.
+    for skipped in [&b"1e400"[..], b"\"\xff\"", b"\"\\ud800\""] {
+        assert!(serde_json::from_slice::<serde::de::IgnoredAny>(skipped).is_ok());
+    }
+    assert!(serde_json::from_slice::<serde::de::IgnoredAny>(&json_nested_arrays(200)).is_ok());
+    let inline = br#"{"a":[[1,-2,3.5,-0.0,1e10,2E-3,1.5e+2,0,true,false,null],[]],"s":"x\u00e9\ud83d\ude00\n\"\\\/","o":{"k":{},"l":[{}]},"n":18446744073709551615,"m":-9223372036854775808,"f":1.7976931348623157e308}"#;
+    let substitutions = [
+        b'"', b'\\', b'{', b'}', b'[', b']', b',', b':', b'0', b'e', b'-', b' ', 0x00, 0xff,
+    ];
+    for document in [
+        &include_bytes!("../tests/fixtures/master-synthetic.json")[..],
+        &inline[..],
+    ] {
+        assert!(validate_json(document).is_ok());
+        for end in 0..=document.len() {
+            agree(&document[..end]);
+        }
+        let mut mutated = document.to_vec();
+        for position in 0..document.len() {
+            for byte in substitutions {
+                mutated[position] = byte;
+                agree(&mutated);
+            }
+            mutated[position] = document[position];
+        }
+    }
+}
+/// Rewrites MasterFixture.json with `bytes` and makes tables.json list their length and digest.
+fn rewrite_indexed_fixture(snapshot: &std::path::Path, bytes: &[u8]) {
+    use crate::master_registry as registry;
+    std::fs::write(snapshot.join("MasterFixture.json"), bytes).unwrap();
+    let mut index: registry::Inventory =
+        serde_json::from_slice(&std::fs::read(snapshot.join("tables.json")).unwrap()).unwrap();
+    index.files = vec![registry::file("MasterFixture.json".into(), bytes)];
+    std::fs::write(
+        snapshot.join("tables.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+}
+#[test]
+fn master_registry_table_intact_trusts_index_only_for_unchanged_polls() {
+    use crate::{master::MasterError, master_registry as registry, region::Region};
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    let hash = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    let read = |hash: &str| {
+        registry::table(
+            &output,
+            Region::Jp,
+            &receipt.snapshot,
+            "MasterFixture",
+            hash,
+        )
+    };
+    let intact = |hash: &str| {
+        registry::table_intact(
+            &output,
+            Region::Jp,
+            &receipt.snapshot,
+            "MasterFixture",
+            hash,
+        )
+    };
+    assert!(read(&hash).is_ok());
+    assert!(intact(&hash));
+    // Invalid UTF-8 inside a string, with an index that matches it.
+    let invalid = b"{\"items\":\"\xff\"}";
+    rewrite_indexed_fixture(&snapshot, invalid);
+    let invalid_hash = registry::digest(invalid);
+    assert!(matches!(read(&invalid_hash), Err(MasterError::Format)));
+    assert!(intact(&invalid_hash));
+    assert!(!intact(&hash));
+    // Bytes that no longer match the index are rejected by both.
+    std::fs::write(snapshot.join("MasterFixture.json"), b"{\"items\":[]}").unwrap();
+    let other = registry::digest(b"{\"items\":[]}");
+    assert!(matches!(read(&other), Err(MasterError::Integrity)));
+    assert!(!intact(&other));
+    std::fs::write(snapshot.join("MasterFixture.json"), invalid).unwrap();
+    // Legacy unindexed snapshots are parsed again.
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    assert!(!intact(&invalid_hash));
+    assert!(matches!(read(&invalid_hash), Err(MasterError::Format)));
+}
+#[test]
+fn master_current_table_intact_mirrors_registry() {
+    use crate::{
+        master::{self, MasterError},
+        region::Region,
+    };
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    let intact = |table: &str, region: Region, version: &str| {
+        master::current_table_intact(&output, table, region, version)
+    };
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+    assert!(!intact("MasterFixture", Region::Jp, "other-version"));
+    assert!(!intact("MasterFixture", Region::Hk, &receipt.version));
+    assert!(!intact("Unlisted", Region::Jp, &receipt.version));
+    let invalid = b"{\"items\":\"\xff\"}";
+    rewrite_indexed_fixture(&snapshot, invalid);
+    // The v1 current read already trusts the index; unchanged polls extend the same trust.
+    assert!(master::read_current(&output, Some("MasterFixture")).is_ok());
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+    assert!(!intact("MasterFixture", Region::Jp, "other-version"));
+    std::fs::write(snapshot.join("MasterFixture.json"), b"{\"items\":[]}").unwrap();
+    assert!(matches!(
+        master::read_current(&output, Some("MasterFixture")),
+        Err(MasterError::Integrity)
+    ));
+    assert!(!intact("MasterFixture", Region::Jp, &receipt.version));
+    std::fs::write(snapshot.join("MasterFixture.json"), invalid).unwrap();
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    assert!(!intact("MasterFixture", Region::Jp, &receipt.version));
+    std::fs::write(
+        snapshot.join("MasterFixture.json"),
+        include_bytes!("../tests/fixtures/master-synthetic.json"),
+    )
+    .unwrap();
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+}
+/// Builds an encrypted Master file whose decrypted, gunzipped body is `body`. The first
+/// plaintext block is the skipped header, so CBC can be built backwards from decryption.
+fn encrypted_master_body(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(body).unwrap();
+    let mut plaintext = vec![0u8; 32];
+    plaintext.extend(gzip.finish().unwrap());
+    let padding = 32 - plaintext.len() % 32;
+    plaintext.extend(std::iter::repeat_n(padding as u8, padding));
+    let cipher = crate::rijndael::Rijndael256::new(&std::array::from_fn(|i| i as u8));
+    let blocks = plaintext.as_chunks::<32>().0;
+    let mut ciphertext = vec![[0x5a_u8; 32]; blocks.len()];
+    for i in (1..blocks.len()).rev() {
+        let decrypted = cipher.decrypt_block(&ciphertext[i]);
+        ciphertext[i - 1] = std::array::from_fn(|j| decrypted[j] ^ blocks[i][j]);
+    }
+    let mut data = vec![0u8; 32];
+    data.extend(ciphertext.concat());
+    data
+}
+#[test]
+fn master_decoder_rejects_decrypted_bodies_that_are_not_json() {
+    use crate::master::{Entry, MasterError};
+    let (_, decoder, _) = master_fixture();
+    let entry = |data: &[u8]| Entry {
+        name: "MasterFixture.bin".into(),
+        size: data.len() as u64,
+        hash: crate::master_registry::digest(data),
+    };
+    let valid = encrypted_master_body(b"{\"items\":[]}");
+    assert_eq!(
+        decoder.decode(&entry(&valid), &valid).unwrap(),
+        b"{\"items\":[]}"
+    );
+    for body in [
+        &b"{\"items\":\"\xff\"}"[..],
+        b"{\"items\":[1e400]}",
+        b"{} x",
+    ] {
+        let data = encrypted_master_body(body);
+        assert!(matches!(
+            decoder.decode(&entry(&data), &data),
+            Err(MasterError::Format)
+        ));
+    }
+}
+#[tokio::test]
+async fn master_bundle_rejects_verified_bytes_that_are_not_json() {
+    use crate::{error::AppError, master_registry as registry};
+    let (_root, _input, output, _receipt) = registry_fixture();
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let permit = || {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap()
+    };
+    let bundle = |manifest: registry::PublishedManifest, bytes: Vec<u8>| {
+        crate::master_bundle::build(
+            manifest,
+            move |_| std::future::ready(Ok::<_, AppError>(bytes.clone())),
+            permit(),
+        )
+    };
+    let valid = include_bytes!("../tests/fixtures/master-synthetic.json").to_vec();
+    assert!(bundle(manifest.clone(), valid).await.is_ok());
+    // Size and digest match the (re-hashed) manifest, but the bytes are not JSON.
+    let invalid = b"{\"items\":\"\xff\"}".to_vec();
+    let mut forged = manifest;
+    forged.files = vec![registry::file("MasterFixture.json".into(), &invalid)];
+    forged.content_sha256 = registry::content_hash(
+        &forged.scope,
+        &forged.source_manifest,
+        &registry::Inventory {
+            schema_version: 1,
+            version: forged.version.clone(),
+            files: forged.files.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        bundle(forged, invalid).await,
+        Err(AppError::MasterUnavailable)
+    ));
 }
 #[tokio::test]
 async fn master_current_conditional_read_works_on_regional_routes() {
