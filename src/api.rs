@@ -208,7 +208,13 @@ async fn protocol_reload(
     c.reload_protocol().await.map(Json)
 }
 
-async fn master_document(c: Arc<GameClient>, table: Option<String>) -> Result<Response, AppError> {
+/// CURRENT-relative reads revalidate with a content ETag. Integrity, region and table
+/// checks all run before the conditional match, so corruption answers 503, never 304.
+async fn master_document(
+    c: Arc<GameClient>,
+    table: Option<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
     let directory = c
         .master_directory()
         .ok_or(AppError::MasterUnavailable)?
@@ -223,20 +229,28 @@ async fn master_document(c: Arc<GameClient>, table: Option<String>) -> Result<Re
         crate::master::MasterError::NotFound => AppError::NotFound,
         _ => AppError::MasterUnavailable,
     })?;
-    Response::builder()
-        .header("content-type", "application/json")
-        .header("x-master-version", document.version)
-        .body(axum::body::Body::from(document.bytes))
-        .map_err(|_| AppError::MasterUnavailable)
+    registry_document(
+        crate::master_registry::Document {
+            etag: format!("\"{}\"", document.sha256),
+            version: document.version,
+            bytes: document.bytes,
+        },
+        headers,
+        false,
+    )
 }
-async fn master_status(State(c): State<Arc<GameClient>>) -> Result<Response, AppError> {
-    master_document(c, None).await
+async fn master_status(
+    State(c): State<Arc<GameClient>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    master_document(c, None, headers).await
 }
 async fn master_table(
     State(c): State<Arc<GameClient>>,
     Path(table): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
-    master_document(c, Some(table)).await
+    master_document(c, Some(table), headers).await
 }
 /// Per-operation status: `live_verified` was exercised against the production service;
 /// `implemented_unverified` uses the verified protocol but was not exercised live.

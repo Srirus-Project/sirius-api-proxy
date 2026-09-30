@@ -109,14 +109,17 @@ a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) i
 | `GET /api/v1/events/{event_id}/players/{player_id}/deck` | API | Event deck |
 | `GET /api/v1/songs/{song_id}/rankings` | API | Song ranking without the service account's myRank |
 | `GET /api/v1/challenge-songs/{challenge_song_id}/rankings` | API | Challenge ranking without myRank/myScore |
-| `GET /api/v1/master-data` | API | Local Master version and table index |
-| `GET /api/v1/master-data/tables/{name}` | API | Original table JSON with x-master-version |
+| `GET /api/v1/master-data` | API | Local Master version and table index; ETag, 304 on If-None-Match |
+| `GET /api/v1/master-data/tables/{name}` | API | Original table JSON with x-master-version and a content ETag; 304 on If-None-Match |
 | `GET /internal/v1/protocol` | Internal | Protocol fingerprint, codec and generation |
 | `POST /internal/v1/protocol/reload` | Internal | Validate and activate the configured proto bundle |
 | `GET /internal/v1/master-data/updater` | Internal | Last update status; does not trigger an update |
 | `GET /internal/v1/account` | Internal | Verify the configured account identity |
 | `GET /internal/v1/account/player-data` | Internal | Read the service account's private data |
 | `GET /internal/v1/resources/snapshot` | Internal | Last observed resource snapshot |
+
+Both current Master reads answer `Cache-Control: private, no-cache` and verify the snapshot
+before evaluating `If-None-Match`, so a corrupted table answers 503, never 304.
 
 HTTP `v1` is independent of game versions. Environment and upstream are deployment settings,
 not request parameters. Protobuf JSON int64/uint64 values are strings; original Master JSON

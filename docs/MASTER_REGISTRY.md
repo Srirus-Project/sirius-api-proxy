@@ -75,6 +75,18 @@ A matching condition returns an empty 304. Digest-qualified table URLs return a 
 read and verified before returning a conditional response, so a missing/corrupted file cannot
 be concealed by a stale ETag. `x-master-version` is present on successful/conditional responses.
 
+The CURRENT-relative `/master-data` and `/master-data/tables/{name}` reads use the same
+conditional handling. Their strong ETag is the SHA-256 of the exact bytes returned, so a
+table's current ETag equals its digest-qualified ETag. They answer `private, no-cache`. CURRENT
+is pinned once, so the version, ETag and bytes come from one snapshot, and the region, table
+name and `tables.json` integrity checks run before any 304. The status ETag covers the snapshot
+identifier, so it changes on reimport and differs between nodes; a table ETag stays equal for
+identical bytes, and its 304 carries the new `x-master-version`. Legacy snapshots without
+`tables.json` get an ETag over the bytes read, with no index check. There is no
+`Last-Modified`: file times differ per node and per reimport. These reads remain convenience
+reads; consumers that need a consistent set must pin the manifest and must not combine it with
+CURRENT-relative table reads.
+
 ## Local integrity and older snapshots
 
 New local imports and CDN updates stage `tables.json` alongside the source manifest, receipt

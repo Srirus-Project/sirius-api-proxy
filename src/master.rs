@@ -54,6 +54,9 @@ impl WriterLock {
 
 pub struct MasterDocument {
     pub version: String,
+    /// Lowercase hex SHA-256 of `bytes`, computed from the same pinned snapshot after
+    /// integrity checks.
+    pub sha256: String,
     pub bytes: Vec<u8>,
 }
 
@@ -92,7 +95,7 @@ fn read_current_checked(
     if expected.is_some_and(|expected| expected != region) {
         return Err(MasterError::Format);
     }
-    let bytes = if let Some(table) = table {
+    let (sha256, bytes) = if let Some(table) = table {
         if !safe_component(table)
             || !manifest
                 .files
@@ -102,8 +105,15 @@ fn read_current_checked(
             return Err(MasterError::NotFound);
         }
         let bytes = read_bounded(&directory.join(format!("{table}.json")), MAX_JSON)?;
-        crate::master_registry::verify_indexed(&directory, &manifest, table, &bytes)?;
-        bytes
+        let sha256 = crate::master_registry::digest(&bytes);
+        crate::master_registry::verify_indexed_digest(
+            &directory,
+            &manifest,
+            table,
+            bytes.len() as u64,
+            &sha256,
+        )?;
+        (sha256, bytes)
     } else {
         let source = receipt
             .get("source")
@@ -121,10 +131,12 @@ fn read_current_checked(
         if let Some(resource) = recorded_resource_version(&receipt)? {
             status["resource_version"] = resource.into();
         }
-        serde_json::to_vec(&status).map_err(|_| MasterError::Format)?
+        let bytes = serde_json::to_vec(&status).map_err(|_| MasterError::Format)?;
+        (crate::master_registry::digest(&bytes), bytes)
     };
     Ok(MasterDocument {
         version: manifest.version,
+        sha256,
         bytes,
     })
 }

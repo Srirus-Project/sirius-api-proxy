@@ -860,7 +860,13 @@ async fn master_http_serves_imported_raw_json_with_version_without_game_calls() 
         assert_eq!(response.status().as_u16(), status);
         if status == 200 {
             assert_eq!(response.headers()["x-master-version"], "fixture-v1");
+            assert_eq!(response.headers()["cache-control"], "private, no-cache");
+            let etag = response.headers()["etag"].to_str().unwrap().to_owned();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                etag,
+                format!("\"{}\"", crate::master_registry::digest(&bytes))
+            );
             if path.ends_with("MasterFixture") {
                 assert_eq!(
                     bytes.as_ref(),
@@ -8917,6 +8923,283 @@ async fn master_registry_http_auth_conditional_reads_and_pinned_bytes_work_witho
         503
     );
     assert!(f.received.lock().unwrap().is_empty());
+}
+
+/// GET with an optional If-None-Match; answers (status, headers, body bytes).
+async fn conditional_get(
+    app: &axum::Router,
+    path: &str,
+    token: &str,
+    if_none_match: Option<&str>,
+) -> (u16, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::get(path).header("authorization", format!("Bearer {token}"));
+    if let Some(value) = if_none_match {
+        request = request.header("if-none-match", value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+#[tokio::test]
+async fn master_current_reads_revalidate_with_content_etag() {
+    let (_root, _input, output, _) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let (status, _, manifest) =
+        conditional_get(&app, "/api/v1/master-data/manifest", "api", None).await;
+    assert_eq!(status, 200);
+    let manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let (status, headers, bytes) = conditional_get(&app, table, "api", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bytes,
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    // The current table ETag equals the pinned table ETag for the same content.
+    assert_eq!(
+        headers["etag"],
+        format!("\"{}\"", manifest["files"][0]["sha256"].as_str().unwrap())
+    );
+    for path in [table, "/api/v1/master-data"] {
+        let (status, headers, bytes) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 200);
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+        assert_eq!(
+            etag,
+            format!("\"{}\"", crate::master_registry::digest(&bytes))
+        );
+        for condition in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"x\", W/{etag}"),
+            "*".into(),
+        ] {
+            let (status, headers, bytes) =
+                conditional_get(&app, path, "api", Some(&condition)).await;
+            assert_eq!(status, 304, "{path} {condition}");
+            assert!(bytes.is_empty());
+            assert_eq!(headers["etag"], etag.as_str());
+            assert_eq!(headers["x-master-version"], "fixture-v1");
+            assert_eq!(headers["cache-control"], "private, no-cache");
+            assert_eq!(headers["content-type"], "application/json");
+        }
+        let (status, _, full) = conditional_get(&app, path, "api", Some("\"0000\"")).await;
+        assert_eq!(status, 200);
+        assert_eq!(full, bytes);
+    }
+    // Table lookup and authorization run before any conditional evaluation.
+    let missing = "/api/v1/master-data/tables/MasterMissing";
+    assert_eq!(
+        conditional_get(&app, missing, "api", Some("*")).await.0,
+        404
+    );
+    assert_eq!(
+        conditional_get(&app, table, "internal", Some("*")).await.0,
+        401
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn master_current_conditional_read_never_hides_corruption() {
+    use crate::master;
+    let (_root, _input, output, receipt) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let status_path = "/api/v1/master-data";
+    let (_, headers, _) = conditional_get(&app, table, "api", None).await;
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    let (_, headers, _) = conditional_get(&app, status_path, "api", None).await;
+    let status_etag = headers["etag"].to_str().unwrap().to_owned();
+    std::fs::write(
+        output.join(&receipt.snapshot).join("MasterFixture.json"),
+        b"[]",
+    )
+    .unwrap();
+    assert!(matches!(
+        master::read_current(&output, Some("MasterFixture")),
+        Err(master::MasterError::Integrity)
+    ));
+    for condition in [etag.as_str(), "*"] {
+        let (status, headers, bytes) = conditional_get(&app, table, "api", Some(condition)).await;
+        assert_eq!(status, 503, "{condition}");
+        assert!(headers.get("etag").is_none());
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "master_unavailable");
+    }
+    // The status document reads no table and still revalidates normally.
+    assert_eq!(
+        conditional_get(&app, status_path, "api", Some(&status_etag))
+            .await
+            .0,
+        304
+    );
+    assert_eq!(conditional_get(&app, status_path, "api", None).await.0, 200);
+}
+#[tokio::test]
+async fn master_current_etag_on_legacy_snapshot() {
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let (status, headers, bytes) = conditional_get(&app, table, "api", None).await;
+    assert_eq!(status, 200);
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    assert_eq!(
+        etag,
+        format!("\"{}\"", crate::master_registry::digest(&bytes))
+    );
+    assert_eq!(
+        conditional_get(&app, table, "api", Some(&etag)).await.0,
+        304
+    );
+    // Without an index the ETag follows whatever bytes are read.
+    std::fs::write(snapshot.join("MasterFixture.json"), b"[{\"id\":2}]").unwrap();
+    let (status, headers, bytes) = conditional_get(&app, table, "api", Some(&etag)).await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, b"[{\"id\":2}]");
+    assert_eq!(
+        headers["etag"],
+        format!("\"{}\"", crate::master_registry::digest(b"[{\"id\":2}]"))
+    );
+    assert_ne!(headers["etag"], etag.as_str());
+    assert!(!snapshot.join("tables.json").exists());
+}
+#[tokio::test]
+async fn master_current_etag_follows_current_switch() {
+    let (_root, input, output, first) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let status_path = "/api/v1/master-data";
+    let (_, headers, _) = conditional_get(&app, table, "api", None).await;
+    let table_etag = headers["etag"].to_str().unwrap().to_owned();
+    let (_, headers, _) = conditional_get(&app, status_path, "api", None).await;
+    let status_etag = headers["etag"].to_str().unwrap().to_owned();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "fixture-v2".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let second = crate::master::import_directory(&input, &output, &decoder).unwrap();
+    assert_ne!(first.snapshot, second.snapshot);
+    // Identical table bytes stay valid, and the 304 carries the new version.
+    let (status, headers, _) = conditional_get(&app, table, "api", Some(&table_etag)).await;
+    assert_eq!(status, 304);
+    assert_eq!(headers["x-master-version"], "fixture-v2");
+    assert_eq!(headers["etag"], table_etag.as_str());
+    // The status document names the snapshot, so its validator changes.
+    let (status, headers, bytes) =
+        conditional_get(&app, status_path, "api", Some(&status_etag)).await;
+    assert_eq!(status, 200);
+    assert_ne!(headers["etag"], status_etag.as_str());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["version"],
+        "fixture-v2"
+    );
+    // A cross-region snapshot or an invalid pointer is unavailable, never unchanged.
+    let receipt_path = output.join(&second.snapshot).join("receipt.json");
+    let mut receipt: Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["region"] = json!("hk");
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    for path in [table, status_path] {
+        for condition in [table_etag.as_str(), status_etag.as_str(), "*"] {
+            assert_eq!(
+                conditional_get(&app, path, "api", Some(condition)).await.0,
+                503,
+                "{path} {condition}"
+            );
+        }
+    }
+    std::fs::write(output.join("CURRENT"), "../escape").unwrap();
+    for path in [table, status_path] {
+        assert_eq!(
+            conditional_get(&app, path, "api", Some("*")).await.0,
+            503,
+            "{path}"
+        );
+    }
+}
+#[test]
+fn master_current_digest_matches_bytes_and_index_verification() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, receipt) = registry_fixture();
+    for table in [None, Some("MasterFixture")] {
+        let document = master::read_current(&output, table).unwrap();
+        assert_eq!(document.sha256, registry::digest(&document.bytes));
+    }
+    let directory = output.join(&receipt.snapshot);
+    let manifest =
+        master::Manifest::parse(&std::fs::read(directory.join("MasterManifest.json")).unwrap())
+            .unwrap();
+    let bytes = include_bytes!("../tests/fixtures/master-synthetic.json");
+    let size = bytes.len() as u64;
+    let hash = registry::digest(bytes);
+    let verify = |size: u64, hash: &str| {
+        registry::verify_indexed_digest(&directory, &manifest, "MasterFixture", size, hash)
+    };
+    assert!(verify(size, &hash).is_ok());
+    assert!(matches!(
+        verify(size + 1, &hash),
+        Err(master::MasterError::Integrity)
+    ));
+    assert!(matches!(
+        verify(size, &"0".repeat(64)),
+        Err(master::MasterError::Integrity)
+    ));
+    std::fs::remove_file(directory.join("tables.json")).unwrap();
+    assert!(verify(size + 1, &"0".repeat(64)).is_ok());
+}
+#[tokio::test]
+async fn master_current_conditional_read_works_on_regional_routes() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        region::Region,
+    };
+    let (_root, input, _, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("hk");
+    crate::master::import_directory_for_region(&input, &master, &decoder, None, Region::Hk)
+        .unwrap();
+    let mut hk = regional_config(Region::Hk);
+    hk.master_directory = Some(master);
+    let deployment = DeploymentConfig::Multi(Box::new(MultiConfig {
+        logging: None,
+        tls: None,
+        access_log: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::from([("hk".into(), hk)]),
+    }));
+    let app = deployment.prepare().unwrap().router;
+    let path = "/api/v1/hk/master-data/tables/MasterFixture";
+    let (status, headers, _) = conditional_get(&app, path, "public-hk", None).await;
+    assert_eq!(status, 200);
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    let (status, headers, bytes) = conditional_get(&app, path, "public-hk", Some(&etag)).await;
+    assert_eq!(status, 304);
+    assert!(bytes.is_empty());
+    assert_eq!(headers["cache-control"], "private, no-cache");
 }
 
 fn master_sync_config(origin: String, output: std::path::PathBuf) -> Config {

@@ -511,6 +511,14 @@ These generic capabilities are intentionally not restored in their original form
    what the iOS 1.0.3 client proves: FindByProfileID expects the code, which names the target,
    and the client reads codes only on gRPC 2 or 7. JP `event_deck`, gRPC 3/5 and
    `PLAYER_NOT_EXISTS` are not mapped (see [REGIONS.md](REGIONS.md)). No configuration surface.
+23. **Current Master reads revalidate with a verified, private content ETag.** The original's
+   pointer files answer public `no-cache` with a strong ETag and `Last-Modified`, and return
+   304 before reading the file (`Haruki-Sekai-API@9a53714:src/registry/http.rs:19-25,581-601`).
+   Sirius hashes the bytes it serves from one pinned CURRENT after the region and `tables.json`
+   checks (`src/master.rs` `read_current_checked`), then shares the pinned routes' matcher
+   (`src/api.rs` `master_document`, `registry_document`), so a 304 never hides corruption. It
+   sends `private, no-cache` like the manifest and no `Last-Modified`, whose file times differ
+   per node and per reimport. No configuration surface.
 
 ## Original fields that were ignored by the original itself
 
@@ -655,3 +663,5 @@ classification and evidence:
   No field is added.
 - **Health uptime:** new [Decision 21](#decisions). `/health` adds `uptime_secs` and remains
   liveness only. No field is added.
+- **Current Master ETag:** new [Decision 23](#decisions). A behavior-only change on the
+  `/master-data` reads; no field is added.

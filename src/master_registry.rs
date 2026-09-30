@@ -334,7 +334,14 @@ pub fn table(
     if digest(&bytes) != expected_hash {
         return Err(MasterError::Integrity);
     }
-    verify_indexed(&directory, &source, table, &bytes)?;
+    // The check above proved `expected_hash` is the digest of these bytes.
+    verify_indexed_digest(
+        &directory,
+        &source,
+        table,
+        bytes.len() as u64,
+        expected_hash,
+    )?;
     serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
     Ok(Document {
         etag: format!("\"{expected_hash}\""),
@@ -343,11 +350,13 @@ pub fn table(
     })
 }
 /// Strengthens ordinary table reads as well; absent indexes preserve 1.1 compatibility.
-pub(crate) fn verify_indexed(
+/// `size`/`sha256` describe bytes the caller already read, so they are hashed only once.
+pub(crate) fn verify_indexed_digest(
     directory: &Path,
     source: &Manifest,
     table: &str,
-    bytes: &[u8],
+    size: u64,
+    sha256: &str,
 ) -> Result<(), MasterError> {
     let path = directory.join("tables.json");
     match fs::symlink_metadata(&path) {
@@ -360,7 +369,7 @@ pub(crate) fn verify_indexed(
                 .iter()
                 .find(|e| e.name == format!("{table}.json"))
                 .ok_or(MasterError::Format)?;
-            if entry.size != bytes.len() as u64 || entry.sha256 != digest(bytes) {
+            if entry.size != size || entry.sha256 != sha256 {
                 return Err(MasterError::Integrity);
             }
         }

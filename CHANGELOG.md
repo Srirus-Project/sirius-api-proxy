@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `GET /api/v1/master-data` and `/master-data/tables/{name}` (and their regional paths) now
+  return a strong content ETag (the SHA-256 of the exact bytes; for a table it equals the pinned
+  table ETag) with `Cache-Control: private, no-cache`, and answer `If-None-Match` with an empty
+  304 only after the region and index integrity checks, so corruption still answers 503.
+  Additive: a client that sends `If-None-Match: *` or a matching validator now gets 304 where
+  it used to get 200.
 - JP `profile` lookups answering gRPC 2 or 7 with `x-sirius-error-code: PLAYER_NOT_FOUND` now
   return 404 `not_found` and leave the account alone, as Global has since 1.2.2. They used to
   answer 502, and on gRPC 7 the JP account was disabled. The evidence is static (the iOS 1.0.3
