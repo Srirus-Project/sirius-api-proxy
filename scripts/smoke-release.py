@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import tarfile
@@ -86,6 +87,17 @@ with tempfile.TemporaryDirectory() as tmp:
             port = sock.getsockname()[1]
         config = (root / "sirius-api-config.example.yaml").read_text().replace("127.0.0.1:9999", f"127.0.0.1:{port}")
         (root / "sirius-api-config.yaml").write_text(config)
+        if shutil.which("git"):
+            # Offline Master Git adoption refuses a branchless remote without echoing paths.
+            usage = subprocess.run([str(exe), "master-git-adopt", "x"], cwd=root, env=env,
+                                   capture_output=True, timeout=15)
+            assert usage.returncode != 0 and b"master-git-adopt" in usage.stderr
+            bare, git_state = Path(tmp) / "smoke-remote.git", Path(tmp) / "smoke-git-state"
+            subprocess.run(["git", "init", "--bare", "--quiet", str(bare)], check=True, timeout=30)
+            refused = subprocess.run([str(exe), "master-git-adopt", str(git_state), bare.as_uri()],
+                                     cwd=root, env=env, capture_output=True, timeout=60)
+            assert refused.returncode != 0 and b"NotAdoptable" in refused.stderr
+            assert str(bare).encode() not in refused.stderr and str(git_state).encode() not in refused.stderr
         proc = subprocess.Popen([str(exe)], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def request(path, token=None):
             req = urllib.request.Request(f"http://127.0.0.1:{port}" + path)

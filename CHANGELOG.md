@@ -48,6 +48,14 @@
   an entry still retained for any pool account instead of 503 `account_unavailable` (peers:
   instead of `unavailable_before_dispatch`), without refreshing it. With a window of 0 nothing
   changes. No configuration or wire change.
+- New one-shot `master-git-adopt GIT_STATE_DIRECTORY REMOTE_URL` recovers Master Git
+  publication stuck on `remote_history` after lost local state or a manual remote commit such
+  as a README: it fast-forwards the local managed branch to the remote head when the newest
+  `Sirius Master` commit among the last 64 is a publication of the profile's scope and layout,
+  and refuses divergence (`RemoteChanged`) or unrecognized history (new static error
+  `NotAdoptable`). It never pushes; the next publication continues on the adopted head, and
+  manually added files leave the next tree. Publication, configuration and the worker are
+  unchanged (the worker never adopts).
 
 ## 1.2.4
 

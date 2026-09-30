@@ -14834,6 +14834,722 @@ async fn master_git_indented_root_pushes_configured_branch_to_remote() {
     assert_eq!(again.commit, receipt.commit);
 }
 
+/// A local bare repository reached over `file://`, for offline remote Git tests.
+#[cfg(unix)]
+fn adopt_remote(path: &std::path::Path) -> crate::master_git::Remote {
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    crate::master_git::Remote {
+        proxy_url_env: None,
+        url: url::Url::from_directory_path(path).unwrap().to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    }
+}
+#[cfg(unix)]
+fn adopt_git(repository: &std::path::Path, args: &[&str], input: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@localhost",
+        ])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+/// Commit `entries` (`mode type oid\tname` lines) on `parent` and point `branch` at it.
+#[cfg(unix)]
+fn adopt_fixture_commit(
+    repository: &std::path::Path,
+    branch: &str,
+    entries: &[String],
+    parent: Option<&str>,
+    message: &str,
+) -> String {
+    let tree = adopt_git(repository, &["mktree"], entries.join("\n").as_bytes());
+    let mut args = vec!["commit-tree", &tree, "-m", message];
+    if let Some(parent) = parent {
+        args.extend(["-p", parent]);
+    }
+    let commit = adopt_git(repository, &args, b"");
+    adopt_git(
+        repository,
+        &["update-ref", &format!("refs/heads/{branch}"), &commit],
+        b"",
+    );
+    commit
+}
+#[cfg(unix)]
+fn adopt_tree_entries(repository: &std::path::Path, commit: &str) -> Vec<String> {
+    adopt_git(repository, &["ls-tree", commit], b"")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+#[cfg(unix)]
+fn adopt_blob(repository: &std::path::Path, bytes: &[u8]) -> String {
+    adopt_git(repository, &["hash-object", "-w", "--stdin"], bytes)
+}
+#[cfg(unix)]
+fn adopt_local_ref(state: &std::path::Path, branch: &str) -> Option<String> {
+    git_output(
+        &state.join("repository.git"),
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .map(|s| s.trim().to_owned())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_recovers_lost_state() {
+    use crate::{master_git, master_registry as registry};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let published = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(published.changed && published.remote_verified);
+    std::fs::remove_dir_all(&state).unwrap();
+    // A fresh store never overwrites the remote branch...
+    assert!(matches!(
+        master_git::publish(&source, &state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    assert_eq!(adopt_local_ref(&state, "master-data"), None);
+    // ...until the operator adopts it; adoption itself never touches the remote.
+    let adoption = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.previous, None);
+    assert_eq!(adoption.commit, published.commit);
+    assert_eq!(
+        adoption.publication.as_deref(),
+        Some(published.commit.as_str())
+    );
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&source, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(adoption.version.as_deref(), Some(manifest.version.as_str()));
+    assert_eq!(
+        adopt_local_ref(&state, "master-data").as_deref(),
+        Some(published.commit.as_str())
+    );
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        published.commit
+    );
+    let json = serde_json::to_value(&adoption).unwrap();
+    assert_eq!(
+        json.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["adopted", "commit", "previous", "publication", "version"]
+    );
+    let after = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!after.changed && after.remote_verified);
+    assert_eq!(after.commit, published.commit);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_fast_forwards_over_manual_readme_commit() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let first = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    let mut entries = adopt_tree_entries(&remote_path, &first.commit);
+    entries.push(format!(
+        "100644 blob {}\tREADME.md",
+        adopt_blob(&remote_path, b"# Master data\n")
+    ));
+    let readme = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &entries,
+        Some(&first.commit),
+        "Add README",
+    );
+    assert!(matches!(
+        master_git::publish(&source, &state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    let adoption = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.previous.as_deref(), Some(first.commit.as_str()));
+    assert_eq!(adoption.commit, readme);
+    assert_eq!(adoption.publication.as_deref(), Some(first.commit.as_str()));
+    assert_eq!(adoption.version.as_deref(), Some("1.0.0"));
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let next = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(next.changed && next.remote_verified);
+    let git = |args: &[&str]| git_output(&remote_path, args).unwrap();
+    assert_eq!(
+        git(&["rev-parse", &format!("{}^", next.commit)]).trim(),
+        readme
+    );
+    // Manually added files leave the published tree; history keeps them.
+    assert_eq!(
+        git(&["ls-tree", "--name-only", "master-data"]),
+        "MasterAlpha.json\nsirius-publication.json\n"
+    );
+    assert_eq!(
+        git(&["log", "-1", "--format=%s", "master-data"]).trim(),
+        "Sirius Master jp 1.0.1"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_refuses_divergence() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap()
+        .commit;
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let entries = adopt_tree_entries(&remote_path, &x);
+    let z = adopt_fixture_commit(&remote_path, "master-data", &entries, Some(&x), "manual");
+    assert!(matches!(
+        master_git::adopt(&state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(y));
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        z
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_refuses_unrecognized_history() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    let not_adoptable = |state: std::path::PathBuf| {
+        let remote = remote.clone();
+        async move {
+            let result = master_git::adopt(&state, registry_scope(), &remote).await;
+            assert!(
+                matches!(result, Err(master_git::Error::NotAdoptable)),
+                "{:?}",
+                result.map(|a| a.commit)
+            );
+            assert_eq!(adopt_local_ref(&state, "master-data"), None);
+        }
+    };
+    // (a) A README-only repository has no Sirius publication.
+    let readme = format!(
+        "100644 blob {}\tREADME.md",
+        adopt_blob(&remote_path, b"# Master data\n")
+    );
+    adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        std::slice::from_ref(&readme),
+        None,
+        "Initial commit",
+    );
+    not_adoptable(root.path().join("a")).await;
+    // (b) Only 64 first-parent commits are inspected.
+    adopt_git(
+        &remote_path,
+        &["update-ref", "-d", "refs/heads/master-data"],
+        b"",
+    );
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(
+        &source,
+        &root.path().join("owner"),
+        registry_scope(),
+        &remote,
+    )
+    .await
+    .unwrap()
+    .commit;
+    let entries = adopt_tree_entries(&remote_path, &x);
+    let mut manual = vec![x.clone()];
+    for index in 0..64 {
+        let parent = manual.last().unwrap().clone();
+        manual.push(adopt_fixture_commit(
+            &remote_path,
+            "master-data",
+            &entries,
+            Some(&parent),
+            &format!("manual {index}"),
+        ));
+    }
+    not_adoptable(root.path().join("b")).await;
+    adopt_git(
+        &remote_path,
+        &["update-ref", "refs/heads/master-data", &manual[63]],
+        b"",
+    );
+    let deep = master_git::adopt(&root.path().join("b"), registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(deep.adopted);
+    assert_eq!(deep.publication.as_deref(), Some(x.as_str()));
+    // (c) A Sirius subject over a tree that is not exactly a publication decides the
+    // walk: the valid publication beneath it is never consulted.
+    let table = entries
+        .iter()
+        .find(|e| e.ends_with("\tMasterAlpha.json"))
+        .unwrap()
+        .clone();
+    let metadata = entries
+        .iter()
+        .find(|e| e.ends_with("\tsirius-publication.json"))
+        .unwrap()
+        .clone();
+    let subtree = adopt_git(&remote_path, &["mktree"], table.as_bytes());
+    let blob = adopt_blob(&remote_path, b"[]");
+    let forged: [Vec<String>; 6] = [
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("040000 tree {subtree}\tnested.json"),
+        ],
+        vec![table.replace("100644", "100755"), metadata.clone()],
+        vec![table.clone()],
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("100644 blob {blob}\tMasterExtra.json"),
+        ],
+        vec![metadata.clone()],
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("100644 blob {blob}\tversion.json"),
+        ],
+    ];
+    for (index, entries) in forged.iter().enumerate() {
+        adopt_fixture_commit(
+            &remote_path,
+            "master-data",
+            entries,
+            Some(&x),
+            "Sirius Master jp 1.0.0",
+        );
+        not_adoptable(root.path().join(format!("c{index}"))).await;
+    }
+    // Subject version and region must match the recorded publication.
+    for subject in [
+        "Sirius Master jp 1.0.1",
+        "Sirius Master jp ../x",
+        "Sirius Master jp",
+        "Sirius Master en 1.0.0",
+    ] {
+        adopt_fixture_commit(&remote_path, "master-data", &entries, Some(&x), subject);
+        not_adoptable(root.path().join("subject")).await;
+    }
+    // The same tree with a correct subject is a recognizable publication.
+    let copy = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &entries,
+        Some(&x),
+        "Sirius Master jp 1.0.0",
+    );
+    let adoption = master_git::adopt(&root.path().join("subject"), registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert_eq!(adoption.publication.as_deref(), Some(copy.as_str()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_checks_region_scope_and_layout() {
+    use crate::{master_git, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let native_path = root.path().join("native.git");
+    let native = adopt_remote(&native_path);
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-1"),
+        &[("MasterAlpha", b"[1]")],
+    );
+    master_git::publish(
+        &source,
+        &root.path().join("owner"),
+        registry_scope(),
+        &native,
+    )
+    .await
+    .unwrap();
+    let indented = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: "main".into(),
+    };
+    let native_on_indented_branch = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: master_git::DEFAULT_BRANCH.into(),
+    };
+    let mut en = registry_scope();
+    en.region = Region::En;
+    let mut review = registry_scope();
+    review.environment = "review".into();
+    let mut android = registry_scope();
+    android.platform = crate::region::Platform::Android;
+    for (index, (scope, options)) in [
+        (en.clone(), master_git::Options::default()),
+        (review.clone(), master_git::Options::default()),
+        (android, master_git::Options::default()),
+        (registry_scope(), native_on_indented_branch),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = root.path().join(format!("native-{index}"));
+        assert!(matches!(
+            master_git::adopt_with_options(&state, scope, &native, &options).await,
+            Err(master_git::Error::NotAdoptable)
+        ));
+        assert_eq!(adopt_local_ref(&state, &options.branch), None);
+    }
+    let indented_path = root.path().join("indented.git");
+    let indented_remote = adopt_remote(&indented_path);
+    let policy = master_git::CommitPolicy::default();
+    let published = master_git::publish_with_options(
+        &source,
+        &root.path().join("indented-owner"),
+        registry_scope(),
+        &indented_remote,
+        &policy,
+        &indented,
+    )
+    .await
+    .unwrap();
+    let native_main = master_git::Options {
+        layout: master_git::Layout::Native,
+        branch: "main".into(),
+    };
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-native"),
+            registry_scope(),
+            &indented_remote,
+            &native_main,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-en"),
+            en,
+            &indented_remote,
+            &indented,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    let state = root.path().join("indented");
+    let adoption =
+        master_git::adopt_with_options(&state, registry_scope(), &indented_remote, &indented)
+            .await
+            .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, published.commit);
+    assert_eq!(adoption.version.as_deref(), Some("1.0.0"));
+    let after = master_git::publish_with_options(
+        &source,
+        &state,
+        registry_scope(),
+        &indented_remote,
+        &policy,
+        &indented,
+    )
+    .await
+    .unwrap();
+    assert!(!after.changed && after.remote_verified);
+    assert_eq!(after.commit, published.commit);
+    // version.json must be exactly the published document, not merely equivalent JSON.
+    let entries: Vec<String> = adopt_tree_entries(&indented_path, &published.commit)
+        .into_iter()
+        .filter(|e| !e.ends_with("\tversion.json"))
+        .chain([format!(
+            "100644 blob {}\tversion.json",
+            adopt_blob(
+                &indented_path,
+                b"{\"dataVersion\":\"1.0.0\",\"assetVersion\":\"asset-1\"}"
+            )
+        )])
+        .collect();
+    adopt_fixture_commit(
+        &indented_path,
+        "main",
+        &entries,
+        Some(&published.commit),
+        "Sirius Master jp 1.0.0",
+    );
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-compact"),
+            registry_scope(),
+            &indented_remote,
+            &indented,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_accepts_legacy_hk_alias() {
+    use crate::{master_git, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    let table = adopt_blob(&remote_path, b"[]");
+    let metadata = serde_json::to_vec_pretty(&json!({
+        "schema_version": 1,
+        "scope": {"region": "tw", "environment": "release", "platform": "iOS"},
+        "version": "9.9.9",
+        "content_sha256": "0".repeat(64),
+        "files": [{"name": "MasterA.json", "size": 2, "sha256": "0".repeat(64)}],
+        "source_manifest": {"version": "9.9.9", "files": []},
+    }))
+    .unwrap();
+    let metadata = adopt_blob(&remote_path, &metadata);
+    let commit = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &[
+            format!("100644 blob {table}\tMasterA.json"),
+            format!("100644 blob {metadata}\tsirius-publication.json"),
+        ],
+        None,
+        "Sirius Master tw 9.9.9",
+    );
+    let mut hk = registry_scope();
+    hk.region = Region::Hk;
+    let state = root.path().join("hk");
+    let adoption = master_git::adopt(&state, hk, &remote).await.unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, commit);
+    assert_eq!(adoption.version.as_deref(), Some("9.9.9"));
+    assert!(matches!(
+        master_git::adopt(&root.path().join("jp"), registry_scope(), &remote).await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_remote_absent_and_noop_cases() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    assert!(matches!(
+        master_git::adopt(&root.path().join("empty"), registry_scope(), &remote).await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    let missing = master_git::Remote {
+        url: url::Url::from_directory_path(root.path().join("missing.git"))
+            .unwrap()
+            .to_string(),
+        ..remote.clone()
+    };
+    assert!(matches!(
+        master_git::adopt(&root.path().join("missing"), registry_scope(), &missing).await,
+        Err(master_git::Error::Git)
+    ));
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap()
+        .commit;
+    let equal = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!equal.adopted && equal.publication.is_none() && equal.version.is_none());
+    assert_eq!(equal.commit, x);
+    assert_eq!(equal.previous.as_deref(), Some(x.as_str()));
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let behind = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!behind.adopted && behind.publication.is_none());
+    assert_eq!(behind.commit, y);
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(y));
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        x
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_cas_rejects_stale_expected_value() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let options = master_git::Options::default();
+    for stale in [Some(x.as_str()), None] {
+        assert!(matches!(
+            master_git::advance_for_test(&state, registry_scope(), &options, &x, stale).await,
+            Err(master_git::Error::Git)
+        ));
+        assert_eq!(
+            adopt_local_ref(&state, "master-data").as_deref(),
+            Some(y.as_str())
+        );
+    }
+    master_git::advance_for_test(&state, registry_scope(), &options, &x, Some(&y))
+        .await
+        .unwrap();
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(x));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_respects_owner_lock_and_ownership() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    // The remote does not exist: reaching it would be `Git`, not the local refusal.
+    let unreachable = master_git::Remote {
+        proxy_url_env: None,
+        url: url::Url::from_directory_path(root.path().join("missing.git"))
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("owner.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    assert!(matches!(
+        master_git::adopt(&state, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Locked)
+    ));
+    drop(owner);
+    let occupied = root.path().join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), b"user-data").unwrap();
+    assert!(matches!(
+        master_git::adopt(&occupied, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    // As for publication, only the lock file may be created; no marker or repository.
+    assert!(!occupied.join("sirius-git.json").exists());
+    assert!(!occupied.join("repository.git").exists());
+    assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"user-data");
+    let linked = root.path().join("linked");
+    std::os::unix::fs::symlink(&state, &linked).unwrap();
+    assert!(matches!(
+        master_git::adopt(&linked, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    let mut wrong = registry_scope();
+    wrong.environment = "review".into();
+    assert!(matches!(
+        master_git::adopt(&state, wrong, &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    assert!(matches!(
+        master_git::adopt(
+            &state,
+            registry_scope(),
+            &master_git::Remote {
+                allow_file: false,
+                ..unreachable.clone()
+            }
+        )
+        .await,
+        Err(master_git::Error::RemoteConfig)
+    ));
+}
+
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn master_git_worker_reports_missing_asset_version_and_retries_after_installation() {

@@ -369,8 +369,9 @@ The command uses the same verified snapshot, scoped state lock, layout and branc
 checks the remote branch before creating a new local commit. An absent remote branch can be
 created; a remote equal to or behind the local branch can be advanced. A remote ahead of or
 diverged from local history fails verification before adding a local commit. A new empty
-local store will not overwrite an existing remote branch; retain/recover the original managed
-state and reconcile deliberately. The command never force-pushes, merges or resets either
+local store will not overwrite an existing remote branch; retain the original managed state, or
+recover it explicitly with [`master-git-adopt`](#adopting-remote-history). The command never
+force-pushes, merges or resets either
 branch to conceal divergence. The force marker used when fetching only refreshes a private
 local inspection ref; it is never part of a push refspec.
 
@@ -398,6 +399,56 @@ mirrors and tests, with authorization unset. The library's HTTP test opt-in is n
 the CLI. Final production Git acceptance, including a packaged Windows binary, remains a
 separate release requirement.
 
+### Adopting remote history
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-adopt ./master-git-state https://git.example/master-data.git
+```
+
+When the local managed state was lost, or the remote branch gained commits that Sirius did not
+create (for example a README), publication keeps failing with `remote_history`. This one-shot
+command makes the remote branch the local managed branch so publication can continue. Argument
+and environment handling (`SIRIUS_MASTER_GIT_AUTHORIZATION`, `SIRIUS_MASTER_GIT_PROXY_URL`,
+HTTPS or explicit `file://` only) are exactly those of `master-git-push`. It reads the profile's
+region, environment, platform, `master_git.layout` and `master_git.branch`; it does not need
+`master_directory` and ignores `master_git.commit`, `state_directory`, `interval_seconds` and
+`remote`. The state directory follows the same ownership rules: a missing or empty directory is
+initialized for the profile's scope, and a foreign non-empty directory or another scope's state
+is refused.
+
+The remote history is adopted only if its newest commit with a `Sirius Master <region>
+<version>` subject, among the latest 64 first-parent commits, is a Sirius publication for this
+profile: the region matches (the pre-1.2.1 alias of `hk` is read as `hk`), the version is a
+valid Master version, and the tree has exactly the configured layout, a flat set of regular
+`.json` files. For `native`, `sirius-publication.json` must record the same scope (including
+environment and platform), version and table names as the tree. For `indented_root`,
+`version.json` must be byte-for-byte the document Sirius writes for that version.
+`indented_root` commits record only the region, so they cannot distinguish two environments
+that share a branch; configure one remote branch per deployment. Older commits are never
+consulted once a `Sirius Master` subject is found.
+
+| Local and remote | Result |
+|---|---|
+| Local branch missing, or an ancestor of the remote | The local branch is fast-forwarded to the remote head; `adopted: true` |
+| Local equal to or ahead of the remote | Nothing changes; `adopted: false`; the next publication pushes as usual |
+| Diverged | `RemoteChanged`; nothing changes |
+| Remote branch absent, no recognizable publication, or another region, scope or layout | `NotAdoptable`; nothing changes |
+
+The command prints a JSON receipt with `commit` (local branch after the call), `previous`,
+`adopted`, `publication` (the recognized Sirius commit) and `version`, never a path or URL. It
+never pushes, force-updates or rewrites a commit, and does not read Master data; the local
+reference moves with a compare-and-swap update. The next publication is parented on the adopted
+head. Its tree is generated from the installed snapshot as always, so files added manually to
+the remote leave the next published tree (history keeps them). If the content is identical to
+the adopted Sirius commit and no other commits were added, publication reuses it and only
+verifies the remote.
+
+To recover from divergence, move the old state directory aside and adopt into a new one. After a
+layout change on the same branch, adopt with the previous layout first. The background worker
+never adopts and has no switch for it. The command takes the state directory lock for each
+operation; while the service is running, it may report `Locked` during a worker cycle, and the
+worker continues from the adopted commit on its next cycle.
+
 ### Background Git publication
 
 JP, HK, EN and KR profiles may enable `master_git` with a separate `state_directory` and
@@ -419,7 +470,11 @@ across restarts: Git refs are durable, while displayed last-success status is re
 internal bearer. It reports pending/running/ready/failed/stopped/disabled, the last successful
 receipt and a static error code; it does not expose paths, remote URLs or credentials. Failure
 never rolls back installed Master data. Shutdown cancels active network work and releases the
-state lock; the next startup reconciles an ambiguous previous push against remote refs.
+state lock; the next startup reconciles an ambiguous previous push against remote refs. A
+persistent `remote_history` error means the remote branch has history the local state does not
+contain; inspect it and, if appropriate, run [`master-git-adopt`](#adopting-remote-history).
+The worker holds the state lock only during each cycle, so the command can run while the
+service is up.
 
 Service remote configuration uses `url`, optional `authorization_env`, and explicit `allow_file`
 or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must be a dedicated
@@ -464,7 +519,9 @@ and `HEAD` is rejected. Changing the branch or layout of an existing state direc
 continues that branch in the same managed repository; other branches are left untouched. The
 remote safety rules are unchanged: a remote branch that is ahead or diverged, including an
 initialized repository whose `main` already has a README commit, is refused. Publish to an
-empty repository or to a branch that Sirius owns.
+empty repository or to a branch that Sirius owns. A README-only repository cannot be adopted
+either, because [adoption](#adopting-remote-history) requires a recognizable Sirius
+publication; a README added on top of an existing Sirius publication can be adopted.
 
 ```yaml
 master_git:

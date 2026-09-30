@@ -30,6 +30,8 @@ pub enum Error {
     LayoutConfig,
     #[error("Master snapshot has no recorded asset version")]
     AssetVersion,
+    #[error("Master Git remote branch is absent or has no recognizable publication for this scope and layout")]
+    NotAdoptable,
 }
 /// Repository tree layout of a publication commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
@@ -288,14 +290,18 @@ impl CommitPolicy {
             .collect()
     }
 }
-struct Prepared {
-    policy: CommitPolicy,
+/// An owned, locked state directory; the lock is held until this value is dropped.
+struct Owned {
     _owner: crate::file_lock::Exclusive,
     directory: PathBuf,
+    reference: String,
+    policy: CommitPolicy,
+}
+struct Prepared {
+    owned: Owned,
     staging: tempfile::TempDir,
     manifest: PublishedManifest,
     names: Vec<String>,
-    reference: String,
 }
 /// Windows canonical paths use the `\\?\` verbatim form, which Git for Windows rejects
 /// (`cannot mkdir ...: Invalid argument`). Convert drive and UNC forms back to ordinary
@@ -340,12 +346,8 @@ fn write_marker(
     file.persist(marker).map_err(|_| Error::Snapshot)?;
     Ok(())
 }
-fn prepare(
-    source: &Path,
-    destination: &Path,
-    scope: Scope,
-    options: &Options,
-) -> Result<Prepared, Error> {
+/// Ownership, lock and marker checks shared by publication and adoption.
+fn own(destination: &Path, scope: &Scope, options: &Options) -> Result<Owned, Error> {
     if let Ok(meta) = fs::symlink_metadata(destination) {
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(Error::Ownership);
@@ -404,6 +406,20 @@ fn prepare(
     if fs::symlink_metadata(&repository).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
         return Err(Error::Ownership);
     }
+    Ok(Owned {
+        _owner: owner,
+        directory,
+        reference: options.reference(),
+        policy: CommitPolicy::default(),
+    })
+}
+fn prepare(
+    source: &Path,
+    destination: &Path,
+    scope: Scope,
+    options: &Options,
+) -> Result<Prepared, Error> {
+    let owned = own(destination, &scope, options)?;
     let document = master_registry::manifest(source, None, scope).map_err(|_| Error::Snapshot)?;
     let manifest: PublishedManifest =
         serde_json::from_slice(&document.bytes).map_err(|_| Error::Snapshot)?;
@@ -454,13 +470,10 @@ fn prepare(
         names.push("version.json".into());
         names.sort();
         return Ok(Prepared {
-            policy: CommitPolicy::default(),
-            _owner: owner,
-            directory,
+            owned,
             staging,
             manifest,
             names,
-            reference: options.reference(),
         });
     }
     // Node-local UUIDs are excluded, so an identical import produces the same Git tree.
@@ -477,13 +490,10 @@ fn prepare(
     names.push("sirius-publication.json".into());
     names.sort();
     Ok(Prepared {
-        policy: CommitPolicy::default(),
-        _owner: owner,
-        directory,
+        owned,
         staging,
         manifest,
         names,
-        reference: options.reference(),
     })
 }
 fn oid(bytes: Vec<u8>) -> Result<String, Error> {
@@ -491,20 +501,25 @@ fn oid(bytes: Vec<u8>) -> Result<String, Error> {
         .map_err(|_| Error::Git)?
         .trim()
         .to_owned();
-    if value.len() != 40
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+    if !is_oid(&value) {
         return Err(Error::Git);
     }
     Ok(value)
 }
 async fn command(
-    prepared: &Prepared,
+    owned: &Owned,
     args: Vec<OsString>,
     input: &[u8],
     deadline: tokio::time::Instant,
+) -> Result<Vec<u8>, Error> {
+    command_limited(owned, args, input, deadline, 1024 * 1024).await
+}
+async fn command_limited(
+    owned: &Owned,
+    args: Vec<OsString>,
+    input: &[u8],
+    deadline: tokio::time::Instant,
+    output_limit: usize,
 ) -> Result<Vec<u8>, Error> {
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
@@ -512,7 +527,7 @@ async fn command(
     let mut all = vec![
         OsString::from("--no-replace-objects"),
         OsString::from("--git-dir"),
-        prepared.directory.join("repository.git").into_os_string(),
+        owned.directory.join("repository.git").into_os_string(),
         "-c".into(),
         "gc.auto=0".into(),
         "-c".into(),
@@ -522,14 +537,14 @@ async fn command(
         "-c".into(),
         "user.email=sirius-master@localhost".into(),
     ];
-    all.extend(prepared.policy.arguments());
+    all.extend(owned.policy.arguments());
     all.extend(args);
     git_process::run_with_input(
         Path::new("git"),
-        &prepared.directory,
+        &owned.directory,
         &all,
         remaining,
-        1024 * 1024,
+        output_limit,
         input,
     )
     .await
@@ -612,50 +627,11 @@ async fn commit_internal(
         tokio::task::spawn_blocking(move || prepare(&source, &destination, scope, &owned))
             .await
             .map_err(|_| Error::Snapshot)??;
-    prepared.policy = policy.clone();
+    prepared.owned.policy = policy.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    command(
-        &prepared,
-        vec![
-            "init".into(),
-            "--bare".into(),
-            "--quiet".into(),
-            "--object-format=sha1".into(),
-            prepared.directory.join("repository.git").into_os_string(),
-        ],
-        &[],
-        deadline,
-    )
-    .await?;
-    command(
-        &prepared,
-        vec![
-            "symbolic-ref".into(),
-            "HEAD".into(),
-            prepared.reference.clone().into(),
-        ],
-        &[],
-        deadline,
-    )
-    .await?;
-    let refs = command(
-        &prepared,
-        vec![
-            "for-each-ref".into(),
-            "--format=%(objectname)".into(),
-            prepared.reference.clone().into(),
-        ],
-        &[],
-        deadline,
-    )
-    .await?;
-    let parent = if refs.is_empty() {
-        None
-    } else {
-        Some(oid(refs)?)
-    };
+    let parent = initialize(&prepared.owned, deadline).await?;
     if let Some(remote) = remote {
-        check_remote(&prepared, remote, parent.as_deref(), deadline).await?;
+        check_remote(&prepared.owned, remote, parent.as_deref(), deadline).await?;
     }
     let mut tree_input = String::new();
     for names in prepared.names.chunks(64) {
@@ -670,7 +646,7 @@ async fn commit_internal(
                 .iter()
                 .map(|n| prepared.staging.path().join(n).into_os_string()),
         );
-        let hashes = command(&prepared, args, &[], deadline).await?;
+        let hashes = command(&prepared.owned, args, &[], deadline).await?;
         let hashes = String::from_utf8(hashes).map_err(|_| Error::Git)?;
         if hashes.lines().count() != names.len() {
             return Err(Error::Git);
@@ -681,7 +657,7 @@ async fn commit_internal(
         }
     }
     let tree = oid(command(
-        &prepared,
+        &prepared.owned,
         vec!["mktree".into()],
         tree_input.as_bytes(),
         deadline,
@@ -689,7 +665,7 @@ async fn commit_internal(
     .await?)?;
     if let Some(parent) = &parent {
         let old_tree = oid(command(
-            &prepared,
+            &prepared.owned,
             vec!["rev-parse".into(), format!("{parent}^{{tree}}").into()],
             &[],
             deadline,
@@ -697,7 +673,7 @@ async fn commit_internal(
         .await?)?;
         if old_tree == tree {
             return finish(
-                &prepared,
+                &prepared.owned,
                 remote,
                 Receipt {
                     commit: parent.clone(),
@@ -727,21 +703,10 @@ async fn commit_internal(
     if policy.signing.is_some() {
         args.push("-S".into());
     }
-    let commit = oid(command(&prepared, args, &[], deadline).await?)?;
-    command(
-        &prepared,
-        vec![
-            "update-ref".into(),
-            prepared.reference.clone().into(),
-            commit.clone().into(),
-            parent.unwrap_or_else(|| "0".repeat(40)).into(),
-        ],
-        &[],
-        deadline,
-    )
-    .await?;
+    let commit = oid(command(&prepared.owned, args, &[], deadline).await?)?;
+    advance(&prepared.owned, &commit, parent.as_deref(), deadline).await?;
     finish(
-        &prepared,
+        &prepared.owned,
         remote,
         Receipt {
             commit,
@@ -752,6 +717,73 @@ async fn commit_internal(
         deadline,
     )
     .await
+}
+/// Create the bare repository if needed and return the local branch commit.
+async fn initialize(
+    owned: &Owned,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>, Error> {
+    command(
+        owned,
+        vec![
+            "init".into(),
+            "--bare".into(),
+            "--quiet".into(),
+            "--object-format=sha1".into(),
+            owned.directory.join("repository.git").into_os_string(),
+        ],
+        &[],
+        deadline,
+    )
+    .await?;
+    command(
+        owned,
+        vec![
+            "symbolic-ref".into(),
+            "HEAD".into(),
+            owned.reference.clone().into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await?;
+    let refs = command(
+        owned,
+        vec![
+            "for-each-ref".into(),
+            "--format=%(objectname)".into(),
+            owned.reference.clone().into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await?;
+    if refs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(oid(refs)?))
+    }
+}
+/// Compare-and-swap the local branch; a missing branch is expected as the zero oid.
+async fn advance(
+    owned: &Owned,
+    new: &str,
+    old: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    command(
+        owned,
+        vec![
+            "update-ref".into(),
+            owned.reference.clone().into(),
+            new.into(),
+            old.map_or_else(|| "0".repeat(40), str::to_owned).into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -866,28 +898,28 @@ impl Remote {
     }
 }
 async fn network(
-    prepared: &Prepared,
+    owned: &Owned,
     remote: &Remote,
     args: Vec<OsString>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, Error> {
     let mut options = remote.options();
     options.extend(args);
-    command(prepared, options, &[], deadline).await
+    command(owned, options, &[], deadline).await
 }
 async fn remote_head(
-    prepared: &Prepared,
+    owned: &Owned,
     remote: &Remote,
     deadline: tokio::time::Instant,
 ) -> Result<Option<String>, Error> {
     let bytes = network(
-        prepared,
+        owned,
         remote,
         vec![
             "ls-remote".into(),
             "--refs".into(),
             remote.url.clone().into(),
-            prepared.reference.clone().into(),
+            owned.reference.clone().into(),
         ],
         deadline,
     )
@@ -901,49 +933,27 @@ async fn remote_head(
         return Err(Error::Git);
     }
     let (hash, reference) = lines[0].split_once('\t').ok_or(Error::Git)?;
-    if reference != prepared.reference {
+    if reference != owned.reference {
         return Err(Error::Git);
     }
     Ok(Some(oid(hash.as_bytes().to_vec())?))
 }
 async fn check_remote(
-    prepared: &Prepared,
+    owned: &Owned,
     remote: &Remote,
     parent: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
-    let Some(head) = remote_head(prepared, remote, deadline).await? else {
+    let Some(head) = remote_head(owned, remote, deadline).await? else {
         return Ok(());
     };
     let parent = parent.ok_or(Error::RemoteChanged)?;
     if head == parent {
         return Ok(());
     }
-    network(
-        prepared,
-        remote,
-        vec![
-            "fetch".into(),
-            "--no-tags".into(),
-            "--no-write-fetch-head".into(),
-            remote.url.clone().into(),
-            format!("+{}:refs/sirius/remote-check", prepared.reference).into(),
-        ],
-        deadline,
-    )
-    .await?;
-    let fetched = oid(command(
-        prepared,
-        vec!["rev-parse".into(), "refs/sirius/remote-check".into()],
-        &[],
-        deadline,
-    )
-    .await?)?;
-    if fetched != head {
-        return Err(Error::RemoteChanged);
-    }
+    fetch_remote_check(owned, remote, &head, deadline).await?;
     command(
-        prepared,
+        owned,
         vec![
             "merge-base".into(),
             "--is-ancestor".into(),
@@ -957,31 +967,328 @@ async fn check_remote(
     .map_err(|_| Error::RemoteChanged)?;
     Ok(())
 }
+/// Fetch the remote branch into `refs/sirius/remote-check` and require it to be `head`.
+async fn fetch_remote_check(
+    owned: &Owned,
+    remote: &Remote,
+    head: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    network(
+        owned,
+        remote,
+        vec![
+            "fetch".into(),
+            "--no-tags".into(),
+            "--no-write-fetch-head".into(),
+            remote.url.clone().into(),
+            format!("+{}:refs/sirius/remote-check", owned.reference).into(),
+        ],
+        deadline,
+    )
+    .await?;
+    let fetched = oid(command(
+        owned,
+        vec!["rev-parse".into(), "refs/sirius/remote-check".into()],
+        &[],
+        deadline,
+    )
+    .await?)?;
+    if fetched != head {
+        return Err(Error::RemoteChanged);
+    }
+    Ok(())
+}
 async fn finish(
-    prepared: &Prepared,
+    owned: &Owned,
     remote: Option<&Remote>,
     mut receipt: Receipt,
     deadline: tokio::time::Instant,
 ) -> Result<Receipt, Error> {
     if let Some(remote) = remote {
         network(
-            prepared,
+            owned,
             remote,
             vec![
                 "push".into(),
                 "--porcelain".into(),
                 remote.url.clone().into(),
-                format!("{}:{}", receipt.commit, prepared.reference).into(),
+                format!("{}:{}", receipt.commit, owned.reference).into(),
             ],
             deadline,
         )
         .await?;
-        if remote_head(prepared, remote, deadline).await?.as_deref()
-            != Some(receipt.commit.as_str())
-        {
+        if remote_head(owned, remote, deadline).await?.as_deref() != Some(receipt.commit.as_str()) {
             return Err(Error::RemoteChanged);
         }
         receipt.remote_verified = true;
     }
     Ok(receipt)
+}
+/// Outcome of [`adopt`]: commit ids and a Master version only, never a path or URL.
+#[derive(Clone, Serialize)]
+pub struct Adoption {
+    /// Local branch commit after the call.
+    pub commit: String,
+    pub previous: Option<String>,
+    pub adopted: bool,
+    /// Newest recognized Sirius publication in the adopted first-parent history.
+    pub publication: Option<String>,
+    pub version: Option<String>,
+}
+/// First-parent commits inspected for a Sirius publication before refusing.
+const ADOPT_DEPTH: usize = 64;
+/// The manifest table limit plus one metadata file.
+const ADOPT_TREE_ENTRIES: usize = 4096 + 1;
+fn is_oid(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+/// Adopt the remote branch as local managed state, for a lost state directory or a remote
+/// that gained non-Sirius commits. The local branch is fast-forwarded (compare-and-swap)
+/// only when it is missing or an ancestor of the remote, and only when the newest
+/// `Sirius Master` commit within [`ADOPT_DEPTH`] first-parent commits is a publication of
+/// this scope in the configured layout. Never pushes, never reads a Master directory and
+/// never rewrites a commit; the next publication fast-forwards from the adopted head.
+pub async fn adopt(destination: &Path, scope: Scope, remote: &Remote) -> Result<Adoption, Error> {
+    adopt_with_options(destination, scope, remote, &Options::default()).await
+}
+pub async fn adopt_with_options(
+    destination: &Path,
+    scope: Scope,
+    remote: &Remote,
+    options: &Options,
+) -> Result<Adoption, Error> {
+    remote.validate()?;
+    options.validate()?;
+    if !cfg!(any(unix, windows)) {
+        return Err(Error::Git);
+    }
+    let owned = {
+        let (destination, scope, options) =
+            (destination.to_owned(), scope.clone(), options.clone());
+        tokio::task::spawn_blocking(move || own(&destination, &scope, &options))
+            .await
+            .map_err(|_| Error::Snapshot)??
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let local = initialize(&owned, deadline).await?;
+    let head = remote_head(&owned, remote, deadline)
+        .await?
+        .ok_or(Error::NotAdoptable)?;
+    let unchanged = |commit: String| Adoption {
+        commit,
+        previous: local.clone(),
+        adopted: false,
+        publication: None,
+        version: None,
+    };
+    if local.as_deref() == Some(head.as_str()) {
+        return Ok(unchanged(head));
+    }
+    fetch_remote_check(&owned, remote, &head, deadline).await?;
+    if let Some(local) = &local {
+        // A remote behind the local branch is advanced by the next ordinary push.
+        if ancestor(&owned, &head, local, deadline).await {
+            return Ok(unchanged(local.clone()));
+        }
+        if !ancestor(&owned, local, &head, deadline).await {
+            return Err(Error::RemoteChanged);
+        }
+    }
+    let (publication, version) = recognize(&owned, &scope, options.layout, &head, deadline).await?;
+    advance(&owned, &head, local.as_deref(), deadline).await?;
+    Ok(Adoption {
+        commit: head,
+        previous: local,
+        adopted: true,
+        publication: Some(publication),
+        version: Some(version),
+    })
+}
+async fn ancestor(owned: &Owned, older: &str, newer: &str, deadline: tokio::time::Instant) -> bool {
+    command(
+        owned,
+        vec![
+            "merge-base".into(),
+            "--is-ancestor".into(),
+            older.into(),
+            newer.into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await
+    .is_ok()
+}
+/// Find the newest `Sirius Master <region> <version>` first-parent commit of `head` and
+/// require its tree to be exactly a publication of `scope` in `layout`. Older commits are
+/// never consulted once a Sirius subject is found.
+async fn recognize(
+    owned: &Owned,
+    scope: &Scope,
+    layout: Layout,
+    head: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(String, String), Error> {
+    let log = command(
+        owned,
+        vec![
+            "rev-list".into(),
+            "--first-parent".into(),
+            format!("--max-count={ADOPT_DEPTH}").into(),
+            "--format=%H%x09%s".into(),
+            head.into(),
+        ],
+        &[],
+        deadline,
+    )
+    .await?;
+    let log = String::from_utf8_lossy(&log);
+    let mut decided = None;
+    for line in log.lines() {
+        // Without --no-commit-header (Git 2.33+) each entry is preceded by `commit <oid>`.
+        if line.strip_prefix("commit ").is_some_and(is_oid) {
+            continue;
+        }
+        let (commit, subject) = line.split_once('\t').ok_or(Error::Git)?;
+        if !is_oid(commit) {
+            return Err(Error::Git);
+        }
+        if let Some(rest) = subject.strip_prefix("Sirius Master ") {
+            decided = Some((commit.to_owned(), rest.to_owned()));
+            break;
+        }
+    }
+    let (commit, rest) = decided.ok_or(Error::NotAdoptable)?;
+    let (region, version) = rest.split_once(' ').ok_or(Error::NotAdoptable)?;
+    if crate::region::Region::from_recorded_name(region) != Some(scope.region)
+        || !crate::master::safe_version(version)
+    {
+        return Err(Error::NotAdoptable);
+    }
+    let listing = command(
+        owned,
+        vec!["ls-tree".into(), "-z".into(), commit.clone().into()],
+        &[],
+        deadline,
+    )
+    .await?;
+    let mut entries = std::collections::BTreeMap::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let entry = std::str::from_utf8(entry).map_err(|_| Error::NotAdoptable)?;
+        let (header, name) = entry.split_once('\t').ok_or(Error::NotAdoptable)?;
+        let blob = header
+            .strip_prefix("100644 blob ")
+            .filter(|blob| is_oid(blob))
+            .ok_or(Error::NotAdoptable)?;
+        if entries.len() >= ADOPT_TREE_ENTRIES
+            || name.len() <= ".json".len()
+            || !name.ends_with(".json")
+            || name.starts_with('.')
+            || name
+                .chars()
+                .any(|c| c == '/' || c == '\\' || c.is_control())
+        {
+            return Err(Error::NotAdoptable);
+        }
+        entries.insert(name.to_owned(), blob.to_owned());
+    }
+    match layout {
+        Layout::Native => {
+            #[derive(serde::Deserialize)]
+            struct Recorded {
+                scope: serde_json::Value,
+                version: String,
+                files: Vec<RecordedFile>,
+            }
+            #[derive(serde::Deserialize)]
+            struct RecordedFile {
+                name: String,
+            }
+            if entries.contains_key("version.json") {
+                return Err(Error::NotAdoptable);
+            }
+            let blob = entries
+                .remove("sirius-publication.json")
+                .ok_or(Error::NotAdoptable)?;
+            // Metadata lists up to 4096 tables twice (files and source manifest).
+            let bytes = command_limited(
+                owned,
+                vec!["cat-file".into(), "blob".into(), blob.into()],
+                &[],
+                deadline,
+                4 * 1024 * 1024,
+            )
+            .await?;
+            let mut recorded: Recorded =
+                serde_json::from_slice(&bytes).map_err(|_| Error::NotAdoptable)?;
+            // Publications before 1.2.1 may record the deprecated alias of `hk`.
+            if let Some(region) = recorded.scope.pointer_mut("/region") {
+                let legacy = region
+                    .as_str()
+                    .filter(|name| crate::region::is_deprecated_alias(name))
+                    .and_then(crate::region::Region::from_recorded_name);
+                if let Some(legacy) = legacy {
+                    *region = serde_json::json!(legacy);
+                }
+            }
+            let recorded_scope: Scope =
+                serde_json::from_value(recorded.scope).map_err(|_| Error::NotAdoptable)?;
+            let mut names: Vec<&str> = recorded.files.iter().map(|f| f.name.as_str()).collect();
+            names.sort_unstable();
+            if recorded_scope != *scope
+                || recorded.version != version
+                || !names.iter().copied().eq(entries.keys().map(String::as_str))
+            {
+                return Err(Error::NotAdoptable);
+            }
+        }
+        Layout::IndentedRoot => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct VersionDocument {
+                data_version: String,
+                asset_version: String,
+            }
+            if entries.contains_key("sirius-publication.json") {
+                return Err(Error::NotAdoptable);
+            }
+            let blob = entries.get("version.json").ok_or(Error::NotAdoptable)?;
+            let bytes = command(
+                owned,
+                vec!["cat-file".into(), "blob".into(), blob.into()],
+                &[],
+                deadline,
+            )
+            .await?;
+            let document: VersionDocument =
+                serde_json::from_slice(&bytes).map_err(|_| Error::NotAdoptable)?;
+            if document.data_version != version
+                || bytes != version_document(&document.data_version, &document.asset_version)
+            {
+                return Err(Error::NotAdoptable);
+            }
+        }
+    }
+    Ok((commit, version.to_owned()))
+}
+#[cfg(test)]
+pub(crate) async fn advance_for_test(
+    destination: &Path,
+    scope: Scope,
+    options: &Options,
+    new: &str,
+    old: Option<&str>,
+) -> Result<(), Error> {
+    let owned = own(destination, &scope, options)?;
+    advance(
+        &owned,
+        new,
+        old,
+        tokio::time::Instant::now() + Duration::from_secs(120),
+    )
+    .await
 }

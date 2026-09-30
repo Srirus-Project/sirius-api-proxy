@@ -189,6 +189,8 @@ impl Worker {
                     master_git::Error::Git => "git_operation",
                     master_git::Error::LayoutConfig => "layout_config",
                     master_git::Error::AssetVersion => "asset_version_unavailable",
+                    // Produced only by the explicit `master-git-adopt` command, never here.
+                    master_git::Error::NotAdoptable => "not_adoptable",
                 };
                 self.game.record_master_git(json!({"status":"failed","checked_at":chrono::Utc::now(),"error_code":code,"last_success":self.last_success})).await;
                 tracing::warn!(

@@ -166,23 +166,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if args
-        .first()
-        .is_some_and(|arg| matches!(arg.as_str(), "master-git-commit" | "master-git-push"))
-    {
+    if args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "master-git-commit" | "master-git-push" | "master-git-adopt"
+        )
+    }) {
         let push = args[0] == "master-git-push";
-        if args.len() != if push { 3 } else { 2 } {
-            return Err("usage: sirius-api-proxy master-git-commit GIT_STATE_DIRECTORY | master-git-push GIT_STATE_DIRECTORY REMOTE_URL".into());
+        let adopt = args[0] == "master-git-adopt";
+        if args.len() != if push || adopt { 3 } else { 2 } {
+            return Err("usage: sirius-api-proxy master-git-commit GIT_STATE_DIRECTORY | master-git-push GIT_STATE_DIRECTORY REMOTE_URL | master-git-adopt GIT_STATE_DIRECTORY REMOTE_URL".into());
         }
         let path =
             std::env::var("SIRIUS_CONFIG_PATH").unwrap_or_else(|_| "sirius-api-config.yaml".into());
         let deployment = DeploymentConfig::parse(&std::fs::read_to_string(path)?)?;
         sirius_api_proxy::region::warn_deprecated_alias();
         let config = deployment.single()?;
-        let source = config
-            .master_directory
-            .as_deref()
-            .ok_or("master_directory is required")?;
         let scope = sirius_api_proxy::master_registry::Scope {
             region: config.region,
             environment: config.environment.clone(),
@@ -198,21 +197,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|g| g.options())
             .unwrap_or_default();
+        // Adoption reads only the scope, layout and branch: no Master directory, commit
+        // policy or configured remote.
+        if adopt {
+            let adoption = sirius_api_proxy::master_git::adopt_with_options(
+                std::path::Path::new(&args[1]),
+                scope,
+                &cli_remote(&args[2]),
+                &options,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&adoption)?);
+            return Ok(());
+        }
+        let source = config
+            .master_directory
+            .as_deref()
+            .ok_or("master_directory is required")?;
         let receipt = if push {
-            let remote = sirius_api_proxy::master_git::Remote {
-                proxy_url_env: std::env::var_os("SIRIUS_MASTER_GIT_PROXY_URL")
-                    .map(|_| "SIRIUS_MASTER_GIT_PROXY_URL".into()),
-                url: args[2].clone(),
-                authorization_env: std::env::var_os("SIRIUS_MASTER_GIT_AUTHORIZATION")
-                    .map(|_| "SIRIUS_MASTER_GIT_AUTHORIZATION".into()),
-                allow_http: false,
-                allow_file: args[2].starts_with("file://"),
-            };
             sirius_api_proxy::master_git::publish_with_options(
                 source,
                 std::path::Path::new(&args[1]),
                 scope,
-                &remote,
+                &cli_remote(&args[2]),
                 &policy,
                 &options,
             )
@@ -462,5 +469,19 @@ async fn global_account(args: &[String]) -> Result<(), Box<dyn std::error::Error
             Ok(())
         }
         _ => Err(GLOBAL_ACCOUNT_USAGE.into()),
+    }
+}
+
+/// Remote for `master-git-push` and `master-git-adopt`: credentials and proxy are passed by
+/// environment variable name only, plain HTTP is never allowed, and `file://` only as given.
+fn cli_remote(url: &str) -> sirius_api_proxy::master_git::Remote {
+    sirius_api_proxy::master_git::Remote {
+        proxy_url_env: std::env::var_os("SIRIUS_MASTER_GIT_PROXY_URL")
+            .map(|_| "SIRIUS_MASTER_GIT_PROXY_URL".into()),
+        url: url.to_owned(),
+        authorization_env: std::env::var_os("SIRIUS_MASTER_GIT_AUTHORIZATION")
+            .map(|_| "SIRIUS_MASTER_GIT_AUTHORIZATION".into()),
+        allow_http: false,
+        allow_file: url.starts_with("file://"),
     }
 }

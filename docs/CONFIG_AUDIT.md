@@ -45,7 +45,7 @@ Original: `Config`, `Haruki-Sekai-API@07da6b80:src/config.rs:515-538`.
 
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `proxy` | DECISION | Per-transport explicit proxies: `upstream.proxy_url_env` / `proxy_authorization_env` (game gRPC, `src/config.rs:76-77`, `src/transport.rs:35-52`, and the Global SDK login of the same profile, `src/client.rs:1436-1462`), `master_update.network.proxy_url_env` / `proxy_authorization_env` (Master CDN, `src/master_update.rs:54-55`, `:109-124`), `resource_snapshot.network.*` (Global catalog `.hash`, `src/config.rs:160-162`, `src/client.rs:150-156`), `master_git.remote.proxy_url_env` (Git, `src/master_git.rs:762`) | Original: one global proxy used by the game client (`Haruki-Sekai-API@07da6b80:src/main.rs:81-82`) and the updater (`Haruki-Sekai-API@07da6b80:src/updater/scheduler.rs:27`), and inherited by Git and music_metas. See [Decisions](#decisions). |
+| `proxy` | DECISION | Per-transport explicit proxies: `upstream.proxy_url_env` / `proxy_authorization_env` (game gRPC, `src/config.rs:76-77`, `src/transport.rs:35-52`, and the Global SDK login of the same profile, `src/client.rs:1436-1462`), `master_update.network.proxy_url_env` / `proxy_authorization_env` (Master CDN, `src/master_update.rs:54-55`, `:109-124`), `resource_snapshot.network.*` (Global catalog `.hash`, `src/config.rs:160-162`, `src/client.rs:150-156`), `master_git.remote.proxy_url_env` (Git, `src/master_git.rs:794`) | Original: one global proxy used by the game client (`Haruki-Sekai-API@07da6b80:src/main.rs:81-82`) and the updater (`Haruki-Sekai-API@07da6b80:src/updater/scheduler.rs:27`), and inherited by Git and music_metas. See [Decisions](#decisions). |
 | `jp_sekai_cookie_url` | NOT_APPLICABLE | none | Sekai JP cookie bootstrap (`Haruki-Sekai-API@07da6b80:src/main.rs:80`), used only when `region == Jp && require_cookies` (`Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:95`). Sirius game RPC is gRPC and has no cookie step (`src/client.rs:1069-1111`). |
 | `git` | ADAPTED | `master_git` (`src/config.rs:11`) | See [`git`](#git). |
 | `redis` | ADAPTED | `response_cache: {backend: redis, ...}` (`src/response_cache.rs:49-59`); the auth-cache use moved to `client_auth` | See [`redis`](#redis). |
@@ -119,15 +119,15 @@ Original: `GitConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:136-169`.
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | Presence of `master_git` (`src/config.rs:11`, `src/master_git_worker.rs:9-25`) | JP/HK/EN/KR (CN rejected) and requires `master_directory` (`src/master_git_worker.rs:38-63`). Multi-region deployments require distinct state directories and remotes (`src/deployment.rs:135-150`). Accepted on Unix and Windows (`cfg!(any(unix, windows))`, `src/master_git_worker.rs:45`). On Windows, Git runs in a kill-on-close Job Object, and the Windows CI job runs the Git tests. |
-| `username` | ADAPTED | `commit.author.name` / `commit.committer.name` (`src/master_git.rs:175-189`, `:204-211`) | The original used `username` both as the committer name (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:456`) and as the URL credential user (`:476`). A Basic user now goes inside `remote.authorization_env` (`src/master_git_worker.rs:66-89`). |
-| `email` | ADAPTED | `commit.author.email` / `commit.committer.email` (`src/master_git.rs:179`) | |
-| `password` | ADAPTED | `remote.authorization_env`, a full `Authorization: Basic` or `Bearer` header held in env (`src/master_git.rs:761`, `:814-832`) | The original injected the credential into the remote URL (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:476`, `:531`). Sirius passes it through Git config-env, never in a URL (`src/master_git.rs:862-864`). |
-| `sign_commits` | ADAPTED | Presence of `commit.signing` (`src/master_git.rs:210`) | |
-| `signing_format` (`gpg` with `openpgp` alias, `ssh`) | REUSED | `commit.signing.format`: `openpgp` (alias `gpg`) or `ssh` (`src/master_git.rs:189-196`) | |
-| `signing_key` | ADAPTED | `commit.signing.key` (`src/master_git.rs:201`) | Must be a 16–64 hex OpenPGP fingerprint or an absolute SSH key path (`:238-248`). The original also accepted an inline SSH public key (`Haruki-Sekai-API@07da6b80:haruki-sekai-configs.example.yaml:11`); Sirius rejects inline key material. |
-| `signing_program` | REUSED | `commit.signing.program` (`src/master_git.rs:202`, `:250-262`) | Restricted to one absolute executable path. |
-| `proxy` (absent inherits, `""` means direct) | DECISION | `remote.proxy_url_env`; omitted means direct (`src/master_git.rs:762`, `:846`, `:853-855`) | There is no inheritance because there is no global proxy. Ambient `*_PROXY` variables are removed from the Git environment (`src/git_process.rs:201-213`). See [Decisions](#decisions). |
-| (implicit) worktree = `master_dir` plus its `origin` | ADAPTED | Separate `state_directory`, which must differ from `master_directory`, and an explicit `remote.url` (`src/master_git_worker.rs:14`, `:47-51`; `src/master_git.rs:760`) | Each commit is built from a fresh tree of the verified snapshot (`src/master_git.rs:343-488`). Since 1.2.1 `layout` (`native` or `indented_root`) and `branch` (default `master-data`) choose the tree and the published branch (`src/master_git_worker.rs:18-23`, `src/master_git.rs:34-89`). |
+| `username` | ADAPTED | `commit.author.name` / `commit.committer.name` (`src/master_git.rs:177-191`, `:206-213`) | The original used `username` both as the committer name (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:456`) and as the URL credential user (`:476`). A Basic user now goes inside `remote.authorization_env` (`src/master_git_worker.rs:66-89`). |
+| `email` | ADAPTED | `commit.author.email` / `commit.committer.email` (`src/master_git.rs:181`) | |
+| `password` | ADAPTED | `remote.authorization_env`, a full `Authorization: Basic` or `Bearer` header held in env (`src/master_git.rs:793`, `:846-864`) | The original injected the credential into the remote URL (`Haruki-Sekai-API@07da6b80:src/updater/git.rs:476`, `:531`). Sirius passes it through Git config-env, never in a URL (`src/master_git.rs:894-896`). |
+| `sign_commits` | ADAPTED | Presence of `commit.signing` (`src/master_git.rs:212`) | |
+| `signing_format` (`gpg` with `openpgp` alias, `ssh`) | REUSED | `commit.signing.format`: `openpgp` (alias `gpg`) or `ssh` (`src/master_git.rs:191-198`) | |
+| `signing_key` | ADAPTED | `commit.signing.key` (`src/master_git.rs:203`) | Must be a 16–64 hex OpenPGP fingerprint or an absolute SSH key path (`:240-250`). The original also accepted an inline SSH public key (`Haruki-Sekai-API@07da6b80:haruki-sekai-configs.example.yaml:11`); Sirius rejects inline key material. |
+| `signing_program` | REUSED | `commit.signing.program` (`src/master_git.rs:204`, `:252-264`) | Restricted to one absolute executable path. |
+| `proxy` (absent inherits, `""` means direct) | DECISION | `remote.proxy_url_env`; omitted means direct (`src/master_git.rs:794`, `:878`, `:885-887`) | There is no inheritance because there is no global proxy. Ambient `*_PROXY` variables are removed from the Git environment (`src/git_process.rs:201-213`). See [Decisions](#decisions). |
+| (implicit) worktree = `master_dir` plus its `origin` | ADAPTED | Separate `state_directory`, which must differ from `master_directory`, and an explicit `remote.url` (`src/master_git_worker.rs:14`, `:47-51`; `src/master_git.rs:792`) | Each commit is built from a fresh tree of the verified snapshot (`src/master_git.rs:350-498`). Since 1.2.1 `layout` (`native` or `indented_root`) and `branch` (default `master-data`) choose the tree and the published branch (`src/master_git_worker.rs:18-23`, `src/master_git.rs:36-91`). |
 
 ## `servers.<region>`
 
@@ -137,7 +137,7 @@ Original: `ServerConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:300-379`.
 | --- | --- | --- | --- |
 | `enabled` | ADAPTED | The region profile is present. Remote-only serving is `node_routing.local_priority: null` with targets (`src/node_routing.rs:20`, `:60`) | |
 | `master_dir` | ADAPTED | `master_directory`, an immutable snapshot store with a `CURRENT` pointer (`src/config.rs:61`, `src/master.rs:443-473`) | |
-| `version_path` | ADAPTED / NOT_APPLICABLE | No configurable file. `dataVersion` and `assetVersion` are recorded with each snapshot (`resource_version`, `src/master.rs:158`, `:425-433`) and published as `version.json` `{dataVersion, assetVersion}` in the `master_git.layout: indented_root` tree (`src/master_git.rs:159-167`, `:448-455`) | The original merged appVersion/appHash/dataVersion/assetVersion/assetHash/cdnVersion into an operator-chosen file (`Haruki-Sekai-API@07da6b80:src/updater/master.rs:1066`, `:1195-1245`) and took app-identity overrides into it (`Haruki-Sekai-API@07da6b80:src/api/internal.rs:253-257`). The data/asset version pair is ADAPTED as above, taken from one VERSION observation (`src/client.rs:1172-1213`). appVersion, appHash, assetHash and cdnVersion are Sekai app-hash and CDN state and remain NOT_APPLICABLE; Sirius has no login version file (Global PlayerLogin sends the static `client_version`). |
+| `version_path` | ADAPTED / NOT_APPLICABLE | No configurable file. `dataVersion` and `assetVersion` are recorded with each snapshot (`resource_version`, `src/master.rs:158`, `:425-433`) and published as `version.json` `{dataVersion, assetVersion}` in the `master_git.layout: indented_root` tree (`src/master_git.rs:161-169`, `:464-471`) | The original merged appVersion/appHash/dataVersion/assetVersion/assetHash/cdnVersion into an operator-chosen file (`Haruki-Sekai-API@07da6b80:src/updater/master.rs:1066`, `:1195-1245`) and took app-identity overrides into it (`Haruki-Sekai-API@07da6b80:src/api/internal.rs:253-257`). The data/asset version pair is ADAPTED as above, taken from one VERSION observation (`src/client.rs:1172-1213`). appVersion, appHash, assetHash and cdnVersion are Sekai app-hash and CDN state and remain NOT_APPLICABLE; Sirius has no login version file (Global PlayerLogin sends the static `client_version`). |
 | `account_dir` | DECISION | `accounts[].{player_id_env, credential_env, credentials_file}` for JP and `accounts[].global_identity_file` plus `global_login` for HK/EN/KR (`src/accounts.rs:24-34`, `:143-222`, `:369-410`), reloaded with `POST /internal/v1/accounts/reload` (`src/api.rs:137`) | The original polled the directory every 5 s (`Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:300-333`), parsed every `*.json` file as a CP (`userId`/`deviceId`/`credential`) or Nuverse (`userId`/`deviceId`/`accessToken`) account (`Haruki-Sekai-API@07da6b80:src/client/account.rs:41-56`, `:100-120`, `Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:335-360`) and logged every account in eagerly (`:226-290`). Those Sekai account files are not accepted: a JP account file holds exactly `player_id` and `credential`, and a Global identity file holds an SDK guest identity and device context (schema 1, [ACCOUNTS.md](ACCOUNTS.md#global-accounts)). The directory watch itself is a decision; see [Decisions](#decisions). |
 | (implicit) account login at load and relogin (CP `PUT /api/user/{id}/auth`, Nuverse `POST /api/user/auth`) | NOT_APPLICABLE | none | Sekai login with msgpack/AES payloads (`Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:713-757`). Sirius JP accounts have no login step: the static credential is sent as gRPC metadata. Sirius has its own Global login, new configuration rather than a restoration of this path: a lazy OneSDK guest `cache.login` plus the gRPC `PlayerLogin`, serialized by the account's session lock and bounded by `global_login` (`src/client.rs:751-885`, `src/global_account.rs:29-81`, `:196-235`, `src/accounts.rs:320-350`). Guest identities are created only by the one-shot `global-account bootstrap` command (`src/main.rs:392-417`). |
 | `api_url` | REUSED | `endpoint`, an HTTPS origin checked against the region's known services (`src/config.rs:40`, `:380-402`) | The Global SDK login uses a separate `global_login.sdk_origin`, restricted to the three official OneSDK origins (`src/global_sdk.rs:11-44`). |
@@ -146,7 +146,7 @@ Original: `ServerConfig`, `Haruki-Sekai-API@07da6b80:src/config.rs:300-379`.
 | `require_cookies` | NOT_APPLICABLE | none | JP Sekai cookie (`Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:95`). |
 | `headers` (free-form map) | DECISION | none | Merged into every Sekai HTTP request (`Haruki-Sekai-API@07da6b80:src/client/sekai_client.rs:91`, `:439-457`) next to computed `X-App-Hash`/`X-Data-Version` (`:189-191`). See [Decisions](#decisions). |
 | `aes_key_hex`, `aes_iv_hex` | NOT_APPLICABLE | none | Sekai msgpack/AES API payload cipher. Sirius game traffic is plain Protobuf gRPC over verified TLS (`src/client.rs:1064-1111`). In the original, these keys were also the Master fallback cipher; that role is covered by the next row. |
-| `master_aes_key_hex`, `master_aes_iv_hex` | ADAPTED | `master_update.key_hex_env` / `iv_hex_env` (`src/config.rs:143-144`, `src/master_update.rs:183-186`); the `master-import` CLI reads `SIRIUS_MASTER_KEY_HEX` / `SIRIUS_MASTER_IV_HEX` (`src/main.rs:259-266`) | The secrets moved into env vars. |
+| `master_aes_key_hex`, `master_aes_iv_hex` | ADAPTED | `master_update.key_hex_env` / `iv_hex_env` (`src/config.rs:143-144`, `src/master_update.rs:183-186`); the `master-import` CLI reads `SIRIUS_MASTER_KEY_HEX` / `SIRIUS_MASTER_IV_HEX` (`src/main.rs:266-273`) | The secrets moved into env vars. |
 | `enable_master_updater` | ADAPTED | Presence of `master_update` (`src/config.rs:62`) | Mutually exclusive with `master_sync` (`src/config.rs:282-292`). |
 | `master_updater_cron` | DECISION | `master_update.interval_seconds`, 60–86400 (`src/config.rs:145`, `:317`) | Runs once at startup, then waits this interval after each completed attempt. See [Decisions](#decisions). |
 | `enable_app_hash_updater`, `app_hash_updater_cron` | IGNORED_BY_ORIGINAL / NOT_APPLICABLE | none | Deprecated and ignored (`Haruki-Sekai-API@07da6b80:src/config.rs:333-340`, warned at `:579-584`). |
@@ -233,7 +233,7 @@ Original: `AssetUpdaterInfo`, `Haruki-Sekai-API@07da6b80:src/config.rs:508-513`.
 
 | Original variable | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `CONFIG_PATH` (`Haruki-Sekai-API@07da6b80:src/config.rs:591`) | ADAPTED | `SIRIUS_CONFIG_PATH`, default `sirius-api-config.yaml` (`src/main.rs:47-50`, `:177-178`, `:278-279`, `:432-433`) | `registry-serve` and `master-db-import` / `master-db-migrate` take their config path from argv (`src/main.rs:5-10`, `:73-81`). |
+| `CONFIG_PATH` (`Haruki-Sekai-API@07da6b80:src/config.rs:591`) | ADAPTED | `SIRIUS_CONFIG_PATH`, default `sirius-api-config.yaml` (`src/main.rs:47-50`, `:180-181`, `:285-286`, `:439-440`) | `registry-serve` and `master-db-import` / `master-db-migrate` take their config path from argv (`src/main.rs:5-10`, `:73-81`). |
 | `RUST_LOG` (`Haruki-Sekai-API@07da6b80:src/logging.rs:28`) | ADAPTED | Ignored on purpose; use `logging.level` | `docs/APPLICATION_LOG.md:39`. |
 | `BENCH_*` (`Haruki-Sekai-API@07da6b80:src/bin/bench_profile.rs:178-337`), `HARUKI_BENCH_*` (`Haruki-Sekai-API@07da6b80:src/updater/master_stream.rs:628-732`) | NOT_APPLICABLE | none | Benchmarks for Sekai profile and master ingest. |
 | `HARUKI_TEST_REGISTRY_DSN` (`Haruki-Sekai-API@07da6b80:src/registry/state.rs:1025`) | ADAPTED | `SIRIUS_TEST_POSTGRES_PORT` / `SIRIUS_TEST_POSTGRES_PASSWORD`; `SIRIUS_TEST_REDIS_SERVER` and `SIRIUS_TEST_GPG_PROGRAM` enable other optional tests (`src/tests.rs`) | Test-only. Never read by the service. |
@@ -242,11 +242,11 @@ Other environment reads in Sirius:
 
 - Every `*_env` field is a variable name, and its value is resolved by `secret()`
   (`src/config.rs:179-188`). YAML never holds a secret value.
-- `master-import` reads `SIRIUS_MASTER_KEY_HEX` / `SIRIUS_MASTER_IV_HEX` (`src/main.rs:259-266`).
-- `master-git-push` reads `SIRIUS_MASTER_GIT_PROXY_URL` / `SIRIUS_MASTER_GIT_AUTHORIZATION`
-  (`src/main.rs:202-210`). See [Decisions](#decisions).
+- `master-import` reads `SIRIUS_MASTER_KEY_HEX` / `SIRIUS_MASTER_IV_HEX` (`src/main.rs:266-273`).
+- `master-git-push` and `master-git-adopt` read `SIRIUS_MASTER_GIT_PROXY_URL` /
+  `SIRIUS_MASTER_GIT_AUTHORIZATION` (`src/main.rs:475-487`). See [Decisions](#decisions).
 - `global-account bootstrap` reads the SDK app key from `--sdk-app-key-env`, default
-  `SIRIUS_GLOBAL_SDK_APP_KEY` (`src/main.rs:407-411`); the service reads it from
+  `SIRIUS_GLOBAL_SDK_APP_KEY` (`src/main.rs:414-418`); the service reads it from
   `global_login.sdk_app_key_env` (same default, `src/global_account.rs:48-60`, `src/client.rs:1448`).
 - PostgreSQL connections refuse to start while `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` or
   `PGOPTIONS` is set; other SQLx-read `PG*` variables are always overridden by explicit
@@ -312,16 +312,22 @@ These generic capabilities are intentionally not restored in their original form
    (`scripts/smoke-release.py:121-157`). Earlier releases used `https://cdn.example.invalid/...`
    placeholders.
 7. **The Master Git CLI takes its state directory and remote from argv and env.**
-   `master-git-commit STATE_DIR` and `master-git-push STATE_DIR REMOTE_URL`
-   (`src/main.rs:169-232`) are explicit one-shot operations. They parse and validate the whole
-   profile, then use only `master_directory`, the scope, `master_git.commit` (identity and
-   signing) and, since 1.2.1, `master_git.layout` and `master_git.branch` (`:182-200`). They
-   ignore `master_git.state_directory`, `interval_seconds` and `remote.*`. The push reads its
-   proxy and authorization only from `SIRIUS_MASTER_GIT_PROXY_URL` /
-   `SIRIUS_MASTER_GIT_AUTHORIZATION`, fixes `allow_http: false`, and sets `allow_file` only for a
-   `file://` argument (`:202-210`). The background worker honors every `master_git` field
-   (`src/master_git_worker.rs:153-172`). The split keeps a manual push from silently targeting
-   the service's configured remote or state.
+   `master-git-commit STATE_DIR`, `master-git-push STATE_DIR REMOTE_URL` and, since 1.3.0,
+   `master-git-adopt STATE_DIR REMOTE_URL` (`src/main.rs:169-239`) are explicit one-shot
+   operations. They parse and validate the whole profile, then use only `master_directory`, the
+   scope, `master_git.commit` (identity and signing) and, since 1.2.1, `master_git.layout` and
+   `master_git.branch` (`:185-199`, `:213-216`). `master-git-adopt` uses only the scope, layout
+   and branch (`:200-212`): it neither requires `master_directory` nor applies the commit
+   policy. All three ignore `master_git.state_directory`, `interval_seconds` and `remote.*`.
+   The push and the adoption read their proxy and authorization only from
+   `SIRIUS_MASTER_GIT_PROXY_URL` / `SIRIUS_MASTER_GIT_AUTHORIZATION`, fix `allow_http: false`,
+   and set `allow_file` only for a `file://` argument (`cli_remote`, `:475-487`). The background
+   worker honors every `master_git` field (`src/master_git_worker.rs:153-172`) and never adopts
+   remote history. The split keeps a manual push or adoption from silently targeting the
+   service's configured remote or state. The original has no adoption: it clones and leaves
+   diverged history to a manual merge (`Haruki-Sekai-API@9a53714:src/updater/git.rs:194-295`,
+   `:892-953`); Sirius adopts only a recognizable Sirius publication by fast-forward
+   ([MASTER_REGISTRY.md](MASTER_REGISTRY.md#adopting-remote-history)).
 8. **Client authorization deviates from the original.** It fails closed, uses the Sirius header
    and table names, enforces `exp`, and uses an in-process cache instead of Redis. See
    [CLIENT_AUTH.md](CLIENT_AUTH.md#differences-from-the-original).
@@ -445,7 +451,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | `upstream` (`src/config.rs:72-97`) | all, including `anonymous_max_inflight`, `coalesce_public_reads`, `http2_keepalive_interval_ms`, `http2_keepalive_timeout_ms` and `version_max_age_seconds` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:203`, `:216`, keepalive at `:220-230` (derived by `src/config.rs:155-171`), `:266-268`, `:813`, `:1456`, `:1478`, `:1603`, version age at `:1707`, SDK proxy at `:1985-1997`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
-| `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
+| `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:210`; `src/master_git.rs:268-292`, `:870-898`; CLI subset (commit, push and, since 1.3.0, adopt with scope, `layout` and `branch` only) in [Decision 7](#decisions) |
 | `master_database`, `master_sync`, `master_notify`, `node_routing` (+ `transport`), `asset_dispatch`, `response_cache`, `tls`, `access_log`, `logging` | all, including `connection.max_read_connections` (1.2.1) | Cited in the tables above; unchanged in use since 1.2.0 |
 | `client_auth` (`src/client_auth.rs:20-48`) | all | `src/client_auth.rs:84-100`, `:132-145`, `src/client.rs:165-172` |
 | `accounts[]` (`src/accounts.rs:24-34`), `account_pool` (`:35-48`) | all, including `global_identity_file` (1.2.1) | `src/accounts.rs:81-101`, `:333-344`, `:346-429`, `:619-650`; path health since 1.3.0: `src/path_health.rs:74-83`, `src/client.rs:569-596` ([Decision 12](#decisions)) |
@@ -465,8 +471,8 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
   (`src/resources.rs`, test `catalog_hash_fetch_honors_the_overall_update_deadline`).
 - **Release smoke script:** `scripts/smoke-release.py` expected HTTP 501 for a Global profile
   lookup; Global now supports it, and without a configured account it returns 503. Updated.
-- One-shot commands honor a documented subset of the profile: `master-git-commit` and
-  `master-git-push` ([Decision 7](#decisions)); `global-account verify` uses the profile's
+- One-shot commands honor a documented subset of the profile: `master-git-commit`,
+  `master-git-push` and `master-git-adopt` ([Decision 7](#decisions)); `global-account verify` uses the profile's
   accounts, `global_login` and `upstream` but, like every one-shot command except
   `master-update` and `master-sync`, default logging (`src/main.rs:47-54`,
   [APPLICATION_LOG.md](APPLICATION_LOG.md)); `global-account bootstrap` reads no configuration
@@ -535,3 +541,7 @@ classification and evidence:
   `CLIENT_UPDATE_REQUIRED` no longer penalizes accounts. `upstream.version_max_age_seconds` is
   added to the reverse check, whose `upstream` line references are updated.
 - **Cache hits before admission:** new [Decision 15](#decisions). No field is added or changed.
+- **Master Git adoption:** [Decision 7](#decisions) adds `master-git-adopt STATE_DIR REMOTE_URL`,
+  which reads the scope, `master_git.layout` and `master_git.branch` only. The environment
+  variable list, the `master_git` reverse-check row and the one-shot finding cover it; the
+  `src/main.rs` and `src/master_git.rs` line references are refreshed. No field is added.
