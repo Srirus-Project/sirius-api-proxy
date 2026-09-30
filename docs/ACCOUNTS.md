@@ -53,8 +53,10 @@ neither does a response carrying `UNDER_MAINTENANCE` (whatever its gRPC status; 
 `maintenance`). Responses carrying `MASTER_VERSION_MISMATCH` or `CLIENT_UPDATE_REQUIRED`, on
 the request or on the identity check before private data, do not count either, whatever their
 gRPC status: they describe the proxy's version headers, not the account (see
-[version header freshness](REQUEST_POLICY.md#version-header-freshness)). gRPC 7 or 16 with any
-other code, or none, still disables the account. Exhaustion returns 503. The failed logical request is never automatically
+[version header freshness](REQUEST_POLICY.md#version-header-freshness)). Since 1.3.0 neither does a JP
+`PLAYER_NOT_FOUND` on `profile` with gRPC 2 or 7: it names the looked-up player and answers 404
+(see [REGIONS.md](REGIONS.md)). gRPC 7 or 16 with any other code, or none, still disables the
+account. Exhaustion returns 503. The failed logical request is never automatically
 replayed with another account; a later request can select another healthy account.
 
 Response-cache hits lease no account: since 1.3.0 they are answered before account selection, are
@@ -209,7 +211,7 @@ request that received a signal is never replayed.
 | Signal | Effect |
 | --- | --- |
 | `TOKEN_*`, or gRPC 16 without a code | Drop the session; the next request runs `cache.login` and PlayerLogin again |
-| `PLAYER_NOT_*` | Drop the session; the next request runs PlayerLogin again |
+| `PLAYER_NOT_*`, except `PLAYER_NOT_FOUND` on `profile`/`event_deck` (the looked-up player: 404, session kept) | Drop the session; the next request runs PlayerLogin again |
 | A second `TOKEN_*`/`PLAYER_NOT_*`/16 before any successful call | Disable the account |
 | `CONCURRENT_DEVICE` | Drop the session and cool down for `cooldown_seconds`; the `concurrent_device_limit`-th signal in 24 h disables |
 | `BAN_*` | Disable the account |

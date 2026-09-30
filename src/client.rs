@@ -28,12 +28,23 @@ use crate::{
     path_health::{Outcome, PathHealth, Ticket},
 };
 
-/// Global `PLAYER_NOT_FOUND` on a lookup of another player names the target, not the account's
-/// own player: it must not drop the session or count toward disabling the account.
-fn target_not_found(route: &str, response: &Result<Value, AppError>, code: Option<&str>) -> bool {
-    matches!(route, PROFILE | EVENT_DECK)
-        && matches!(response, Err(AppError::Grpc(_)))
-        && code == Some("PLAYER_NOT_FOUND")
+/// `PLAYER_NOT_FOUND` on a lookup of another player names the target, not the account's own
+/// player: it must not drop the session or count toward disabling the account. Global: live
+/// (2026-09-27) on profile and event_deck, any gRPC status. JP: static evidence only (iOS 1.0.3
+/// client): FindByProfileID is the read whose wrapper expects PLAYER_NOT_FOUND, and the client
+/// reads application codes only on gRPC 2 or 7.
+pub(crate) fn target_not_found(
+    global: bool,
+    route: &str,
+    response: &Result<Value, AppError>,
+    code: Option<&str>,
+) -> bool {
+    let matched = if global {
+        matches!(route, PROFILE | EVENT_DECK) && matches!(response, Err(AppError::Grpc(_)))
+    } else {
+        route == PROFILE && matches!(response, Err(AppError::Grpc(2 | 7)))
+    };
+    matched && code == Some("PLAYER_NOT_FOUND")
 }
 pub(crate) fn authenticated(route: &str) -> bool {
     matches!(
@@ -1190,9 +1201,9 @@ impl GameClient {
                     let (response, code) = self
                         .execute_once(&protocol, route, input, auth.as_ref(), deadline)
                         .await;
-                    if global && target_not_found(route, &response, code.as_deref()) {
+                    if target_not_found(global, route, &response, code.as_deref()) {
                         // The session worked; the looked-up player does not exist on this
-                        // server (including players of another Global region).
+                        // server (on Global including players of another region).
                         (Err(AppError::NotFound), None)
                     } else {
                         (response, code)

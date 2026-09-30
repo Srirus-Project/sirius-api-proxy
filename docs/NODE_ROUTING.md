@@ -55,7 +55,7 @@ observation answers every joined request (see
 [shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)). This is not hedging: no
 extra request is sent.
 
-Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a Global
+Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a
 looked-up player that does not exist) are terminal rather than presumed target failures. A peer
 reports maintenance as its gRPC status plus `observation.maintenance` (describing that call); the
 caller answers 503 `maintenance` (a 1.2.3 caller answers 502), so the wire format is unchanged.

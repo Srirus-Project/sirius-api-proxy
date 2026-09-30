@@ -503,6 +503,14 @@ These generic capabilities are intentionally not restored in their original form
    single-profile, multi-region and registry servers (`src/registry_service.rs`). The body is
    exactly `status`, `service`, `version` and `uptime_secs`: no wall-clock start time and no
    readiness, account, Master or upstream state. No field is added.
+22. **JP `PLAYER_NOT_FOUND` answers 404 only on `profile`, on gRPC 2 or 7, from static
+   evidence.** The original passes the upstream status and body through to the caller
+   (`Haruki-Sekai-API@9a53714:src/api/apis.rs:57-69`). Sirius never echoes upstream bodies or
+   `grpc-message`; it maps a proven code to its own 404 `not_found` without an account penalty
+   (`src/client.rs` `target_not_found`). No JP account exists for a live test, so the JP scope is
+   what the iOS 1.0.3 client proves: FindByProfileID expects the code, which names the target,
+   and the client reads codes only on gRPC 2 or 7. JP `event_deck`, gRPC 3/5 and
+   `PLAYER_NOT_EXISTS` are not mapped (see [REGIONS.md](REGIONS.md)). No configuration surface.
 
 ## Original fields that were ignored by the original itself
 

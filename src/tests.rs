@@ -2657,6 +2657,178 @@ async fn maintenance_answers_503_with_a_code_and_never_penalizes_accounts() {
         Err(AppError::AccountUnavailable)
     ));
 }
+/// A trailers-only JP error with an application code and a grpc-message that must not leak.
+fn application_error_reply(grpc_status: &str, code: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-status", grpc_status.parse().unwrap());
+    reply
+        .trailers
+        .insert("grpc-message", "secret%20must-not-leak".parse().unwrap());
+    if !code.is_empty() {
+        reply
+            .trailers
+            .insert("x-sirius-error-code", code.parse().unwrap());
+    }
+    reply
+}
+fn strict_single_account_config() -> Config {
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg.account_pool.failure_threshold = 1;
+    cfg.account_pool.cooldown_seconds = 60;
+    cfg
+}
+#[tokio::test]
+async fn jp_looked_up_player_not_found_answers_404_and_keeps_the_account() {
+    // Static evidence (iOS 1.0.3): FindByProfileID expects PLAYER_NOT_FOUND about the target,
+    // and the client reads application codes only on gRPC 2 or 7.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+        application_error_reply("7", "PLAYER_NOT_FOUND"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+                .await,
+            Err(AppError::NotFound)
+        ));
+        let status = c.account_status().unwrap();
+        assert_eq!(status["accounts"][0]["disabled"], false);
+        assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    }
+    // gRPC 7 with the code did not disable the account.
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+
+    // Over HTTP: the plain 404 body, without the gRPC status or the upstream message.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let app = api::router(
+        client(&f, strict_single_account_config()),
+        "api".into(),
+        "internal".into(),
+    );
+    let r = app
+        .oneshot(
+            Request::get("/api/v1/players/by-profile-id/1")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert!(!format!("{:?}", r.headers()).contains("must-not-leak"));
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&bytes).contains("must-not-leak"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":"not found","code":"not_found"})
+    );
+
+    // A JP peer executor answers the typed, terminal not_found kind.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(
+        c.peer_identity().unwrap(),
+        json!({"type":"profile","profile_id":1}),
+    );
+    let response = peer_send(app, "peer", request).await;
+    assert_eq!(response.status(), 200);
+    let reply = body(response).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"not_found"}})
+    );
+    assert!(!reply.to_string().contains("must-not-leak"));
+}
+#[tokio::test]
+async fn jp_player_not_found_outside_the_proven_case_is_unchanged() {
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("5", "PLAYER_NOT_FOUND"),
+        application_error_reply("2", "PLAYER_NOT_EXISTS"),
+        application_error_reply("2", ""),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+        application_error_reply("13", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    assert!(matches!(profile().await, Err(AppError::Grpc(5))));
+    assert!(matches!(profile().await, Err(AppError::Grpc(2))));
+    assert!(matches!(profile().await, Err(AppError::Grpc(2))));
+    // JP event_deck: the client expects no application code there, so it stays 502.
+    assert!(matches!(
+        c.call(
+            crate::client::EVENT_DECK,
+            json!({"eventId":"1","playerId":"player-42"})
+        )
+        .await,
+        Err(AppError::Grpc(2))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    // Other statuses keep today's account handling.
+    assert!(matches!(profile().await, Err(AppError::Grpc(13))));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        1
+    );
+}
+#[test]
+fn target_not_found_is_region_route_status_and_code_specific() {
+    use crate::client::{target_not_found, EVENT_DECK, PLAYER_DATA, PROFILE, WHOAMI};
+    let grpc = |status| Err(AppError::Grpc(status));
+    let code = Some("PLAYER_NOT_FOUND");
+    for route in [PROFILE, EVENT_DECK] {
+        for status in [2, 5, 7] {
+            assert!(target_not_found(true, route, &grpc(status), code));
+        }
+    }
+    assert!(target_not_found(false, PROFILE, &grpc(2), code));
+    assert!(target_not_found(false, PROFILE, &grpc(7), code));
+    for status in [3, 5, 13, 14, 16] {
+        assert!(!target_not_found(false, PROFILE, &grpc(status), code));
+    }
+    assert!(!target_not_found(false, EVENT_DECK, &grpc(2), code));
+    for global in [true, false] {
+        for route in [PROFILE, EVENT_DECK, WHOAMI, PLAYER_DATA] {
+            for response in [
+                Err(AppError::Maintenance(2)),
+                Err(AppError::Timeout),
+                Ok(json!({})),
+            ] {
+                assert!(!target_not_found(global, route, &response, code));
+            }
+            for other in [None, Some("PLAYER_NOT_EXISTS")] {
+                assert!(!target_not_found(global, route, &grpc(2), other));
+            }
+        }
+        for route in [WHOAMI, PLAYER_DATA] {
+            assert!(!target_not_found(global, route, &grpc(2), code));
+        }
+    }
+}
 #[test]
 fn every_error_has_a_stable_code_and_json_body() {
     use axum::response::IntoResponse;

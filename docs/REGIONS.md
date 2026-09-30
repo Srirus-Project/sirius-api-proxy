@@ -77,6 +77,15 @@ Notes:
 - `PLAYER_NOT_FOUND` on `profile` or `event_deck` names the looked-up player: the proxy answers
   404 and keeps the account session. On any other operation it still means the account's own
   player and triggers a new PlayerLogin.
+- JP (since 1.3.0): only `profile` answers 404, and only when `PLAYER_NOT_FOUND` comes with
+  gRPC 2 or 7; the account is not penalized. The evidence is static, from the iOS 1.0.3 (10042)
+  client: it maps `x-sirius-error-code` `PLAYER_NOT_FOUND` to its friend-player-not-found error,
+  only the FindByProfileID, friend-request withdrawal, unlink and report wrappers (each taking a
+  target player) expect it, and it reads application codes only on gRPC 2 or 7. It is not
+  live-verified because no JP account exists. Any other status stays 502. JP `event_deck` stays
+  502 because its client wrapper expects no code; whether the JP server sends
+  `PLAYER_NOT_FOUND` there is not proven either way, so gRPC 7 on it still disables the account
+  as any gRPC 7 does. `PLAYER_NOT_EXISTS` is a different code and is not mapped.
 - The client's descriptor names `ServerInfo` field 8 `areaID`. The proxy validates it by field
   number and keeps publishing it as `areaId` in `/api/v1/servers`.
 - `GetPlayerData` responses include the Global-only fields `chatReportUsedToday` and `roomIds`.

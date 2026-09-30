@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- JP `profile` lookups answering gRPC 2 or 7 with `x-sirius-error-code: PLAYER_NOT_FOUND` now
+  return 404 `not_found` and leave the account alone, as Global has since 1.2.2. They used to
+  answer 502, and on gRPC 7 the JP account was disabled. The evidence is static (the iOS 1.0.3
+  client), not a live test; JP `event_deck`, other statuses and `PLAYER_NOT_EXISTS` are
+  unchanged. A JP executor now emits the terminal peer kind `not_found`, which callers parse
+  since 1.2.2; no wire-format change.
 - `/health` (single-profile, multi-region and registry servers) adds `uptime_secs`: whole
   seconds since the process entered `main()`, on a monotonic clock, reset on restart. The key is
   additive and `/health` stays liveness only, with no readiness, account or upstream data.
