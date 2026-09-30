@@ -143,7 +143,7 @@ without echoing the input.
 | `upstream_timeout` / `upstream_transport` / `upstream_proxy` / `upstream_protocol` | 504 / 502 | Upstream call failed |
 | `account_unavailable` | 503 | No game account is configured or healthy |
 | `upstream_unavailable` | 503 | The region's game path (or Global SDK path) is failing; refused before contacting it, retry shortly |
-| `node_unavailable`, `peer_account_unavailable`, `snapshot_unavailable`, `master_unavailable`, `auth_unavailable` | 503 | Dependency temporarily unavailable |
+| `node_unavailable`, `peer_account_unavailable`, `snapshot_unavailable`, `master_unavailable`, `auth_unavailable` | 503 | Dependency temporarily unavailable; Master table reads also answer `master_unavailable` after 5 s under load ([admission](docs/MASTER_REGISTRY.md#table-read-admission)), retry later |
 | `not_found` | 404 | Unknown route, Master item or looked-up player |
 | `invalid_request` | 400 (422 for a well-formed JSON body of the wrong shape) | Rejected input |
 | `method_not_allowed`, `payload_too_large`, `unsupported_media_type` | 405, 413, 415 | Framework rejections |

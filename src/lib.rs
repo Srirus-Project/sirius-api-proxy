@@ -74,4 +74,6 @@ pub mod registry_service;
 
 mod master_bundle;
 
+mod master_admission;
+
 pub mod registry_owner;

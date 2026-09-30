@@ -569,6 +569,19 @@ These generic capabilities are intentionally not restored in their original form
    unindexed tables are parsed again. This is the trust the `/master-data` current read already
    extends; pinned, bundle, Git and database reads still reject invalid JSON. No configuration
    surface.
+27. **Table reads are admitted through a fixed gate with its own wait.** The original holds at
+   most `READ_CONCURRENCY = 16` blob responses at once, the permit travelling with the body, and
+   takes the read slot inside the 2 s database budget, behind a breaker with a disk fallback
+   (`Haruki-Sekai-API@9a53714:src/registry/blobs.rs:22-27`, `:64-85`, `:487-509`). Sirius admits
+   every Master table read, file or database, proxy or standalone registry, through 16
+   process-wide permits (`src/master_admission.rs`). A read waits in FIFO order for up to 5 s
+   and then answers the existing 503 `master_unavailable`; a 200 keeps its permit until the body
+   is sent or dropped, and a 304 or error releases it at once. Differences: the wait is its own
+   budget before the database read deadline (Decision 17), not shared with it, because file
+   reads have no database budget; there is no breaker or disk fallback (Sirius backends never
+   fall back to each other); manifests, history and bundles are not admitted, bundles keeping
+   their own two permits. The count and wait are fixed like the bundle gate, and no `Retry-After`
+   is sent, because `master_sync` does not read it. No configuration surface.
 
 ## Original fields that were ignored by the original itself
 
@@ -725,3 +738,5 @@ classification and evidence:
   `Sirius-Content-SHA256` trailer; no field is added.
 - **JSON validation:** new [Decision 26](#decisions). Unchanged polls trust the snapshot index
   (size + SHA-256) instead of reparsing JSON; serving reads still validate. No field is added.
+- **Table read admission:** new [Decision 27](#decisions). Master table reads pass 16 fixed
+  process-wide permits with a 5 s wait; no field is added.

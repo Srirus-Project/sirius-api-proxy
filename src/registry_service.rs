@@ -56,6 +56,16 @@ impl Config {
         yaml_serde::from_slice(&bytes).map_err(|_| invalid())
     }
     pub fn prepare(&self) -> Result<Prepared, AppError> {
+        self.prepare_with(crate::master_admission::Gate::tables())
+    }
+    #[cfg(test)]
+    pub(crate) fn prepare_with_table_gate(
+        &self,
+        gate: crate::master_admission::Gate,
+    ) -> Result<Prepared, AppError> {
+        self.prepare_with(gate)
+    }
+    fn prepare_with(&self, tables: crate::master_admission::Gate) -> Result<Prepared, AppError> {
         if !self.scope.region.master_supported()
             || self.scope.environment.is_empty()
             || self.scope.environment.len() > 256
@@ -196,6 +206,7 @@ impl Config {
             backend,
             owner: owner.clone(),
             notify_status: self.notify.as_ref().map(|_| notify_status.clone()),
+            tables,
         });
         let notifier = targets.map(|(targets, interval)| Notifier {
             targets,
@@ -284,6 +295,8 @@ struct Service {
     backend: Source,
     owner: Option<Arc<crate::registry_owner::Worker>>,
     notify_status: Option<Arc<tokio::sync::RwLock<Value>>>,
+    /// Admission for the table route; bundle loads stay under the bundle gate.
+    tables: crate::master_admission::Gate,
 }
 enum Selection {
     Current,
@@ -303,11 +316,18 @@ fn db_error(e: db::Error) -> AppError {
         _ => AppError::MasterUnavailable,
     }
 }
+fn invalid_table(snapshot: &str, name: &str, hash: &str) -> bool {
+    !registry::valid_history_cursor(snapshot)
+        || !crate::master::safe_component(name)
+        || !registry::hash_valid(hash)
+}
 impl Service {
+    /// `hold` keeps a table admission until the read finishes, even if the caller is cancelled.
     async fn document(
         &self,
         selection: Selection,
         table: Option<(String, String)>,
+        hold: Option<crate::master_admission::Admission>,
     ) -> Result<registry::Document, AppError> {
         if match &selection {
             Selection::Hash(h) => !registry::hash_valid(h),
@@ -322,16 +342,21 @@ impl Service {
             Source::Files(root) => {
                 let root = root.clone();
                 let scope = self.scope.clone();
-                tokio::task::spawn_blocking(move || match (selection, table) {
-                    (Selection::Snapshot(id), Some((name, hash))) => {
-                        registry::table(&root, scope.region, &id, &name, &hash)
+                tokio::task::spawn_blocking(move || {
+                    let _hold = hold;
+                    match (selection, table) {
+                        (Selection::Snapshot(id), Some((name, hash))) => {
+                            registry::table(&root, scope.region, &id, &name, &hash)
+                        }
+                        (Selection::Snapshot(id), None) => {
+                            registry::manifest(&root, Some(&id), scope)
+                        }
+                        (Selection::Hash(hash), None) => {
+                            registry::manifest_by_hash(&root, scope, &hash)
+                        }
+                        (Selection::Current, None) => registry::manifest(&root, None, scope),
+                        _ => Err(crate::master::MasterError::Format),
                     }
-                    (Selection::Snapshot(id), None) => registry::manifest(&root, Some(&id), scope),
-                    (Selection::Hash(hash), None) => {
-                        registry::manifest_by_hash(&root, scope, &hash)
-                    }
-                    (Selection::Current, None) => registry::manifest(&root, None, scope),
-                    _ => Err(crate::master::MasterError::Format),
                 })
                 .await
                 .map_err(|_| AppError::MasterUnavailable)?
@@ -376,44 +401,49 @@ impl Service {
         }
     }
 }
+/// Manifest reads; tables go through `table` and its admission.
 async fn respond(
     s: Arc<Service>,
     selection: Selection,
-    table: Option<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let pinned = table.is_some();
-    crate::api::registry_document(s.document(selection, table).await?, headers, pinned)
+    crate::api::registry_document(s.document(selection, None, None).await?, headers, false)
 }
 async fn current(State(s): State<Arc<Service>>, headers: HeaderMap) -> Result<Response, AppError> {
-    respond(s, Selection::Current, None, headers).await
+    respond(s, Selection::Current, headers).await
 }
 async fn by_hash(
     State(s): State<Arc<Service>>,
     Path(hash): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    respond(s, Selection::Hash(hash), None, headers).await
+    respond(s, Selection::Hash(hash), headers).await
 }
 async fn snapshot_manifest(
     State(s): State<Arc<Service>>,
     Path(snapshot): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    respond(s, Selection::Snapshot(snapshot), None, headers).await
+    respond(s, Selection::Snapshot(snapshot), headers).await
 }
 async fn table(
     State(s): State<Arc<Service>>,
     Path((snapshot, table, hash)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    respond(
-        s,
-        Selection::Snapshot(snapshot),
-        Some((table, hash)),
-        headers,
-    )
-    .await
+    // Malformed requests never queue for admission.
+    if invalid_table(&snapshot, &table, &hash) {
+        return Err(AppError::InvalidRequest);
+    }
+    let admission = s.tables.admit().await?;
+    let doc = s
+        .document(
+            Selection::Snapshot(snapshot),
+            Some((table, hash)),
+            Some(admission.clone()),
+        )
+        .await?;
+    Ok(admission.attach(crate::api::registry_document(doc, headers, true)?))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -490,7 +520,7 @@ async fn bundle(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let permit = crate::master_bundle::permit()?;
-    let document = s.document(selection, None).await?;
+    let document = s.document(selection, None, None).await?;
     let manifest: registry::PublishedManifest =
         serde_json::from_slice(&document.bytes).map_err(|_| AppError::MasterUnavailable)?;
     let snapshot = manifest.snapshot.clone();
@@ -507,9 +537,13 @@ async fn bundle(
                     .strip_suffix(".json")
                     .ok_or(AppError::MasterUnavailable)?
                     .to_owned();
-                s.document(Selection::Snapshot(snapshot), Some((name, file.sha256)))
-                    .await
-                    .map(|d| d.bytes)
+                s.document(
+                    Selection::Snapshot(snapshot),
+                    Some((name, file.sha256)),
+                    None,
+                )
+                .await
+                .map(|d| d.bytes)
             }
         },
         permit,
@@ -580,7 +614,10 @@ pub struct Notifier {
 }
 impl Notifier {
     async fn served_hash(&self) -> Result<String, AppError> {
-        let document = self.service.document(Selection::Current, None).await?;
+        let document = self
+            .service
+            .document(Selection::Current, None, None)
+            .await?;
         let manifest: registry::PublishedManifest =
             serde_json::from_slice(&document.bytes).map_err(|_| AppError::MasterUnavailable)?;
         Ok(manifest.content_sha256)

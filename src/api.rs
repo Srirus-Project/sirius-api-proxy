@@ -214,6 +214,7 @@ async fn protocol_reload(
 
 /// CURRENT-relative reads revalidate with a content ETag. Integrity, region and table
 /// checks all run before the conditional match, so corruption answers 503, never 304.
+/// Table reads (not the status document) pass the table read admission first.
 async fn master_document(
     c: Arc<GameClient>,
     table: Option<String>,
@@ -224,7 +225,13 @@ async fn master_document(
         .ok_or(AppError::MasterUnavailable)?
         .to_path_buf();
     let region = c.region();
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
+    let held = admission.clone();
     let document = tokio::task::spawn_blocking(move || {
+        let _held = held;
         crate::master::read_current_in(&directory, table.as_deref(), region)
     })
     .await
@@ -242,6 +249,7 @@ async fn master_document(
         headers,
         false,
     )
+    .map(|response| crate::master_admission::attach(admission, response))
 }
 async fn master_status(
     State(c): State<Arc<GameClient>>,
@@ -517,17 +525,25 @@ async fn registry_response(
         platform: c.platform(),
     };
     let pinned = table.is_some();
-    let document = tokio::task::spawn_blocking(move || match table {
-        Some((table, hash)) => crate::master_registry::table(
-            &root,
-            scope.region,
-            snapshot
-                .as_deref()
-                .ok_or(crate::master::MasterError::Format)?,
-            &table,
-            &hash,
-        ),
-        None => crate::master_registry::manifest(&root, snapshot.as_deref(), scope),
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
+    let held = admission.clone();
+    let document = tokio::task::spawn_blocking(move || {
+        let _held = held;
+        match table {
+            Some((table, hash)) => crate::master_registry::table(
+                &root,
+                scope.region,
+                snapshot
+                    .as_deref()
+                    .ok_or(crate::master::MasterError::Format)?,
+                &table,
+                &hash,
+            ),
+            None => crate::master_registry::manifest(&root, snapshot.as_deref(), scope),
+        }
     })
     .await
     .map_err(|_| AppError::MasterUnavailable)?
@@ -536,6 +552,7 @@ async fn registry_response(
         _ => AppError::MasterUnavailable,
     })?;
     registry_document(document, headers, pinned)
+        .map(|response| crate::master_admission::attach(admission, response))
 }
 pub(crate) fn registry_document(
     document: crate::master_registry::Document,
@@ -709,6 +726,11 @@ async fn database_response(
     let reader = c
         .master_database_reader()
         .ok_or(AppError::MasterUnavailable)?;
+    // The admission wait precedes the read deadline: worst case is both budgets in turn.
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
     let doc = reader
         .document(&database_scope(&c), hash.as_deref(), table.as_deref())
         .await
@@ -716,6 +738,7 @@ async fn database_response(
     // Manifests contain the first local snapshot UUID for retained content. Retention
     // may permit later re-publication with another UUID, so only exact tables are immutable.
     registry_document(doc, headers, table.is_some())
+        .map(|response| crate::master_admission::attach(admission, response))
 }
 async fn database_current(
     State(c): State<Arc<GameClient>>,

@@ -173,6 +173,10 @@ weak (`W/"<hash>"`); weak `If-None-Match` values still match.
 
 A missing/pruned hash or unlisted table is 404. Missing configured database, connection failure,
 missing listed table, oversized or corrupt content is 503. There is no fallback to local files.
+A table read that cannot be admitted within 5 s (see
+[table read admission](MASTER_REGISTRY.md#table-read-admission)) is also 503. That wait comes
+before the read deadline, so a table read can take up to 5 s plus `read_timeout_seconds`;
+manifest and history reads are not admitted and keep the read deadline alone.
 Manifest/table reads share a repeatable-read, read-only transaction, preventing retention or
 current-pointer changes from mixing versions within a response. Manifest and payload reads are
 bounded to 1 MiB and 64 MiB respectively on the database side before allocating response bytes.

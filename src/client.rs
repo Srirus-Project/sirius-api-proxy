@@ -173,6 +173,8 @@ pub struct GameClient {
     path: PathHealth,
     /// Global: health of the SDK login path (present with `sdk`).
     sdk_path: Option<PathHealth>,
+    /// Master table read admission, shared by every region of the process.
+    table_reads: crate::master_admission::Gate,
 }
 /// One upstream attempt on a path. Its outcome is recorded when it is dropped, so an attempt
 /// abandoned at the logical deadline still counts as a timeout; one cancelled earlier, or never
@@ -341,7 +343,11 @@ impl GameClient {
             sdk,
             path,
             sdk_path,
+            table_reads: crate::master_admission::Gate::tables(),
         }))
+    }
+    pub(crate) fn table_reads(&self) -> &crate::master_admission::Gate {
+        &self.table_reads
     }
     pub(crate) fn client_auth(&self) -> Option<&crate::client_auth::Authenticator> {
         self.client_auth.as_ref()
@@ -361,6 +367,10 @@ impl GameClient {
     #[cfg(test)]
     pub(crate) fn set_test_timeout(client: &mut Arc<Self>, duration: Duration) {
         Arc::get_mut(client).unwrap().timeout = duration;
+    }
+    #[cfg(test)]
+    pub(crate) fn set_test_table_gate(client: &mut Arc<Self>, gate: crate::master_admission::Gate) {
+        Arc::get_mut(client).unwrap().table_reads = gate;
     }
     /// Moves the version freshness deadline and the refresh retry window `by` into the past.
     #[cfg(test)]

@@ -14981,6 +14981,312 @@ async fn master_bundle_file_http_auth_pinned_hash_conditional_and_corruption() {
     }
 }
 
+/// A proxy router over `registry_fixture()` whose table reads use `gate`.
+async fn table_admission_proxy(
+    gate: crate::master_admission::Gate,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+    axum::Router,
+    Fixture,
+) {
+    let (root, _input, output, receipt) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let mut c = client(&f, cfg);
+    GameClient::set_test_table_gate(&mut c, gate);
+    let app = api::router(c, "api".into(), "internal".into());
+    let manifest = crate::master_registry::manifest(&output, None, registry_scope()).unwrap();
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&manifest.bytes).unwrap();
+    let pinned = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        receipt.snapshot, manifest.files[0].sha256
+    );
+    (root, output.join(receipt.snapshot), pinned, app, f)
+}
+fn table_admission_get(path: &str, token: &str, etag: Option<&str>) -> Request<axum::body::Body> {
+    let mut request = Request::get(path).header("authorization", format!("Bearer {token}"));
+    if let Some(etag) = etag {
+        request = request.header("if-none-match", etag);
+    }
+    request.body(axum::body::Body::empty()).unwrap()
+}
+const TABLE_ADMISSION_CURRENT: &str = "/api/v1/master-data/tables/MasterFixture";
+#[tokio::test]
+async fn master_table_admission_saturation_rejects_tables_but_serves_manifests() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, snapshot, pinned, app, f) = table_admission_proxy(gate.clone()).await;
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    assert_eq!(gate.available(), 0);
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let started = std::time::Instant::now();
+        let (status, headers, bytes) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 503, "{path}");
+        assert!(started.elapsed() >= Duration::from_millis(50), "{path}");
+        assert!(headers.get("etag").is_none());
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "master_unavailable");
+    }
+    let snapshot_manifest = format!(
+        "/api/v1/master-data/snapshots/{}/manifest",
+        snapshot.file_name().unwrap().to_str().unwrap()
+    );
+    for path in [
+        "/api/v1/master-data/manifest",
+        "/api/v1/master-data",
+        "/api/v1/master-data/history",
+        snapshot_manifest.as_str(),
+    ] {
+        assert_eq!(
+            conditional_get(&app, path, "api", None).await.0,
+            200,
+            "{path}"
+        );
+    }
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    assert_eq!(gate.available(), 1);
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        assert_eq!(conditional_get(&app, path, "api", None).await.0, 200);
+        assert_eq!(gate.available(), 1);
+    }
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn master_table_admission_releases_on_304_error_and_disconnect() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let (status, headers, _) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 200);
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+        let unchanged = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", Some(&etag)))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), 304, "{path}");
+        assert_eq!(gate.available(), 1, "{path}");
+        // A dropped 200 (client disconnect or HEAD) releases with its body.
+        let full = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(full.status(), 200);
+        assert_eq!(gate.available(), 0);
+        drop(full);
+        assert_eq!(gate.available(), 1);
+    }
+    let missing = app
+        .clone()
+        .oneshot(table_admission_get(
+            "/api/v1/master-data/tables/MasterMissing",
+            "api",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    assert_eq!(gate.available(), 1);
+    std::fs::write(snapshot.join("MasterFixture.json"), b"[]").unwrap();
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let corrupt = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), 503, "{path}");
+        assert_eq!(gate.available(), 1, "{path}");
+    }
+}
+#[tokio::test]
+async fn master_table_admission_keeps_content_length() {
+    use axum::body::HttpBody;
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, _snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let fixture = include_bytes!("../tests/fixtures/master-synthetic.json");
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let response = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.body().size_hint().exact(),
+            Some(fixture.len() as u64),
+            "{path}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), fixture);
+        assert_eq!(gate.available(), 1);
+    }
+}
+#[tokio::test]
+async fn master_table_admission_waits_fifo_before_rejecting() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_secs(2));
+    let (_root, _snapshot, _pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    let waiting = tokio::spawn(app.clone().oneshot(table_admission_get(
+        TABLE_ADMISSION_CURRENT,
+        "api",
+        None,
+    )));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(gate.available(), 0);
+    drop(response);
+    assert_eq!(gate.available(), 1);
+}
+#[tokio::test]
+async fn master_table_admission_cancelled_request_releases_permit() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_secs(2));
+    let (_root, _snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let released = |gate: crate::master_admission::Gate| async move {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.available() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    // Cancelled during the read: a still-running blocking read may hold the permit briefly.
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let task = tokio::spawn(app.clone().oneshot(table_admission_get(path, "api", None)));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        released(gate.clone()).await;
+    }
+    // Cancelled while queued: the abandoned waiter never takes a permit.
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    let task = tokio::spawn(app.clone().oneshot(table_admission_get(
+        TABLE_ADMISSION_CURRENT,
+        "api",
+        None,
+    )));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    task.abort();
+    let _ = task.await;
+    drop(held);
+    released(gate.clone()).await;
+    assert_eq!(
+        conditional_get(&app, TABLE_ADMISSION_CURRENT, "api", None)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(gate.available(), 1);
+}
+#[tokio::test]
+async fn registry_service_table_admission() {
+    let _guard = BUNDLE_TEST_LOCK.lock().await;
+    use crate::master_registry as registry;
+    let (_root, _input, source, _) = registry_fixture();
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let app = standalone_registry_config(source.clone())
+        .prepare_with_table_gate(gate.clone())
+        .unwrap()
+        .router;
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&source, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let table = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        manifest.snapshot, manifest.files[0].sha256
+    );
+    let token = "owner-read";
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(&table, token, None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    let etag = held.headers()["etag"].to_str().unwrap().to_owned();
+    assert_eq!(gate.available(), 0);
+    let (status, _, bytes) = conditional_get(&app, &table, token, None).await;
+    assert_eq!(status, 503);
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["code"], "master_unavailable");
+    // Malformed requests are rejected before they could queue.
+    let malformed = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/zz",
+        manifest.snapshot
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(conditional_get(&app, &malformed, token, None).await.0, 400);
+    assert!(started.elapsed() < Duration::from_millis(50));
+    let by_hash = format!(
+        "/api/v1/master-data/by-hash/{}/manifest",
+        manifest.content_sha256
+    );
+    let snapshot = format!(
+        "/api/v1/master-data/snapshots/{}/manifest",
+        manifest.snapshot
+    );
+    for path in [
+        "/api/v1/master-data/manifest",
+        "/api/v1/master-data/history",
+        by_hash.as_str(),
+        snapshot.as_str(),
+        // Bundle table loads stay under the bundle gate only.
+        "/api/v1/master-data/bundle",
+    ] {
+        assert_eq!(
+            conditional_get(&app, path, token, None).await.0,
+            200,
+            "{path}"
+        );
+    }
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    assert_eq!(gate.available(), 1);
+    let unchanged = app
+        .clone()
+        .oneshot(table_admission_get(&table, token, Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), 304);
+    assert_eq!(gate.available(), 1);
+    assert_eq!(conditional_get(&app, &table, token, None).await.0, 200);
+    assert_eq!(gate.available(), 1);
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
 async fn master_bundle_postgres_http_integrity_and_retention() {

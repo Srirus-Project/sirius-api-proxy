@@ -92,6 +92,11 @@ successful partial archive. Build work is bounded to 120 seconds after manifest 
 additional simultaneous bundle requests return 503. Temporary files and permits are dropped on
 failure, disconnect or completion, including cancellation while a bounded blocking write finishes.
 
+The table route applies the same [table read admission](MASTER_REGISTRY.md#table-read-admission)
+as the proxy: 16 process-wide permits, a FIFO wait of up to 5 s, then 503 `master_unavailable`.
+Malformed table requests are rejected before they queue. This gate is separate from the two
+bundle permits; the tables a bundle loads count only against the bundle gate.
+
 The response is never content-encoded. It includes exact Content-Length, an ETag covering the
 actual tar bytes, Master version, scoped content hash and a safe content-derived download
 filename. Bundle responses use private `no-cache`: reimporting identical file content can

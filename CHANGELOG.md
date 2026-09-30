@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Master table reads (`/master-data/tables/{name}`, `snapshots/{id}/tables/{name}/{hash}`,
+  `database/by-hash/{hash}/tables/{name}` and the standalone registry's table route) are admitted
+  through 16 process-wide permits, held until a 200 body is sent. After waiting 5 s in FIFO order
+  they answer 503 `master_unavailable`; 304s and errors release at once, Content-Length is kept,
+  and manifests, history and bundles are unaffected. No configuration.
 - Master tables are validated as JSON without building an in-memory document (the same
   accepted and rejected inputs, recursion limit, UTF-8 and number checks), which lowers
   per-read memory and CPU on registry, pinned, bundle, import and database table reads.

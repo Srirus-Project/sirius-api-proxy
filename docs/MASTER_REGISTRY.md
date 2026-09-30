@@ -90,6 +90,27 @@ identical bytes, and its 304 carries the new `x-master-version`. Legacy snapshot
 reads; consumers that need a consistent set must pin the manifest and must not combine it with
 CURRENT-relative table reads.
 
+### Table read admission
+
+Every table read loads, hashes and checks the whole file before answering, then keeps its bytes
+until the client has received them. Table reads therefore pass a fixed admission gate:
+`/master-data/tables/{name}`, `/master-data/snapshots/{id}/tables/{name}/{hash}`,
+`/master-data/database/by-hash/{hash}/tables/{name}` and the standalone registry's table route.
+One proxy process has 16 permits shared by all its regions; a standalone registry process has
+its own 16. A read that finds none waits in FIFO order for up to 5 s and then answers 503
+`master_unavailable`, logged at most once a minute as `master_read_busy` so operators can tell
+it from an integrity 503. A 200 keeps its permit until the body is sent or the client
+disconnects; a 304 or an error releases it at once. Content-Length is unchanged.
+
+This bounds decoded table bytes held for reads and responses to about 24 MB with real tables of
+about 1.5 MB, 16 × 64 MiB in theory. Slow or stalled authenticated clients hold their permits
+while they read, so 16 of them can make other table reads wait and fail; there is no send
+timeout. Manifests, `/master-data`, history and bundles are not admitted here (bundles keep
+their own two permits), including a legacy snapshot without `tables.json`, whose manifest
+reads every table; reimport it to write the index. The built-in consumer fetches one table at a
+time, so it uses at most one permit, and the wait absorbs short bursts that would otherwise fail
+its cycle. Nothing is configurable and no `Retry-After` is sent.
+
 ## Local integrity and older snapshots
 
 New local imports and CDN updates stage `tables.json` alongside the source manifest, receipt
