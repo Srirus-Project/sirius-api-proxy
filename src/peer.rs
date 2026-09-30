@@ -176,6 +176,7 @@ async fn query(
     }
     let (route, input) = request.operation.rpc()?;
     let identity = client.peer_identity()?;
+    let mut maintenance = None;
     let outcome = if identity != request.identity {
         Outcome::Failure {
             kind: Failure::IdentityMismatch {},
@@ -194,9 +195,18 @@ async fn query(
                 }
                 Outcome::Success { data }
             }
-            Err(error) => Outcome::Failure { kind: error.into() },
+            Err(error) => {
+                maintenance = Some(matches!(error, AppError::Maintenance(_)));
+                Outcome::Failure { kind: error.into() }
+            }
         }
     };
+    // The shared observation may already reflect a later call; a failure's maintenance flag must
+    // describe this call, because 1.2.4 callers map it to 503 `maintenance`.
+    let mut observation = client.observation().await;
+    if let Some(maintenance) = maintenance {
+        observation.maintenance = maintenance;
+    }
     // Echo requested identity to bind replies; failure does not claim acceptance.
     Ok((
         StatusCode::OK,
@@ -204,7 +214,7 @@ async fn query(
             request_id: request.request_id,
             identity: request.identity,
             outcome,
-            observation: client.observation().await,
+            observation,
         }),
     ))
 }

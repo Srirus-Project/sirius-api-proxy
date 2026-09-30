@@ -71,17 +71,33 @@ impl Default for Network {
     }
 }
 /// The written fields of a `network` block; the rest come from the context's defaults.
+/// A written value must be present: `attempts: ~` is an error, not the default.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PartialNetwork {
+    #[serde(default, deserialize_with = "present")]
     connect_timeout_ms: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
     request_timeout_ms: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
     update_timeout_seconds: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
     attempts: Option<usize>,
+    #[serde(default, deserialize_with = "present")]
     retry_delay_ms: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
     max_retry_delay_ms: Option<u64>,
+    #[serde(default)]
     proxy_url_env: Option<String>,
+    #[serde(default)]
     proxy_authorization_env: Option<String>,
+}
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 impl PartialNetwork {
     fn over(self, base: Network) -> Network {
@@ -109,11 +125,11 @@ impl<'de> serde::Deserialize<'de> for Network {
 impl Network {
     /// Master CDN defaults. A Master update downloads every table, so like the original
     /// updater (3 attempts, `Haruki-Sekai-API@9a53714:src/updater/master.rs:22-23`) a
-    /// transient failure is retried instead of discarding the whole pass.
+    /// transient failure is retried instead of discarding the whole pass. The delays stay
+    /// those of 1.2.3 so configs that only lower `max_retry_delay_ms` remain valid.
     pub fn master() -> Self {
         Self {
             attempts: 3,
-            retry_delay_ms: 1_000,
             ..Self::default()
         }
     }

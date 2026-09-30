@@ -50,8 +50,9 @@ the router. The executing node retains its existing local anonymous retry policy
 
 Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a Global
 looked-up player that does not exist) are terminal rather than presumed target failures. A peer
-reports maintenance as its gRPC status plus `observation.maintenance`; the caller answers 503
-`maintenance` (a 1.2.3 caller answers 502), so the wire format is unchanged. Target failures increment a passive counter; after the threshold they enter
+reports maintenance as its gRPC status plus `observation.maintenance` (describing that call); the
+caller answers 503 `maintenance` (a 1.2.3 caller answers 502), so the wire format is unchanged.
+Target failures increment a passive counter; after the threshold they enter
 cooldown. An expired cooldown admits one probe while other calls use remaining targets. Successful
 execution or a valid game outcome resets the counter. Cancelling a probe releases its slot.
 Health is in-memory and resets on process restart. If every target is cooling down, the request
@@ -65,7 +66,8 @@ credential references and values are not returned. The public bearer cannot acce
 Health changes are logged once per transition, with the configured node name and the stable
 error `code` of the failure (never an origin or credential): `node_router_ready` (info, at
 startup), `node_cooldown_started` and `node_probe_failed` (warn, with `cooldown_ms`),
-`node_recovered` (info) and `node_unavailable` (warn, when no node completed a call). Every target
+`node_recovered` (info) and `node_unavailable` (warn, for each call that no node completed,
+including every call while all nodes cool down). Every target
 failure is also logged at debug as `node_target_failed` with `failover` (whether another node is
 tried).
 

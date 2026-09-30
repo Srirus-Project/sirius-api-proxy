@@ -863,6 +863,8 @@ impl GameClient {
             );
             return Err(match result {
                 Err(AppError::Timeout) => AppError::Timeout,
+                // Game-wide: not an account or node fault (the account was not penalized).
+                Err(AppError::Maintenance(status)) => AppError::Maintenance(status),
                 _ => AppError::AccountUnavailable,
             });
         };

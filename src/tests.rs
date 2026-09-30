@@ -4249,7 +4249,7 @@ fn master_network_configuration_is_bounded_and_old_yaml_keeps_defaults() {
     .unwrap();
     // Master downloads retry by default (3 attempts), also when the block is partly written.
     assert_eq!(old.network.attempts, 3);
-    assert_eq!(old.network.retry_delay_ms, 1_000);
+    assert_eq!(old.network.retry_delay_ms, 250);
     assert_eq!(old.network.update_timeout_seconds, 600);
     assert!(old.network.proxy_url_env.is_none());
     let partial: crate::config::MasterUpdateConfig = yaml_serde::from_str(
@@ -4263,6 +4263,17 @@ fn master_network_configuration_is_bounded_and_old_yaml_keeps_defaults() {
     )
     .unwrap();
     assert_eq!(single.network.attempts, 1);
+    // A 1.2.3 block that only lowers the retry cap stays valid.
+    let capped: crate::master_update::Network =
+        yaml_serde::from_str("max_retry_delay_ms: 500").unwrap();
+    assert!(capped.validate().is_ok());
+    // A written but empty value is an error, not the default.
+    for yaml in ["attempts: ~", "request_timeout_ms:"] {
+        assert!(
+            yaml_serde::from_str::<crate::master_update::Network>(yaml).is_err(),
+            "{yaml}"
+        );
+    }
     // Other network blocks (the resource snapshot `.hash` request) keep one attempt.
     let snapshot: crate::config::ResourceSnapshotConfig =
         yaml_serde::from_str("network:\n  request_timeout_ms: 5000").unwrap();
@@ -15615,6 +15626,31 @@ mod global_accounts {
             Err(AppError::Grpc(16))
         ));
         assert_eq!(status(&c)["session_state"], "relogin_pending");
+    }
+
+    #[tokio::test]
+    async fn maintenance_during_player_login_is_maintenance_not_an_account_failure() {
+        let e = env(Region::En).await;
+        e.script
+            .login_errors
+            .lock()
+            .unwrap()
+            .push_back((2, "UNDER_MAINTENANCE"));
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::Maintenance(2))
+        ));
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_ne!(s["session_state"], "cooling");
+        // Across peers it stays a game outcome, not a node fault.
+        let failure: crate::peer::Failure = AppError::Maintenance(2).into();
+        assert!(matches!(
+            failure,
+            crate::peer::Failure::Game { grpc_status: 2 }
+        ));
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
     }
 
     #[tokio::test]

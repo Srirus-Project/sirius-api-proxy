@@ -16,12 +16,12 @@ adapted rather than copied.
   rejections (malformed path, query or body, unknown route, wrong method, oversized or wrongly
   typed body) are now JSON of the same shape instead of plain text or an empty body, and never
   echo the input. Status codes are unchanged. See the code table in the README.
-- Master CDN downloads retry: `master_update.network` defaults to 3 attempts with 1 s doubling
-  backoff (was 1 attempt), including when the block is only partly written. The
+- Master CDN downloads retry: `master_update.network` defaults to 3 attempts (was 1) with the
+  unchanged 250 ms doubling backoff, including when the block is only partly written. The
   `resource_snapshot` `.hash` request keeps one attempt. `attempts: 1` restores the old behavior.
 - Asset dispatch classifies the updater's answer to a submission instead of recording every
   failed POST as `submission_ambiguous`: 429/503 (busy) resubmit with the same Idempotency-Key at
-  the next cycle, up to 10 times (`submission_refused`); 400/404/405/413/415/422, 401/403 and 409
+  the next cycle until the 10th busy answer (`submission_refused`); 400/404/405/413/415/422, 401/403 and 409
   fail at once as `submission_rejected`, `submission_unauthorized` and `idempotency_conflict`.
   These are not adoptable; fix the configuration and raise `profile_revision`. Transport errors
   and other 5xx remain ambiguous. Dispatch warnings carry `region`, `profile`, `target` (a

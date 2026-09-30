@@ -14,7 +14,7 @@ master_update:
     request_timeout_ms: 60000
     update_timeout_seconds: 600
     attempts: 3
-    retry_delay_ms: 1000
+    retry_delay_ms: 250
     max_retry_delay_ms: 5000
     # proxy_url_env: SIRIUS_MASTER_PROXY_URL
     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION
@@ -25,7 +25,8 @@ master_update:
 limited to HK/EN/KR (see [region support](REGIONS.md#cdn-authorization)).
 
 The shown values are the defaults. Since 1.2.4 a Master update makes 3 attempts per request
-(1–2 s backoff), like the original updater's Master downloads; 1.2.0–1.2.3 made one attempt.
+(250/500 ms backoff), like the original updater's Master downloads; 1.2.0–1.2.3 made one
+attempt.
 Omitted fields keep these Master defaults even when the block is partly written; set
 `attempts: 1` to restore the old behavior. The `.hash` request of `resource_snapshot.network`
 still defaults to one attempt and 250 ms.
