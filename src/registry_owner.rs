@@ -13,6 +13,10 @@ pub struct Config {
     pub internal_token_env: String,
     /// Required for PostgreSQL; file backends use their serving directory.
     pub staging_directory: Option<PathBuf>,
+    /// Retention of the directory this owner writes (the files backend directory or
+    /// `staging_directory`). Requires `source`: only synchronization writes snapshots here.
+    #[serde(default)]
+    pub retention: Option<crate::master_registry::Retention>,
 }
 pub struct Worker {
     sync: Option<Arc<master_sync::Syncer>>,
@@ -45,11 +49,24 @@ impl Worker {
         if !(60..=86400).contains(&interval) {
             return Err(AppError::Config("invalid registry publication interval"));
         }
+        if config
+            .retention
+            .is_some_and(|r| config.source.is_none() || !r.valid())
+        {
+            return Err(AppError::Config(
+                "registry owner retention requires a source and keep_snapshots 2..10000",
+            ));
+        }
         let sync = config
             .source
             .as_ref()
             .map(|source| {
-                master_sync::Syncer::standalone(source.clone(), scope.clone(), directory.clone())
+                master_sync::Syncer::standalone(
+                    source.clone(),
+                    scope.clone(),
+                    directory.clone(),
+                    config.retention,
+                )
             })
             .transpose()?;
         if directory.as_os_str().is_empty() {

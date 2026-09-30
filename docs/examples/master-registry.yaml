@@ -39,6 +39,8 @@ backend:
 #     timeout_seconds: 600
 #     request_timeout_ms: 60000
 #   staging_directory: ./registry-master # PostgreSQL only; omit for files
+#   retention: # optional; prunes the directory this owner writes (requires source)
+#     keep_snapshots: 20
 
 # For local-only publication, omit owner.source and set:
 # owner:

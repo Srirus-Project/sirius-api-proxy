@@ -83,6 +83,17 @@
   It always answers 200 without the 16-command queue, so a busy worker is distinguishable from a
   stopped one where the entry routes answer 503. No configuration is added; existing routes,
   the list's constant `status: "ready"`, the ledger and log events are unchanged.
+- Optional file snapshot retention: `master_retention.keep_snapshots` (2..10000, with
+  `master_update` or `master_sync`) and registry `owner.retention` keep the newest installations
+  along the committed chain and remove older ones after each settled update or sync pass (also
+  unchanged ones; at most 64 per pass, oldest first). The boundary is recorded in
+  `retention.json`; staging, orphan and legacy directories are never touched. Off by default:
+  nothing is deleted and no output changes unless configured.
+- Master history (and `master-db-migrate` receipts) gain `retention_boundary`, present only when
+  true, and stop there; pruned snapshots, tables, content identities and bundles answer 404.
+  Update and sync results gain `pruned_snapshots` when retention is configured. Downgrade
+  warning: after a pass has pruned, 1.2.x history, by-hash lookup and `master-db-migrate` fail on
+  the missing directories (current reads, updates and sync are unaffected).
 
 ## 1.2.4
 

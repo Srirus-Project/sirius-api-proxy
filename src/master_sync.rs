@@ -95,6 +95,7 @@ pub struct Syncer {
     output: PathBuf,
     game: Option<Arc<GameClient>>,
     gate: Mutex<()>,
+    retention: Option<master_registry::Retention>,
 }
 impl Syncer {
     pub fn new(
@@ -118,23 +119,30 @@ impl Syncer {
                 .clone()
                 .ok_or(AppError::Config("Master sync output is required"))?,
             Some(game),
+            config.master_retention,
         )
     }
-    /// Shared verified transfer engine for standalone registry owners.
+    /// Shared verified transfer engine for standalone registry owners, with the owner's own
+    /// retention of its directory (independent of the upstream owner's retention).
     pub fn standalone(
         policy: Config,
         scope: Scope,
         output: PathBuf,
+        retention: Option<master_registry::Retention>,
     ) -> Result<Arc<Self>, AppError> {
-        Self::construct(policy, scope, output, None)
+        Self::construct(policy, scope, output, None, retention)
     }
     fn construct(
         policy: Config,
         scope: Scope,
         output: PathBuf,
         game: Option<Arc<GameClient>>,
+        retention: Option<master_registry::Retention>,
     ) -> Result<Arc<Self>, AppError> {
         policy.validate()?;
+        if retention.is_some_and(|r| !r.valid()) {
+            return Err(AppError::Config("invalid Master retention"));
+        }
         if !scope.region.master_supported()
             || scope.environment.is_empty()
             || scope.environment.len() > 256
@@ -177,6 +185,7 @@ impl Syncer {
             output,
             game,
             gate: Mutex::new(()),
+            retention,
         }))
     }
     async fn download(&self, path: &str, limit: u64) -> Result<Vec<u8>, Error> {
@@ -222,7 +231,7 @@ impl Syncer {
     pub async fn update_once(&self) -> Result<Value, Error> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.timeout_seconds);
-        let result = tokio::time::timeout_at(deadline, async {
+        let mut result = tokio::time::timeout_at(deadline, async {
             let _gate = self.gate.lock().await;
             if let Some(game) = &self.game {
                 game.record_master_update(json!({"mode":"sync","status":"running"}))
@@ -232,6 +241,14 @@ impl Syncer {
         })
         .await
         .unwrap_or(Err(Error::Timeout));
+        // Retention follows the settled result, outside the sync deadline, under the gate
+        // so a concurrent pass waits instead of finding the writer lock busy.
+        if let Ok(value) = &mut result {
+            let _gate = self.gate.lock().await;
+            if let Some(pruned) = master_registry::retain(&self.output, self.retention).await {
+                value["pruned_snapshots"] = json!(pruned);
+            }
+        }
         if let Some(game) = &self.game {
             game.record_master_update(match &result {Ok(v)=>json!({"mode":"sync","status":"ready","completed_at":chrono::Utc::now(),"result":v}),Err(e)=>json!({"mode":"sync","status":"failed","error":e.to_string()})}).await;
         }

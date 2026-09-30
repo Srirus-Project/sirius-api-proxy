@@ -113,6 +113,9 @@ owner:
     request_timeout_ms: 60000
   # PostgreSQL backends require this local verified snapshot directory:
   # staging_directory: ./registry-master
+  # Optional; see "Snapshot retention" in MASTER_REGISTRY.md:
+  # retention:
+  #   keep_snapshots: 20 # 2..10000
 ```
 
 File backends synchronize into their configured serving directory and reject `staging_directory`
@@ -120,6 +123,13 @@ to avoid ambiguous ownership. PostgreSQL backends require that directory: first 
 installs a fully verified local snapshot, then it transactionally publishes to the database.
 With this worker enabled, the database role needs the writer's schema/publication permissions;
 a SELECT-only role is suitable only for a registry without an owner worker.
+
+`owner.retention` prunes the snapshots this owner's synchronization writes: the files backend's
+serving directory, or the PostgreSQL `staging_directory`. It requires `source`, because a
+local-only owner writes no snapshots, and it is independent of the upstream owner's retention.
+The PostgreSQL mirror keeps its own `keep_snapshots`, counted in distinct content hashes. After
+a files backend has been pruned, its history, lookup by content identity, bundles and pinned
+reads stop at the retention boundary, and pruned identities answer 404.
 
 Public read, internal administration and source bearer values must all differ. Database passwords
 must also differ from all three. Source transport uses verified HTTPS, no ambient proxy, no redirects

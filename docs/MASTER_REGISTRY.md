@@ -21,7 +21,9 @@ Multi-region deployments insert `{region}` after `/api/v1`, for example
 receipt (legacy receipts without a region are JP). A table identifier is the existing
 name without `.json`, for example `MasterExample`. Only names listed in the source manifest
 are served. Unsafe paths and linked snapshot/file entries are rejected. Retained snapshots
-remain addressable after a new snapshot becomes current; these endpoints do not prune history.
+remain addressable after a new snapshot becomes current; these endpoints never prune history.
+By default every snapshot is kept; optional [snapshot retention](#snapshot-retention) removes
+installations older than a configured window, after which their pinned URLs answer 404.
 
 The manifest contains schema version 1, region/environment/platform scope, snapshot identifier,
 Master version, sorted plaintext file names/sizes/SHA-256, a `content_sha256`, and the original
@@ -161,7 +163,8 @@ An invalid existing pointer/predecessor fails publication rather than silently s
 `GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
 (and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
 query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
-`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, nullable
+`has_more`, `next_before`, `legacy_boundary` and, only when true, `retention_boundary` (absent
+means false; see [snapshot retention](#snapshot-retention)). Entries include snapshot UUID, source version, nullable
 `resource_version` (the asset version in the snapshot's manifest, since 1.3.0), scoped content
 SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
 history: explicit reimports of identical content remain visible with equal content hashes;
@@ -183,8 +186,63 @@ A syntactically invalid cursor returns 400; a missing or orphan snapshot, or a c
 legacy boundary, returns 404. A cursor at the oldest entry returns an empty final page. Cursors
 are bounded to 128 characters; each request traverses at most 10,000 links, including the skipped
 prefix. Hitting that safety bound fails explicitly with 503, not a truncated success. Deep
-history indexing, external database persistence and retention/compaction remain separate work.
-Existing snapshot directories are not pruned.
+history indexing and external database persistence remain separate work. Snapshot directories
+are pruned only by the optional [snapshot retention](#snapshot-retention); traversal then stops
+at its recorded boundary with `retention_boundary: true`, and a cursor naming a pruned snapshot
+returns 404.
+
+## Snapshot retention
+
+Snapshots are kept indefinitely unless a writer is configured to prune them. A profile with
+`master_directory` and either `master_update` or `master_sync` may set:
+
+```yaml
+master_retention:
+  keep_snapshots: 20 # 2..10000
+```
+
+A standalone registry owner sets `owner.retention` instead (see
+[REGISTRY_SERVICE.md](REGISTRY_SERVICE.md)). Without a writer in the same process the field is
+rejected rather than silently ignored; `master-import` does not read configuration and never
+prunes, so the next service pass applies the policy.
+
+Retention counts installations along CURRENT's committed predecessor chain, newest first. An
+identical reimport is its own installation and counts once, unlike the PostgreSQL mirror's
+`keep_snapshots`, which counts distinct content hashes. The minimum of 2 keeps the snapshot
+CURRENT just replaced readable for pinned readers. The maximum equals the history traversal
+bound, so `master-db-migrate` can still read the whole retained window.
+
+A pass runs after each update or sync pass has settled its result, including unchanged polls, so
+enabling retention converges within one interval. It runs outside the update deadline and never
+changes the reported outcome; it takes the directory's writer lock and is skipped for that cycle
+when another writer (for example `master-import`) holds it. Update and sync results gain
+`pruned_snapshots` when retention is configured and the pass succeeded. A failed pass logs
+`master_retention_failed` and keeps what it did not remove.
+
+Before deleting anything, the pass durably writes `retention.json` in the snapshot directory,
+naming the oldest retained snapshot. Readers honour that boundary even if retention is later
+unconfigured, because older snapshots no longer exist; a malformed record fails reads with 503.
+Raising `keep_snapshots` never moves the boundary back. Candidates beyond the boundary are then
+removed oldest first, at most 64 per pass: each is renamed to `.master-pruned-*` (leaving its
+canonical path atomically) and then deleted. A rename failure (for example an open handle on
+Windows) stops the pass with the remaining candidates still reachable, to retry next cycle. A
+`.master-pruned-*` directory left by a failed deletion is unreachable and safe to delete by hand.
+
+The pass follows only the committed chain and never scans the directory: staging, download and
+sync temporaries, orphaned snapshots, legacy snapshots without a publication record, and linked
+entries are left alone (a linked candidate fails the pass before anything is removed). A chain
+that reaches a legacy snapshot inside the window prunes nothing.
+
+History, lookup by content identity, complete bundles and migration stop at the boundary; pruned
+snapshot, table, manifest and content-identity URLs answer 404. A reader walking the chain while
+a pass moves the boundary rechecks it when a directory vanishes and truncates at the boundary;
+a missing directory without that evidence still fails explicitly. A consumer, bundle stream or
+Git/database worker that pinned a snapshot fails only when two publications land during its read,
+and succeeds on its next retry.
+
+Downgrading after a pass has pruned: 1.2.x does not know `retention.json`, so its history,
+lookup by content identity and `master-db-migrate` fail on the missing predecessors. Current
+reads, manifests, tables, updates and synchronization are unaffected.
 
 ## Remaining restoration
 
@@ -273,7 +331,8 @@ Master-read bearer, and regional deployments use the corresponding regional pref
 
 The lookup pins CURRENT and walks its committed predecessor chain. It selects the newest
 matching installation, returns 404 when no reachable match exists, and stops at a legacy
-snapshot without a publication record. It does not scan unrelated directories, so a staged
+snapshot without a publication record or at the [retention](#snapshot-retention) boundary (a
+pruned content identity returns 404). It does not scan unrelated directories, so a staged
 or orphaned snapshot is never exposed as a published hash. Corruption and the 10,000-link
 traversal limit return 503 rather than an incomplete successful result. This is a bounded
 local-history lookup; a persistent deep-history index and optional database backend remain

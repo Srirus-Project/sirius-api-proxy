@@ -316,7 +316,7 @@ pub(crate) fn sync_existing_file(path: &Path) -> std::io::Result<()> {
 // Unix supports fsync on directory handles. Windows File::open cannot open a
 // directory as a normal file. Every data file and CURRENT is still synced
 // through its writable handle before atomic publication on all platforms.
-fn sync_directory(path: &Path) -> Result<(), MasterError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), MasterError> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]

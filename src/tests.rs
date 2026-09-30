@@ -58,6 +58,7 @@ fn config() -> Config {
         player_id_env: None,
         player_credential_env: None,
         master_directory: None,
+        master_retention: None,
         master_update: None,
         resource_snapshot: None,
         default_cdn_root: "https://static.bang-dream-on.jp".into(),
@@ -14260,6 +14261,7 @@ fn registry_owner_config(
         local_interval_seconds: None,
         internal_token_env: internal,
         staging_directory: None,
+        retention: None,
     });
     cfg
 }
@@ -15271,6 +15273,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     for block in [
         "master_update:",
         "master_sync:",
+        "master_retention:",
         "accounts:",
         "tls:",
         "access_log:",
@@ -15313,6 +15316,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         let owner = parsed.owner.unwrap();
         assert_eq!(owner.source.is_some(), synchronizing);
         assert_eq!(owner.local_interval_seconds.is_some(), !synchronizing);
+        assert_eq!(owner.retention.is_some(), synchronizing);
     }
     // The documented PostgreSQL backend replaces the files backend.
     let files = "backend:\n  kind: files\n  directory: ./master\n";
@@ -17474,6 +17478,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             policy_for(true),
             global_scope(region),
             consumer.clone(),
+            None,
         )
         .unwrap();
         let synced = syncer.update_once().await.unwrap();
@@ -17489,6 +17494,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             policy_for(true),
             global_scope(other),
             root.path().join("x"),
+            None,
         )
         .unwrap();
         assert!(wrong.update_once().await.is_err());
@@ -17502,6 +17508,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             flat.clone(),
             global_scope(other),
             root.path().join("y"),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -17512,7 +17519,8 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         // A same-scope owner never installs on top of another region's directory history.
         let before = std::fs::read(jp_output.join("CURRENT")).unwrap();
         let onto_jp =
-            master_sync::Syncer::standalone(flat, global_scope(region), jp_output.clone()).unwrap();
+            master_sync::Syncer::standalone(flat, global_scope(region), jp_output.clone(), None)
+                .unwrap();
         assert!(matches!(
             onto_jp.update_once().await,
             Err(master_sync::Error::Storage)
@@ -20563,4 +20571,796 @@ async fn peer_executor_mismatch_keeps_the_game_failure_wire_format() {
         c.account_status().unwrap()["accounts"][0]["disabled"],
         false
     );
+}
+
+/// Import `count` more committed installations, each with a distinct Master version.
+fn retention_imports(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    count: usize,
+) -> Vec<crate::master::ImportReceipt> {
+    let (mut manifest, decoder, _) = master_fixture();
+    (0..count)
+        .map(|_| {
+            manifest.version = format!("retention-{}", uuid::Uuid::new_v4().simple());
+            std::fs::write(
+                input.join("MasterManifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            crate::master::import_directory(input, output, &decoder).unwrap()
+        })
+        .collect()
+}
+/// A chain of `total` committed installations, oldest first.
+fn retention_chain(
+    total: usize,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<String>,
+) {
+    let (root, input, output, first) = registry_fixture();
+    let mut chain = vec![first.snapshot];
+    chain.extend(
+        retention_imports(&input, &output, total - 1)
+            .into_iter()
+            .map(|r| r.snapshot),
+    );
+    (root, input, output, chain)
+}
+fn master_snapshot_directories(root: &std::path::Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("master-"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+fn retention_prune(root: &std::path::Path, keep: usize) -> usize {
+    let writer = crate::master::WriterLock::acquire(root).unwrap();
+    crate::master_registry::prune(&writer, root, keep).unwrap()
+}
+fn history_snapshots(history: &crate::master_registry::History) -> Vec<&str> {
+    history
+        .entries
+        .iter()
+        .map(|entry| entry.snapshot.as_str())
+        .collect()
+}
+
+#[test]
+fn retention_keeps_newest_snapshots_along_committed_chain() {
+    use crate::master_registry as registry;
+    let (_root, _input, output, chain) = retention_chain(5);
+    let pointer = std::fs::read(output.join("CURRENT")).unwrap();
+    assert_eq!(retention_prune(&output, 2), 3);
+    let mut kept = vec![chain[3].clone(), chain[4].clone()];
+    kept.sort();
+    assert_eq!(master_snapshot_directories(&output), kept);
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[3].as_str())
+    );
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), pointer);
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    assert!(history.retention_boundary && !history.legacy_boundary);
+    assert!(!history.has_more && history.next_before.is_none());
+    assert_eq!(
+        serde_json::to_value(&history).unwrap()["retention_boundary"],
+        true
+    );
+    // CURRENT still reads normally.
+    assert!(crate::master::read_current(&output, Some("MasterFixture")).is_ok());
+}
+
+#[test]
+fn retention_is_idempotent_and_off_by_default() {
+    use crate::{master_database as db, master_registry as registry};
+    let (_root, _input, output, _) = retention_chain(4);
+    // Never pruned: no record, no field, and the migration plan digest of 1.2.x.
+    assert!(registry::retention_boundary(&output).unwrap().is_none());
+    let history = registry::committed_history(&output, registry_scope()).unwrap();
+    assert!(!history.retention_boundary);
+    assert!(serde_json::to_value(&history)
+        .unwrap()
+        .get("retention_boundary")
+        .is_none());
+    assert_eq!(
+        db::migration_plan_digest(&history).unwrap(),
+        legacy_migration_plan_digest(&history)
+    );
+    let receipt = db::MigrationReceipt {
+        head: history.head.clone(),
+        source_sha256: "0".repeat(64),
+        publications: 4,
+        legacy_boundary: false,
+        retention_boundary: false,
+        changed: true,
+    };
+    let encoded = serde_json::to_value(&receipt).unwrap();
+    assert!(encoded.get("retention_boundary").is_none());
+    let decoded: db::MigrationReceipt = serde_json::from_value(encoded).unwrap();
+    assert!(!decoded.retention_boundary);
+    assert_eq!(retention_prune(&output, 2), 2);
+    let record = output.join("retention.json");
+    let (bytes, modified) = (
+        std::fs::read(&record).unwrap(),
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+    );
+    assert_eq!(retention_prune(&output, 2), 0);
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+        modified
+    );
+    // A pruned plan differs from any 1.2 plan and records the boundary.
+    let pruned = registry::committed_history(&output, registry_scope()).unwrap();
+    assert!(pruned.retention_boundary);
+    assert_ne!(
+        db::migration_plan_digest(&pruned).unwrap(),
+        legacy_migration_plan_digest(&pruned)
+    );
+    let receipt = db::MigrationReceipt {
+        retention_boundary: true,
+        ..receipt
+    };
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["retention_boundary"],
+        true
+    );
+}
+
+#[test]
+fn retention_leaves_staging_orphans_and_legacy_untouched() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, legacy) = registry_fixture();
+    // The oldest snapshot predates publication records.
+    std::fs::remove_file(output.join(&legacy.snapshot).join("publication.json")).unwrap();
+    let chain = retention_imports(&input, &output, 4);
+    let orphan = retention_imports(&input, &output, 1).remove(0);
+    std::fs::write(output.join("CURRENT"), &chain[3].snapshot).unwrap();
+    for name in [".master-stage-x", ".master-sync-x", ".master-download-x"] {
+        std::fs::create_dir(output.join(name)).unwrap();
+    }
+    assert_eq!(retention_prune(&output, 2), 2);
+    for name in [
+        ".master-stage-x",
+        ".master-sync-x",
+        ".master-download-x",
+        legacy.snapshot.as_str(),
+        orphan.snapshot.as_str(),
+        chain[2].snapshot.as_str(),
+        chain[3].snapshot.as_str(),
+    ] {
+        assert!(output.join(name).is_dir(), "{name}");
+    }
+    for pruned in &chain[..2] {
+        assert!(!output.join(&pruned.snapshot).exists());
+    }
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history.entries.len(), 2);
+    assert!(history.retention_boundary && !history.legacy_boundary);
+    // A chain that reaches a legacy snapshot inside the window prunes nothing.
+    let (_root, input, output, legacy) = registry_fixture();
+    std::fs::remove_file(output.join(&legacy.snapshot).join("publication.json")).unwrap();
+    retention_imports(&input, &output, 2);
+    for keep in [3, 5] {
+        assert_eq!(retention_prune(&output, keep), 0);
+    }
+    assert_eq!(master_snapshot_directories(&output).len(), 3);
+    assert!(!output.join("retention.json").exists());
+    // Without a committed CURRENT there is nothing to prune.
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(retention_prune(empty.path(), 2), 0);
+    let writer = master::WriterLock::acquire(empty.path()).unwrap();
+    for keep in [0, 1, 10_001] {
+        assert!(registry::prune(&writer, empty.path(), keep).is_err());
+    }
+}
+
+#[tokio::test]
+async fn retention_history_pages_stop_at_boundary() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(6);
+    assert_eq!(retention_prune(&output, 3), 3);
+    let mut before = None::<String>;
+    let mut seen = Vec::new();
+    loop {
+        let page = registry::history_page(&output, registry_scope(), 1, before.as_deref()).unwrap();
+        seen.extend(page.entries.iter().map(|e| e.snapshot.clone()));
+        match page.next_before {
+            Some(next) => {
+                assert!(page.has_more && !page.retention_boundary);
+                before = Some(next);
+            }
+            None => {
+                assert!(!page.has_more && page.retention_boundary);
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, [&chain[5], &chain[4], &chain[3]].map(String::clone));
+    let last = registry::history_page(&output, registry_scope(), 1, Some(&chain[3])).unwrap();
+    assert!(last.entries.is_empty() && !last.has_more && last.next_before.is_none());
+    assert!(last.retention_boundary);
+    assert!(matches!(
+        registry::history_page(&output, registry_scope(), 1, Some(&chain[1])),
+        Err(MasterError::NotFound)
+    ));
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let get = |query: String| {
+        Request::get(format!("/api/v1/master-data/history{query}"))
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(get(format!("?before={}", chain[1])))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let response = app.clone().oneshot(get(String::new())).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let page = body(response).await;
+    assert_eq!(page["retention_boundary"], true);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 3);
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retention_by_hash_and_pinned_reads_return_404_for_pruned_content() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(4);
+    let before = registry::history(&output, registry_scope(), 100).unwrap();
+    let hash_of = |snapshot: &str| {
+        before
+            .entries
+            .iter()
+            .find(|e| e.snapshot == snapshot)
+            .unwrap()
+            .content_sha256
+            .clone()
+    };
+    let (kept, pruned) = (chain[2].clone(), chain[1].clone());
+    let (kept_hash, pruned_hash) = (hash_of(&kept), hash_of(&pruned));
+    let table_sha = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    assert_eq!(retention_prune(&output, 2), 2);
+    assert!(matches!(
+        registry::manifest_by_hash(&output, registry_scope(), &pruned_hash),
+        Err(MasterError::NotFound)
+    ));
+    assert!(registry::manifest_by_hash(&output, registry_scope(), &kept_hash).is_ok());
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    for (path, expected) in [
+        (format!("by-hash/{pruned_hash}/manifest"), 404),
+        (format!("by-hash/{kept_hash}/manifest"), 200),
+        (format!("by-hash/{pruned_hash}/bundle"), 404),
+        (format!("by-hash/{kept_hash}/bundle"), 200),
+        (format!("snapshots/{pruned}/manifest"), 404),
+        (format!("snapshots/{kept}/manifest"), 200),
+        (
+            format!("snapshots/{pruned}/tables/MasterFixture/{table_sha}"),
+            404,
+        ),
+        (
+            format!("snapshots/{kept}/tables/MasterFixture/{table_sha}"),
+            200,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/master-data/{path}"))
+                    .header("authorization", "Bearer api")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{path}");
+    }
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn retention_config_bounds() {
+    use crate::master_registry::Retention;
+    for (keep, valid) in [
+        (0, false),
+        (1, false),
+        (2, true),
+        (10_000, true),
+        (10_001, false),
+    ] {
+        assert_eq!(
+            Retention {
+                keep_snapshots: keep
+            }
+            .valid(),
+            valid
+        );
+    }
+    assert!(yaml_serde::from_str::<Retention>("keep_snapshots: 2\nextra: 1\n").is_err());
+    assert!(yaml_serde::from_str::<Retention>("keep_snapshots: -1\n").is_err());
+    let keep = |n| Some(Retention { keep_snapshots: n });
+    let directory = tempfile::tempdir().unwrap();
+    // Root profile: a directory and a writer in this process are both required.
+    let mut cfg = config();
+    cfg.master_retention = keep(20);
+    assert!(cfg.validate().is_err());
+    cfg.master_directory = Some(directory.path().join("master"));
+    assert!(cfg.validate().is_err());
+    let mut cfg = master_sync_config("http://127.0.0.1:9".into(), directory.path().join("master"));
+    cfg.validate().unwrap();
+    for (n, ok) in [(1, false), (2, true), (10_000, true), (10_001, false)] {
+        cfg.master_retention = keep(n);
+        assert_eq!(cfg.validate().is_ok(), ok, "{n}");
+    }
+    let mut cfg = remote_master_config_at("https://cdn.example.invalid", directory.path());
+    cfg.master_retention = keep(2);
+    let parsed = cfg.validate();
+    cfg.master_retention = None;
+    assert_eq!(parsed.is_ok(), cfg.validate().is_ok());
+    // Registry owner: retention applies only where synchronization writes snapshots.
+    let mut owner =
+        registry_owner_config("http://127.0.0.1:9".into(), directory.path().join("owner"))
+            .owner
+            .unwrap();
+    owner.retention = keep(2);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_ok());
+    owner.retention = keep(1);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_err());
+    owner.retention = keep(2);
+    owner.source = None;
+    owner.local_interval_seconds = Some(300);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_err());
+    let parsed: crate::registry_owner::Config =
+        yaml_serde::from_str("internal_token_env: X\nretention:\n  keep_snapshots: 5\n").unwrap();
+    assert_eq!(parsed.retention.unwrap().keep_snapshots, 5);
+    assert!(yaml_serde::from_str::<crate::registry_owner::Config>(
+        "internal_token_env: X\nretention:\n  keep: 5\n"
+    )
+    .is_err());
+}
+
+#[test]
+fn retention_crash_after_boundary_before_delete_is_readable() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(5);
+    let hashes = registry::history(&output, registry_scope(), 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| (e.snapshot.clone(), e.content_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // An interrupted keep=2 pass: boundary durable, only the oldest candidate removed, and a
+    // renamed directory whose removal never finished.
+    std::fs::write(
+        output.join("retention.json"),
+        serde_json::to_vec(&json!({"schema_version":1,"boundary":chain[3]})).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(output.join(&chain[0]), output.join(".master-pruned-x")).unwrap();
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    assert!(history.retention_boundary);
+    let committed = registry::committed_history(&output, registry_scope()).unwrap();
+    assert_eq!(committed.entries.len(), 2);
+    assert!(registry::manifest_by_hash(&output, registry_scope(), &hashes[&chain[3]]).is_ok());
+    // Candidates still on disk are beyond the boundary and no longer addressable.
+    assert!(matches!(
+        registry::manifest_by_hash(&output, registry_scope(), &hashes[&chain[2]]),
+        Err(MasterError::NotFound)
+    ));
+    assert_eq!(retention_prune(&output, 2), 2);
+    assert!(output.join(".master-pruned-x").is_dir());
+    let mut kept = vec![chain[3].clone(), chain[4].clone()];
+    kept.sort();
+    assert_eq!(master_snapshot_directories(&output), kept);
+    // Malformed records fail explicitly instead of widening or narrowing history.
+    for record in [
+        json!({"schema_version":1,"boundary":"../escape"}),
+        json!({"schema_version":2,"boundary":chain[3]}),
+        json!({"schema_version":1,"boundary":chain[3],"extra":1}),
+    ] {
+        std::fs::write(
+            output.join("retention.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            registry::history(&output, registry_scope(), 100),
+            Err(MasterError::Format)
+        ));
+    }
+}
+
+#[test]
+fn retention_budget_spreads_large_backlog() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(8);
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    for pass in 0..3 {
+        assert_eq!(registry::prune_within(&writer, &output, 2, 2).unwrap(), 2);
+        // Oldest first: the remaining candidates stay contiguous behind the boundary.
+        for (index, snapshot) in chain.iter().enumerate() {
+            assert_eq!(
+                output.join(snapshot).exists(),
+                index >= 2 * (pass + 1),
+                "{pass} {index}"
+            );
+        }
+        let history = registry::history(&output, registry_scope(), 100).unwrap();
+        assert_eq!(history_snapshots(&history), [&chain[7], &chain[6]]);
+        assert!(history.retention_boundary);
+    }
+    assert_eq!(registry::prune_within(&writer, &output, 2, 2).unwrap(), 0);
+}
+
+#[test]
+fn retention_keep_increase_does_not_move_boundary_back() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, chain) = retention_chain(5);
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    assert_eq!(registry::prune_within(&writer, &output, 2, 1).unwrap(), 1);
+    let record = std::fs::read(output.join("retention.json")).unwrap();
+    assert_eq!(registry::prune(&writer, &output, 5).unwrap(), 2);
+    assert_eq!(
+        std::fs::read(output.join("retention.json")).unwrap(),
+        record
+    );
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[3].as_str())
+    );
+    assert_eq!(master_snapshot_directories(&output).len(), 2);
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    // New publications move the boundary forward again.
+    drop(writer);
+    let newer = retention_imports(&input, &output, 1).remove(0);
+    assert_eq!(retention_prune(&output, 2), 1);
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[4].as_str())
+    );
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(
+        history_snapshots(&history),
+        [newer.snapshot.as_str(), chain[4].as_str()]
+    );
+}
+
+#[test]
+fn retention_reader_recovers_from_concurrent_prune() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(5);
+    let hashes = registry::history(&output, registry_scope(), 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| (e.snapshot.clone(), e.content_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // A pass named C and renamed older directories away after the reader read no boundary.
+    std::fs::write(
+        output.join("retention.json"),
+        serde_json::to_vec(&json!({"schema_version":1,"boundary":chain[2]})).unwrap(),
+    )
+    .unwrap();
+    for snapshot in &chain[..2] {
+        std::fs::rename(
+            output.join(snapshot),
+            output.join(format!(".master-pruned-{snapshot}")),
+        )
+        .unwrap();
+    }
+    let history =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, None, None).unwrap();
+    assert_eq!(
+        history_snapshots(&history),
+        [&chain[4], &chain[3], &chain[2]]
+    );
+    assert!(history.retention_boundary && !history.has_more);
+    let page =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[3]), None)
+            .unwrap();
+    assert_eq!(history_snapshots(&page), [&chain[2]]);
+    let at =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[2]), None)
+            .unwrap();
+    assert!(at.entries.is_empty() && at.retention_boundary);
+    assert!(matches!(
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[1]), None),
+        Err(MasterError::NotFound)
+    ));
+    assert!(matches!(
+        registry::manifest_by_hash_with_boundary(
+            &output,
+            registry_scope(),
+            &hashes[&chain[0]],
+            None
+        ),
+        Err(MasterError::NotFound)
+    ));
+    assert!(registry::manifest_by_hash_with_boundary(
+        &output,
+        registry_scope(),
+        &hashes[&chain[2]],
+        None
+    )
+    .is_ok());
+    // A missing directory without boundary evidence is never presented as retention.
+    std::fs::remove_file(output.join("retention.json")).unwrap();
+    assert!(registry::history(&output, registry_scope(), 100).is_err());
+    assert!(registry::committed_history(&output, registry_scope()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_refuses_symlinked_predecessor() {
+    use crate::{master, master_registry as registry};
+    let (root, _input, output, chain) = retention_chain(5);
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::rename(output.join(&chain[1]), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, output.join(&chain[1])).unwrap();
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    assert!(registry::prune(&writer, &output, 2).is_err());
+    assert!(elsewhere.join("publication.json").is_file());
+    for snapshot in [&chain[0], &chain[2], &chain[3], &chain[4]] {
+        assert!(output.join(snapshot).is_dir());
+    }
+    assert!(!output.join("retention.json").exists());
+    assert!(crate::master::read_current(&output, Some("MasterFixture")).is_ok());
+}
+
+#[tokio::test]
+async fn retention_migration_uses_retained_window() {
+    use crate::{master_database as db, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(4);
+    assert_eq!(retention_prune(&output, 2), 2);
+    let history = registry::committed_history(&output, registry_scope()).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[3], &chain[2]]);
+    assert!(history.retention_boundary && !history.has_more && !history.legacy_boundary);
+    // Source verification passes before any connection is attempted: the failure that
+    // follows is the unreachable database, never the source snapshot.
+    let mut cfg = master_database_config();
+    cfg.port = 9;
+    cfg.timeout_seconds = 2;
+    let result = db::migrate_history(&cfg, &output, registry_scope()).await;
+    assert!(result.is_err());
+    assert!(!matches!(result, Err(db::Error::Snapshot)));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_migration_imports_retained_window() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master_database as db, master_registry as registry};
+    use sqlx::{Connection, Row};
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.keep_snapshots = 10;
+    let mut scope = registry_scope();
+    scope.environment = format!("retention-{}", uuid::Uuid::new_v4().simple());
+    let key = serde_json::to_string(&scope).unwrap();
+    let (_root, input, source, _) = retention_chain(5);
+    assert_eq!(retention_prune(&source, 3), 2);
+    let chain = registry::committed_history(&source, scope.clone()).unwrap();
+    assert_eq!(chain.entries.len(), 3);
+    let receipt = db::migrate_history(&cfg, &source, scope.clone())
+        .await
+        .unwrap();
+    assert!(receipt.changed && receipt.retention_boundary && !receipt.legacy_boundary);
+    assert_eq!(receipt.publications, 3);
+    assert_eq!(
+        receipt.source_sha256,
+        db::migration_plan_digest(&chain).unwrap()
+    );
+    let replay = db::migrate_history(&cfg, &source, scope.clone())
+        .await
+        .unwrap();
+    assert!(!replay.changed && replay.retention_boundary);
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    let rows = sqlx::query("SELECT content_hash,published_at::text AS at FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
+        .bind(&key).fetch_all(&mut conn).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    for (row, entry) in rows.iter().zip(&chain.entries) {
+        assert_eq!(row.get::<String, _>("content_hash"), entry.content_sha256);
+        let at: String = row.get("at");
+        let parsed = chrono::DateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S%.f%#z").unwrap();
+        assert_eq!(
+            parsed.timestamp_micros(),
+            entry.published_at.unwrap().timestamp_micros()
+        );
+    }
+    // Pruning locally after migration changes the plan: a rerun is refused.
+    retention_imports(&input, &source, 1);
+    assert_eq!(retention_prune(&source, 3), 1);
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Integrity)
+    ));
+}
+
+#[tokio::test]
+async fn retention_skips_when_writer_busy() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, _) = retention_chain(4);
+    let keep = Some(registry::Retention { keep_snapshots: 2 });
+    let busy = master::WriterLock::acquire(&output).unwrap();
+    assert_eq!(registry::retain(&output, keep).await, None);
+    assert_eq!(master_snapshot_directories(&output).len(), 4);
+    drop(busy);
+    assert_eq!(registry::retain(&output, None).await, None);
+    assert_eq!(master_snapshot_directories(&output).len(), 4);
+    assert_eq!(registry::retain(&output, keep).await, Some(2));
+    assert_eq!(master_snapshot_directories(&output).len(), 2);
+}
+
+#[tokio::test]
+async fn master_updater_prunes_after_settled_result_including_unchanged_cycles() {
+    use crate::{master_registry::Retention, master_update::MasterUpdater};
+    let root = tempfile::tempdir().unwrap();
+    let input = tempfile::tempdir().unwrap();
+    let (mut manifest, decoder, bytes) = master_fixture();
+    std::fs::write(input.path().join("MasterFixture.bin"), bytes).unwrap();
+    let mut install = |version: &str| {
+        manifest.version = version.into();
+        std::fs::write(
+            input.path().join("MasterManifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        crate::master::import_directory(input.path(), root.path(), &decoder).unwrap();
+    };
+    install("fixture-v1");
+    install("fixture-v2");
+    let cdn = cdn_fixture(vec![
+        cdn_reply(remote_master_manifest()),
+        cdn_reply(master_fixture().2.to_vec()),
+    ])
+    .await;
+    let game = fixture(vec![
+        Reply::version(),
+        Reply::version(),
+        Reply::version(),
+        Reply::version(),
+    ])
+    .await;
+    let mut cfg = remote_master_config(&cdn, root.path());
+    cfg.master_retention = Some(Retention { keep_snapshots: 2 });
+    let c = client(&game, cfg.clone());
+    let updater = MasterUpdater::new(&cfg, c.clone()).unwrap();
+    let result = updater.update_once().await.unwrap();
+    assert_eq!(result["action"], "updated");
+    assert_eq!(result["pruned_snapshots"], 1);
+    let status = c.master_update_status().await;
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["result"]["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(root.path()).len(), 2);
+    // Identical content installed locally twice more: an unchanged cycle converges too.
+    install("master-fixture");
+    install("master-fixture");
+    let result = updater.update_once().await.unwrap();
+    assert_eq!(result["action"], "unchanged");
+    assert_eq!(result["pruned_snapshots"], 2);
+    assert_eq!(master_snapshot_directories(root.path()).len(), 2);
+    // Without retention the result shape is that of 1.2.x.
+    let mut plain = cfg.clone();
+    plain.master_retention = None;
+    let result = MasterUpdater::new(&plain, c.clone())
+        .unwrap()
+        .update_once()
+        .await
+        .unwrap();
+    assert_eq!(result["action"], "unchanged");
+    assert!(result.get("pruned_snapshots").is_none());
+    assert_eq!(c.master_update_status().await["status"], "ready");
+}
+
+#[tokio::test]
+async fn master_sync_prunes_owner_and_consumer_independently() {
+    use crate::{master_registry as registry, master_sync::Syncer};
+    let (_owner_root, input, owner, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(owner.clone());
+    let app = api::router(
+        client(&game, cfg),
+        "owner-read".into(),
+        "owner-admin".into(),
+    );
+    let (origin, server) = peer_http_server(app).await;
+    let consumers = tempfile::tempdir().unwrap();
+    let policy = master_sync_config(origin, consumers.path().join("unused"))
+        .master_sync
+        .unwrap();
+    let pruning_dir = consumers.path().join("pruning");
+    let keeping_dir = consumers.path().join("keeping");
+    let pruning = Syncer::standalone(
+        policy.clone(),
+        registry_scope(),
+        pruning_dir.clone(),
+        Some(registry::Retention { keep_snapshots: 2 }),
+    )
+    .unwrap();
+    let keeping = Syncer::standalone(policy, registry_scope(), keeping_dir.clone(), None).unwrap();
+    let first = pruning.update_once().await.unwrap();
+    assert_eq!(first["action"], "updated");
+    assert_eq!(first["pruned_snapshots"], 0);
+    assert!(keeping
+        .update_once()
+        .await
+        .unwrap()
+        .get("pruned_snapshots")
+        .is_none());
+    let mut last = Value::Null;
+    for _ in 0..3 {
+        retention_imports(&input, &owner, 1);
+        last = pruning.update_once().await.unwrap();
+        assert_eq!(last["action"], "updated");
+        let kept = keeping.update_once().await.unwrap();
+        assert_eq!(kept["action"], "updated");
+        assert!(kept.get("pruned_snapshots").is_none());
+    }
+    assert_eq!(last["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(&pruning_dir).len(), 2);
+    assert_eq!(master_snapshot_directories(&keeping_dir).len(), 4);
+    assert_eq!(master_snapshot_directories(&owner).len(), 4);
+    // The owner's own retention never reaches a consumer that keeps everything.
+    assert_eq!(retention_prune(&owner, 2), 2);
+    assert_eq!(keeping.update_once().await.unwrap()["action"], "unchanged");
+    assert_eq!(master_snapshot_directories(&keeping_dir).len(), 4);
+    // The snapshot a new owner publication replaced stays readable for pinned consumers.
+    let replaced = registry::current_snapshot(&owner).unwrap();
+    retention_imports(&input, &owner, 1);
+    assert_eq!(retention_prune(&owner, 2), 1);
+    let table_sha = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    assert!(registry::table(
+        &owner,
+        crate::region::Region::Jp,
+        &replaced,
+        "MasterFixture",
+        &table_sha
+    )
+    .is_ok());
+    let synced = pruning.update_once().await.unwrap();
+    assert_eq!(synced["action"], "updated");
+    assert_eq!(synced["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(&pruning_dir).len(), 2);
+    server.abort();
 }

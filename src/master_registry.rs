@@ -6,7 +6,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 const MAX_JSON: u64 = 64 * 1024 * 1024;
@@ -413,6 +415,10 @@ pub struct History {
     pub next_before: Option<String>,
     /// Older snapshots have no predecessor record; their chronology is unknown.
     pub legacy_boundary: bool,
+    /// Older committed snapshots were removed by snapshot retention. Absent means false:
+    /// omitted so the serialization of directories never pruned is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retention_boundary: bool,
 }
 
 pub fn history(root: &Path, scope: Scope, limit: usize) -> Result<History, MasterError> {
@@ -450,15 +456,39 @@ fn history_page_inner(
     limit: usize,
     before: Option<&str>,
 ) -> Result<History, MasterError> {
+    let boundary = retention_boundary(root)?;
+    history_walk(root, scope, limit, before, boundary)
+}
+
+/// Test entry point: walk with the retention boundary a reader read before a pass moved it.
+#[cfg(test)]
+pub(crate) fn history_page_with_boundary(
+    root: &Path,
+    scope: Scope,
+    limit: usize,
+    before: Option<&str>,
+    boundary: Option<String>,
+) -> Result<History, MasterError> {
+    history_walk(root, scope, limit, before, boundary)
+}
+
+fn history_walk(
+    root: &Path,
+    scope: Scope,
+    limit: usize,
+    before: Option<&str>,
+    boundary: Option<String>,
+) -> Result<History, MasterError> {
     if before.is_some_and(|v| !valid_history_cursor(v)) {
         return Err(MasterError::Format);
     }
     let head = predecessor(root)?.ok_or(MasterError::NotFound)?;
     let mut cursor_found = before.is_none();
     let mut next = Some(head.clone());
-    let mut visited = std::collections::BTreeSet::new();
-    let mut entries = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut entries = Vec::<HistoryEntry>::new();
     let mut legacy_boundary = false;
+    let mut retained = false;
     while let Some(snapshot) = next.take() {
         if visited.len() == 10_000 {
             return Err(MasterError::Limit);
@@ -466,16 +496,33 @@ fn history_page_inner(
         if !visited.insert(snapshot.clone()) {
             return Err(MasterError::Format);
         }
-        let directory = snapshot_directory(root, &snapshot)?;
-        let doc = manifest(root, Some(&snapshot), scope.clone())?;
+        let (doc, publication) = match chain_step(root, &scope, &snapshot, &visited) {
+            Ok(step) => step,
+            Err(error) => {
+                let crossed = crossed_boundary(root, error, &snapshot, &visited)?;
+                if before == Some(crossed.as_str()) {
+                    entries.clear();
+                } else if let Some(at) = entries.iter().position(|e| e.snapshot == crossed) {
+                    entries.truncate(at + 1);
+                } else {
+                    // The cursor itself lies beyond the new boundary: it was pruned.
+                    return Err(MasterError::NotFound);
+                }
+                retained = true;
+                break;
+            }
+        };
         let value: PublishedManifest =
             serde_json::from_slice(&doc.bytes).map_err(|_| MasterError::Format)?;
-        let publication = publication(&directory, &snapshot, &visited)?;
         if publication.is_none() {
             legacy_boundary = true;
         }
         let published_at = publication.as_ref().map(|p| p.published_at);
         next = publication.and_then(|p| p.previous_snapshot);
+        if next.is_some() && boundary.as_deref() == Some(snapshot.as_str()) {
+            next = None;
+            retained = true;
+        }
         if !cursor_found {
             cursor_found = before == Some(snapshot.as_str());
             continue;
@@ -509,13 +556,54 @@ fn history_page_inner(
         has_more: next.is_some(),
         next_before,
         legacy_boundary,
+        retention_boundary: retained,
     })
+}
+
+/// One committed chain step. A directory renamed away by a concurrent retention pass
+/// surfaces as missing, never as a legacy snapshot without a publication record.
+fn chain_step(
+    root: &Path,
+    scope: &Scope,
+    snapshot: &str,
+    visited: &BTreeSet<String>,
+) -> Result<(Document, Option<Publication>), MasterError> {
+    let directory = snapshot_directory(root, snapshot)?;
+    let document = manifest(root, Some(snapshot), scope.clone())?;
+    let record = publication(&directory, snapshot, visited)?;
+    if record.is_none() {
+        snapshot_directory(root, snapshot)?;
+    }
+    Ok((document, record))
+}
+
+/// A reader that read the boundary before a retention pass moved it can find an older
+/// snapshot renamed away mid-walk. Only a new boundary this walk already crossed explains
+/// that; any other missing directory remains an explicit error, never hidden as retention.
+fn crossed_boundary(
+    root: &Path,
+    error: MasterError,
+    failed: &str,
+    visited: &BTreeSet<String>,
+) -> Result<String, MasterError> {
+    let missing = match &error {
+        MasterError::NotFound => true,
+        MasterError::Io(e) => e.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    };
+    if !missing {
+        return Err(error);
+    }
+    match retention_boundary(root) {
+        Ok(Some(boundary)) if boundary != failed && visited.contains(&boundary) => Ok(boundary),
+        _ => Err(error),
+    }
 }
 
 fn publication(
     directory: &Path,
     snapshot: &str,
-    visited: &std::collections::BTreeSet<String>,
+    visited: &BTreeSet<String>,
 ) -> Result<Option<Publication>, MasterError> {
     match regular(&directory.join("publication.json"), 4096) {
         Ok(bytes) => {
@@ -539,12 +627,34 @@ fn publication(
 }
 /// Find the newest committed installation with this scoped content identity.
 /// UUID and response ETag may change after an identical reimport; content identity does not.
+/// The walk stops at the retention boundary: pruned content identities are not found.
 pub fn manifest_by_hash(root: &Path, scope: Scope, hash: &str) -> Result<Document, MasterError> {
     if !hash_valid(hash) {
         return Err(MasterError::Format);
     }
+    let boundary = retention_boundary(root)?;
+    by_hash_walk(root, scope, hash, boundary)
+}
+
+/// Test entry point: look up with the retention boundary a reader read before a pass.
+#[cfg(test)]
+pub(crate) fn manifest_by_hash_with_boundary(
+    root: &Path,
+    scope: Scope,
+    hash: &str,
+    boundary: Option<String>,
+) -> Result<Document, MasterError> {
+    by_hash_walk(root, scope, hash, boundary)
+}
+
+fn by_hash_walk(
+    root: &Path,
+    scope: Scope,
+    hash: &str,
+    boundary: Option<String>,
+) -> Result<Document, MasterError> {
     let mut next = predecessor(root)?;
-    let mut visited = std::collections::BTreeSet::new();
+    let mut visited = BTreeSet::new();
     while let Some(snapshot) = next.take() {
         if visited.len() == 10_000 {
             return Err(MasterError::Limit);
@@ -552,15 +662,213 @@ pub fn manifest_by_hash(root: &Path, scope: Scope, hash: &str) -> Result<Documen
         if !visited.insert(snapshot.clone()) {
             return Err(MasterError::Format);
         }
-        let directory = snapshot_directory(root, &snapshot)?;
-        let record = publication(&directory, &snapshot, &visited)?;
-        let document = manifest(root, Some(&snapshot), scope.clone())?;
+        let (document, record) = match chain_step(root, &scope, &snapshot, &visited) {
+            Ok(step) => step,
+            Err(error) => {
+                crossed_boundary(root, error, &snapshot, &visited)?;
+                return Err(MasterError::NotFound);
+            }
+        };
         let value: PublishedManifest =
             serde_json::from_slice(&document.bytes).map_err(|_| MasterError::Format)?;
         if value.content_sha256 == hash {
             return Ok(document);
         }
+        if boundary.as_deref() == Some(snapshot.as_str()) {
+            break;
+        }
         next = record.and_then(|r| r.previous_snapshot);
     }
     Err(MasterError::NotFound)
+}
+
+/// Optional file snapshot retention. The newest `keep_snapshots` installations along the
+/// committed publication chain are kept (an identical reimport counts as its own
+/// installation); older chain entries are removed. Absent keeps every snapshot.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retention {
+    pub keep_snapshots: usize,
+}
+impl Retention {
+    /// At least 2: the snapshot CURRENT just replaced stays readable for pinned readers.
+    /// At most the committed history walk limit, so migration still reads the whole window.
+    pub fn valid(&self) -> bool {
+        (2..=10_000).contains(&self.keep_snapshots)
+    }
+}
+
+/// Snapshots removed by one retention pass at most. A larger backlog converges over later
+/// passes, oldest first, so every remaining candidate stays reachable from the boundary.
+pub(crate) const MAX_PRUNED_PER_PASS: usize = 64;
+
+/// `retention.json`: the oldest retained snapshot. Data, not configuration: readers honour
+/// it even after retention is unconfigured, because older snapshots no longer exist.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionRecord {
+    schema_version: u32,
+    boundary: String,
+}
+
+pub(crate) fn retention_boundary(root: &Path) -> Result<Option<String>, MasterError> {
+    let bytes = match regular(&root.join("retention.json"), 4096) {
+        Ok(bytes) => bytes,
+        Err(MasterError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let record: RetentionRecord =
+        serde_json::from_slice(&bytes).map_err(|_| MasterError::Format)?;
+    if record.schema_version != 1
+        || !record.boundary.starts_with("master-")
+        || !master::safe_component(&record.boundary)
+    {
+        return Err(MasterError::Format);
+    }
+    Ok(Some(record.boundary))
+}
+
+fn write_retention(root: &Path, boundary: &str) -> Result<(), MasterError> {
+    let record = RetentionRecord {
+        schema_version: 1,
+        boundary: boundary.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|_| MasterError::Format)?;
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
+    file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(root.join("retention.json"))
+        .map_err(|err| MasterError::Io(err.error))?;
+    master::sync_directory(root)
+}
+
+/// Remove committed snapshots older than the newest `keep` along CURRENT's chain. Only the
+/// writer may prune; the directory is never scanned, so staging, download, orphan and
+/// legacy directories (and other chains) are left alone.
+pub(crate) fn prune(
+    writer: &master::WriterLock,
+    root: &Path,
+    keep: usize,
+) -> Result<usize, MasterError> {
+    prune_within(writer, root, keep, MAX_PRUNED_PER_PASS)
+}
+
+pub(crate) fn prune_within(
+    _writer: &master::WriterLock,
+    root: &Path,
+    keep: usize,
+    budget: usize,
+) -> Result<usize, MasterError> {
+    if !(Retention {
+        keep_snapshots: keep,
+    })
+    .valid()
+    {
+        return Err(MasterError::Limit);
+    }
+    let Some(head) = predecessor(root)? else {
+        return Ok(0);
+    };
+    let old = retention_boundary(root)?;
+    let mut visited = BTreeSet::new();
+    let mut next = Some(head);
+    let mut kept = 0;
+    // The boundary is the keep-th installation, or an earlier recorded one: raising keep
+    // never moves the boundary back to snapshots readers were already told are gone.
+    let (boundary, mut next) = loop {
+        let Some(snapshot) = next.take() else {
+            return Ok(0);
+        };
+        if !visited.insert(snapshot.clone()) {
+            return Err(MasterError::Format);
+        }
+        let directory = snapshot_directory(root, &snapshot)?;
+        // A legacy snapshot inside the window has no recorded predecessor to prune.
+        let Some(record) = publication(&directory, &snapshot, &visited)? else {
+            return Ok(0);
+        };
+        kept += 1;
+        if kept == keep || old.as_deref() == Some(snapshot.as_str()) {
+            break (snapshot, record.previous_snapshot);
+        }
+        next = record.previous_snapshot;
+    };
+    let mut candidates = Vec::new();
+    while let Some(snapshot) = next.take() {
+        if candidates.len() == 10_000 {
+            return Err(MasterError::Limit);
+        }
+        if !visited.insert(snapshot.clone()) {
+            return Err(MasterError::Format);
+        }
+        let directory = match snapshot_directory(root, &snapshot) {
+            Ok(directory) => directory,
+            // Removed by an earlier pass, which deletes oldest first.
+            Err(MasterError::NotFound) => break,
+            Err(e) => return Err(e),
+        };
+        match publication(&directory, &snapshot, &visited)? {
+            Some(record) => {
+                next = record.previous_snapshot;
+                candidates.push(snapshot);
+            }
+            // Legacy snapshots have no recorded chronology and are never removed.
+            None => break,
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // The boundary is durable before anything disappears, so readers stop there first.
+    if old.as_deref() != Some(boundary.as_str()) {
+        write_retention(root, &boundary)?;
+    }
+    let mut pruned = 0;
+    for snapshot in candidates.iter().rev().take(budget) {
+        // Rename first: the snapshot leaves its canonical path atomically. A failure (for
+        // example an open handle on Windows) stops the pass with the rest still contiguous.
+        let trash = root.join(format!(".master-pruned-{}", uuid::Uuid::new_v4().simple()));
+        fs::rename(root.join(snapshot), &trash)?;
+        master::sync_directory(root)?;
+        if fs::remove_dir_all(&trash).is_err() {
+            tracing::warn!(
+                error_code = "master_retention_cleanup_failed",
+                "Pruned Master snapshot left unreachable; it is safe to delete by hand"
+            );
+        }
+        pruned += 1;
+    }
+    Ok(pruned)
+}
+
+/// Apply configured retention after a pass's result is settled. Never fails that pass: a
+/// busy writer skips this cycle, and a failed pass keeps what it did not remove. The
+/// blocking worker owns the lock, so cancelling the caller never releases it mid-pass.
+pub(crate) async fn retain(output: &Path, retention: Option<Retention>) -> Option<usize> {
+    let keep = retention?.keep_snapshots;
+    let writer = match master::WriterLock::acquire(output) {
+        Ok(writer) => writer,
+        Err(MasterError::Busy) => {
+            tracing::debug!("Master snapshot retention skipped; another writer is active");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                error_code = "master_retention_failed",
+                "Master snapshot retention failed; snapshots retained"
+            );
+            return None;
+        }
+    };
+    let output = output.to_owned();
+    match tokio::task::spawn_blocking(move || prune(&writer, &output, keep)).await {
+        Ok(Ok(pruned)) => Some(pruned),
+        _ => {
+            tracing::warn!(
+                error_code = "master_retention_failed",
+                "Master snapshot retention failed; snapshots retained"
+            );
+            None
+        }
+    }
 }

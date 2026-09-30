@@ -268,8 +268,10 @@ These generic capabilities are intentionally not restored in their original form
    - The staged snapshot is renamed into place and `CURRENT` is switched atomically
      (`src/master.rs:443-473`).
 
-   A partial download therefore cannot publish. File-store snapshots are never deleted by Sirius.
-   Git keeps every earlier commit. The PostgreSQL mirror only drops whole snapshots beyond
+   A partial download therefore cannot publish. File-store snapshots are never deleted by Sirius
+   unless `master_retention` or a registry `owner.retention` is configured, and even then only
+   along the committed chain behind an explicit boundary, never by mtime or directory scan
+   ([Decision 19](#decisions)). Git keeps every earlier commit. The PostgreSQL mirror only drops whole snapshots beyond
    `keep_snapshots` (`src/master_database.rs:393-394`). A table that upstream really drops is
    absent from the next snapshot, as the manifest says, and all earlier snapshots remain
    readable. No ratio threshold would prevent a verified manifest from being published.
@@ -465,6 +467,21 @@ These generic capabilities are intentionally not restored in their original form
    `src/asset_dispatch_admin.rs`): always 200, independent of the command queue, readable
    after the worker stopped, and made only of timestamps, counts, the recorded resource version
    and closed-set codes. Unknown persisted failure codes count as `other`. No field is added.
+19. **File snapshot retention follows the committed chain, is bounded below and is off by
+   default.** The original keeps the newest `MANIFEST_SNAPSHOTS_KEPT = 20` manifest snapshots per
+   region, chosen by scanning the snapshot directory and sorting by mtime, and deletes the rest
+   (`Haruki-Sekai-API@9a53714:src/registry/state.rs:93`, `:492-512`). Sirius does not reproduce
+   the scan or the mtime order: a directory also holds staging, download and sync temporaries,
+   orphans of failed pointer switches and legacy snapshots, and clock changes would reorder it.
+   The optional `master_retention` and registry `owner.retention` (`keep_snapshots`, 2..10000)
+   count installations along CURRENT's committed predecessor chain (`src/master_registry.rs`
+   `prune`). The minimum of 2 keeps the snapshot CURRENT just replaced readable for pinned
+   readers. The oldest retained snapshot is durably recorded in `retention.json` before anything
+   is removed, so history, lookup by content identity, bundles and migration stop there and
+   report `retention_boundary` instead of failing on missing predecessors. A pass runs after the
+   update or sync result is settled (`retain`, called from `src/master_update.rs` and
+   `src/master_sync.rs` `update_once`), under the writer lock and outside the update deadline,
+   and removes at most 64 snapshots, oldest first. Nothing is pruned unless configured.
 
 ## Original fields that were ignored by the original itself
 
@@ -490,7 +507,8 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 
 | Section | Fields | Read at |
 | --- | --- | --- |
-| Root profile (`src/config.rs:5-70`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
+| Root profile (`src/config.rs:5-74`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
+| | `master_retention.keep_snapshots` (1.3.0, `src/config.rs:66`) | `MasterUpdater::new` (`src/master_update.rs:267`) and `Syncer::new` (`src/master_sync.rs:122`), applied by `master_registry::retain` after each settled pass (`src/master_update.rs:333`, `src/master_sync.rs:248`); rejected without `master_directory` or a writer (`src/config.rs:367-378`) ([Decision 19](#decisions)) |
 | `upstream` (`src/config.rs:72-97`) | all, including `anonymous_max_inflight`, `coalesce_public_reads`, `http2_keepalive_interval_ms`, `http2_keepalive_timeout_ms` and `version_max_age_seconds` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:203`, `:216`, keepalive at `:220-230` (derived by `src/config.rs:155-171`), `:266-268`, `:813`, `:1456`, `:1478`, `:1603`, version age at `:1707`, SDK proxy at `:1985-1997`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
@@ -503,7 +521,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | | `aegis_cooldown_seconds`, `concurrent_device_limit` | `src/accounts.rs:330-345` |
 | Global identity file (1.2.1, `src/global_account.rs:83-106`, `src/global_sdk.rs:50-69`) | `schema`, `sdk.{uid, access_key, id_token, mid}`, `players.<region>.expected_player_id`, `device.{udid, model, pf_ver, dp, net, operators, adid, lang, time_zone, isRoot}`, `device.unity_{device_model, operating_system, device_id}` | `src/global_account.rs:127-162`, `:253-270`, `src/global_sdk.rs:101-114`, `:239-252`, `src/client.rs:854` |
 | `MultiConfig` (`src/deployment.rs:13-25`) | all; `regions` accepts the deprecated `tw` key (1.2.1) | `src/deployment.rs:156-201`, `:383-389`, `src/application_log.rs:78-93` |
-| Registry `Config`, `Backend` (`src/registry_service.rs:20-42`), `owner` (`src/registry_owner.rs:7-16`) | all | `src/registry_service.rs:56-247`, `src/registry_owner.rs:29-60`, `src/main.rs:11` |
+| Registry `Config`, `Backend` (`src/registry_service.rs:20-42`), `owner` (`src/registry_owner.rs:7-20`) | all | `src/registry_service.rs:56-247`, `src/registry_owner.rs:33-87`, `src/main.rs:11`; `owner.retention` (1.3.0) is passed to `Syncer::standalone` (`src/registry_owner.rs:62-71`) and requires `source` (`:52-59`) |
 | `master-db-*` `Import` (`src/master_database.rs:73-80`) | `source`, `scope`, `database` | `src/main.rs:92-113` |
 
 ### Findings
@@ -527,7 +545,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 Every shipped example is parsed by tests, with its documented optional blocks uncommented:
 
 - `sirius-api-config.example.yaml` as shipped (`src/tests.rs:2080-2082`), and each commented
-  optional block (`master_update`, `master_sync`, `accounts`, `tls`, `access_log`, `logging`,
+  optional block (`master_update`, `master_sync`, `master_retention`, `accounts`, `tls`, `access_log`, `logging`,
   `asset_dispatch`, `node_routing`, `master_notify`, `master_git` with its nested `signing`,
   `master_database`, `client_auth`) uncommented one at a time.
 - `sirius-multi-region-config.example.yaml` as shipped and with its commented `tls:` and
@@ -537,7 +555,8 @@ Every shipped example is parsed by tests, with its documented optional blocks un
   and Global account line uncommented; `hk.yaml` also with the deprecated `tw` region.
 - `docs/examples/global-identity.example.json` through the identity-file parser.
 - `docs/examples/master-registry.yaml` as shipped and with `tls:`, `access_log:`, `notify:`, each
-  of the two `owner:` variants and the PostgreSQL `backend:` uncommented.
+  of the two `owner:` variants (the synchronizing one with its `retention`) and the PostgreSQL
+  `backend:` uncommented.
 - `docs/examples/master-database.yaml` as shipped and with `root_certificate` uncommented.
 - The files above are covered by `every_shipped_example_parses_including_documented_optional_blocks`
   (`src/tests.rs:11916`). `docs/examples/master-publisher.yaml` is validated with all four regions
@@ -599,6 +618,9 @@ classification and evidence:
   is added to the `master_database` `dsn` row and the reverse check; the moved
   `src/master_database.rs` references (including the environment variable list, Decisions 1 and
   16 and the `client_auth` rows) are refreshed.
+- **File snapshot retention:** new [Decision 19](#decisions); Decision 1 notes the opt-in
+  exception. `master_retention` joins the root-profile reverse-check rows and `owner.retention`
+  the registry row; the example coverage lists the new commented blocks.
 - **Dispatch worker status:** new [Decision 18](#decisions). The `asset_updater_servers[]` rows
   point to the status route and their moved `src/asset_dispatch.rs` references are refreshed.
   No field is added.

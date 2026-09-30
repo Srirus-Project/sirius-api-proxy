@@ -217,6 +217,7 @@ pub struct MasterUpdater {
     lock: Mutex<()>,
     deadline: Duration,
     network: Network,
+    retention: Option<crate::master_registry::Retention>,
 }
 impl MasterUpdater {
     #[cfg(test)]
@@ -263,6 +264,7 @@ impl MasterUpdater {
             lock: Mutex::new(()),
             deadline: Duration::from_secs(update.network.update_timeout_seconds),
             network: update.network.clone(),
+            retention: config.master_retention,
         }))
     }
     async fn download(
@@ -322,9 +324,17 @@ impl MasterUpdater {
         self.game
             .record_master_update(json!({"status":"running","started_at":started}))
             .await;
-        let result = tokio::time::timeout_at(deadline, self.update())
+        let mut result = tokio::time::timeout_at(deadline, self.update())
             .await
             .unwrap_or(Err(UpdateError::Timeout));
+        // Retention follows the settled result, outside the update deadline: it can never
+        // turn an installed update into a reported timeout, and it never changes the result.
+        if let Ok(value) = &mut result {
+            if let Some(pruned) = crate::master_registry::retain(&self.output, self.retention).await
+            {
+                value["pruned_snapshots"] = json!(pruned);
+            }
+        }
         let status = match &result {
             Ok(value) => {
                 json!({"status":"ready","started_at":started,"completed_at":Utc::now(),"result":value})

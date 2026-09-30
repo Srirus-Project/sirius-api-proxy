@@ -407,6 +407,10 @@ pub struct MigrationReceipt {
     pub source_sha256: String,
     pub publications: usize,
     pub legacy_boundary: bool,
+    /// The plan ended at the file retention boundary: only the retained window was
+    /// migrated. Absent means false. The plan digest already covers it, so no column.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retention_boundary: bool,
     pub changed: bool,
 }
 const MIGRATION_SCHEMA: &str = "
@@ -461,7 +465,9 @@ pub async fn migrate_history(
 /// `sirius_master_migrations.source_hash` and compared on every replay. This is a frozen format:
 /// exactly the 1.2 serialization of `registry::History`. It must not follow History's public
 /// shape (1.3.0 added `resource_version` to entries), or replaying `master-db-migrate` on a scope
-/// migrated by an earlier release would be refused as an integrity conflict.
+/// migrated by an earlier release would be refused as an integrity conflict. The 1.3.0
+/// `retention_boundary` is omitted when false, so plans of never-pruned directories keep
+/// their 1.2 digest.
 pub(crate) fn migration_plan_digest(history: &registry::History) -> Result<String, Error> {
     #[derive(Serialize)]
     struct PlanV1<'a> {
@@ -472,6 +478,8 @@ pub(crate) fn migration_plan_digest(history: &registry::History) -> Result<Strin
         has_more: bool,
         next_before: Option<&'a str>,
         legacy_boundary: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        retention_boundary: bool,
     }
     #[derive(Serialize)]
     struct PlanEntryV1<'a> {
@@ -501,6 +509,7 @@ pub(crate) fn migration_plan_digest(history: &registry::History) -> Result<Strin
         has_more: history.has_more,
         next_before: history.next_before.as_deref(),
         legacy_boundary: history.legacy_boundary,
+        retention_boundary: history.retention_boundary,
     };
     Ok(registry::digest(
         &serde_json::to_vec(&plan).map_err(|_| Error::Snapshot)?,
@@ -535,6 +544,7 @@ async fn migrate_transaction(
         source_sha256,
         publications: history.entries.len(),
         legacy_boundary: history.legacy_boundary,
+        retention_boundary: history.retention_boundary,
         changed: false,
     };
     if let Some(row) = saved {

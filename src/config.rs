@@ -60,6 +60,10 @@ pub struct Config {
     /// Optional immutable Master JSON snapshot store written by master-import.
     pub master_directory: Option<std::path::PathBuf>,
     pub master_update: Option<MasterUpdateConfig>,
+    /// Optional retention of `master_directory` snapshots along the committed chain, applied
+    /// by this process's writer (`master_update` or `master_sync`). Absent keeps everything.
+    #[serde(default)]
+    pub master_retention: Option<crate::master_registry::Retention>,
     /// Global (HK/EN/KR) resource snapshots built from the VERSION body `resourceVersion` and the
     /// base catalog `.hash` on the configured CDN root. JP snapshots come from `x-asset-version`.
     #[serde(default)]
@@ -358,6 +362,18 @@ impl Config {
                     .is_none_or(|p| p.as_os_str().is_empty())
             {
                 return Err(AppError::Config("Master owner synchronization requires an output directory and excludes CDN updating"));
+            }
+        }
+        if let Some(retention) = &self.master_retention {
+            // Without a writer in this process the field would parse yet never apply.
+            if !retention.valid()
+                || self
+                    .master_directory
+                    .as_ref()
+                    .is_none_or(|p| p.as_os_str().is_empty())
+                || (self.master_update.is_none() && self.master_sync.is_none())
+            {
+                return Err(AppError::Config("Master retention requires master_directory, master_update or master_sync, and keep_snapshots 2..10000"));
             }
         }
         crate::accounts::validate(self)?;

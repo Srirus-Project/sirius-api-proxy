@@ -169,6 +169,8 @@ Configure `master_directory` to serve snapshots. Remote updates verify manifest 
 decrypt and parse every table, recheck the version and atomically switch CURRENT.
 Failed updates preserve the old snapshot; a writer lock prevents concurrent publication.
 Optional background updates run at the configured interval without overlapping.
+Snapshots are kept indefinitely by default; optional `master_retention` keeps only the newest
+installations along the committed chain ([snapshot retention](docs/MASTER_REGISTRY.md#snapshot-retention)).
 See [Master CDN proxy, retry and deadline configuration](docs/MASTER_NETWORK.md).
 
 Protocol reload rejects incompatible changes with HTTP 422 and keeps the previous schema.

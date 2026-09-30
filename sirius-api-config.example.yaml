@@ -48,6 +48,11 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 #   interval_seconds: 300
 #   timeout_seconds: 600
 #   request_timeout_ms: 60000
+# Snapshots are kept indefinitely by default. Optionally keep only the newest installations
+# along the committed chain (2..10000); requires master_update or master_sync.
+# See docs/MASTER_REGISTRY.md (Snapshot retention) before enabling: removal is permanent.
+# master_retention:
+#   keep_snapshots: 20
 default_cdn_root: https://static.bang-dream-on.jp
 cdn_credential_env:
   https://static.bang-dream-on.jp: SIRIUS_CDN_CREDENTIAL

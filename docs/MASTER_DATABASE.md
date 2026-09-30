@@ -219,7 +219,10 @@ table is verified before connecting, and each snapshot is verified again as it i
 one decoded snapshot is held at a time; local files and CURRENT remain unchanged. New local
 installations after the plan is pinned belong to a later normal publication. Missing or corrupt
 history and cycles fail closed. A legacy snapshot without a publication record ends the chain;
-`legacy_boundary: true` reports that older chronology is unknown.
+`legacy_boundary: true` reports that older chronology is unknown. After file
+[snapshot retention](MASTER_REGISTRY.md#snapshot-retention) has pruned the directory, the chain
+ends at the recorded retention boundary: only the retained window is migrated and the receipt
+includes `retention_boundary: true` (omitted when false).
 
 Schema initialization, all events and documents, retention, current and a durable migration
 receipt commit in one transaction. Original publication times are preserved to PostgreSQL's
@@ -231,11 +234,13 @@ byte total. The additional `public.sirius_master_migrations` table stores the sc
 hash, head, publication count and legacy-boundary flag. It contains no credentials or paths.
 The source-plan hash keeps the 1.2 format: it covers each entry's snapshot, version, content hash,
 publication time, file count and byte total, not `resource_version`, so scopes migrated by 1.2.x
-still replay.
+still replay. A retention boundary is part of the plan (serialized only when true), so plans of
+never-pruned directories keep their 1.2 hash and no receipt column is added.
 
 Retrying the same source plan returns `changed: false` without duplicating events or rewinding
 subsequent database publications. A different plan in a previously migrated scope is refused;
-use normal publication for subsequent updates. The receipt acknowledges the completed migration,
+use normal publication for subsequent updates. Pruning locally after migration likewise changes
+the plan, so a rerun is refused exactly as after a new publication. The receipt acknowledges the completed migration,
 not a new integrity audit of data changed afterward. Retrying requires the original source chain
 to remain available and valid. Keep the files until migration has been confirmed.
 
