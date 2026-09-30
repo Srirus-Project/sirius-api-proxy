@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.2.4
+
+Behavior restored from a second comparison with the original (Haruki-Sekai-API `9a53714`),
+adapted rather than copied.
+
+- Maintenance answers 503. A failed game call whose response carries `UNDER_MAINTENANCE` now
+  returns HTTP 503 with code `maintenance` (it was 502), is not retried, does not count against
+  the account (JP accounts previously cooled down on gRPC 14 with that code) and is not a node
+  fault. Peers keep the wire format: a 1.2.4 caller maps the executor's gRPC status plus
+  `observation.maintenance` to 503, a 1.2.3 caller still answers 502.
+- Error bodies add a stable `code` and, for game failures, `grpc_status`:
+  `{"error": "...", "code": "...", "grpc_status": 2}`. The `error` text of `not_found` and
+  `account_unavailable` no longer claims "environment not found" / "not configured". Framework
+  rejections (malformed path, query or body, unknown route, wrong method, oversized or wrongly
+  typed body) are now JSON of the same shape instead of plain text or an empty body, and never
+  echo the input. Status codes are unchanged. See the code table in the README.
+- Master CDN downloads retry: `master_update.network` defaults to 3 attempts with 1 s doubling
+  backoff (was 1 attempt), including when the block is only partly written. The
+  `resource_snapshot` `.hash` request keeps one attempt. `attempts: 1` restores the old behavior.
+- Asset dispatch classifies the updater's answer to a submission instead of recording every
+  failed POST as `submission_ambiguous`: 429/503 (busy) resubmit with the same Idempotency-Key at
+  the next cycle, up to 10 times (`submission_refused`); 400/404/405/413/415/422, 401/403 and 409
+  fail at once as `submission_rejected`, `submission_unauthorized` and `idempotency_conflict`.
+  These are not adoptable; fix the configuration and raise `profile_revision`. Transport errors
+  and other 5xx remain ambiguous. Dispatch warnings carry `region`, `profile`, `target` (a
+  destination digest prefix), `stage` and the HTTP `status`.
+- Node routing logs health transitions once each (`node_cooldown_started`, `node_probe_failed`,
+  `node_recovered`, `node_unavailable`, `node_router_ready`) with the node name and error code;
+  target failures are logged at debug with `failover`.
+- The Docker image includes `ssh-keygen`, so `master_git.signing.format: ssh` works in the
+  official container (it failed every signed commit before). The container smoke test signs and
+  verifies a commit offline.
+
 ## 1.2.3
 
 - The Docker image includes `git`. `master_git` commits and pushes Master repositories by running
