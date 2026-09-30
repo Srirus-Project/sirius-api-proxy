@@ -118,6 +118,7 @@ prints JSON without credential values. They require no game/CDN credentials or n
 
 Online administrative routes are available when `asset_dispatch` is configured:
 
+- `GET /internal/v1/asset-dispatch/status` (see [Worker status](#worker-status))
 - `GET /internal/v1/asset-dispatch/entries?limit=50&after=DISPATCH_KEY`
 - `POST /internal/v1/asset-dispatch/entries/DISPATCH_KEY/adopt` with
   `{"job_id":"EXISTING_JOB_UUID"}`
@@ -130,7 +131,8 @@ Lists return `status`, `total`, `entries` (each has `key` and `entry`) and nulla
 `next_after`. Limit defaults to 50 and accepts 1–200. Entries sort by dispatch key; pass
 `next_after` as `after` for the next page. Pages are live views, not a frozen export:
 new identities can appear before a previous cursor. No origins or credential values are
-included. `ready` means the worker processed this request, not that every remote job is healthy;
+included. The list's `status` is always the constant `ready`: it means the worker processed this
+request, not that the worker or every remote job is healthy. Use `/status` for worker health and
 inspect individual persisted states and failure codes.
 
 Adoption returns the persisted entry with HTTP 200, unknown identities return 404,
@@ -142,15 +144,17 @@ does. Repeating the same UUID is safe; do not switch to a different UUID after a
 Commands use a bounded 16-request queue and wait at most five seconds. The sole worker
 processes them between network reconciliation passes, so a long game/updater request can
 make the management endpoint return 503. Stopped workers and queue saturation also return
-503. Requests abandoned while still queued are discarded. Once persistence has started, a
+503. `GET /status` tells these apart: `reconciling` (or `observing`) means the worker is busy
+and the command can be retried; `stopped` with a `stop_reason` means it will not be processed
+until restart. Requests abandoned while still queued are discarded. Once persistence has started, a
 lost or timed-out response does not prove the change was rolled back: query state or repeat
 the identical adoption. Management requests do not accelerate observation/polling or race
 in-flight submissions. Automatic replay of uncertain POSTs remains intentionally disabled.
 
 The working ledger has a hard capacity and no automatic pruning. Confirmed completions can be
 explicitly archived to free capacity while retaining permanent deduplication, as described below.
-Capacity exhaustion refuses new observations but leaves reconciliation and online management
-available. If the worker has stopped after a reconciliation persistence error, use offline
+Capacity exhaustion refuses new observations (reported by `/status` as the observation result
+`capacity_exhausted`) but leaves reconciliation and online management available. If the worker has stopped after a reconciliation persistence error, use offline
 maintenance before restarting it; an online command cannot revive a stopped worker.
 Changing the profile revision intentionally creates a new identity. The updater resolves profiles
 at execution time, so this revision is an operator-controlled re-export marker, not an immutable
@@ -159,8 +163,9 @@ copy of its configuration. Coordinate profile changes with active work.
 Writes sync temporary files before atomic replacement. Process restart is tested; power-loss
 persistence across every filesystem is not claimed. Persistence failure stops the dispatch worker
 and emits an error while the HTTP proxy remains available. Monitor these errors and inspect the
-state ledger. The online endpoint returns 503 once the worker has stopped; it does not restart
-a worker or erase its failure state.
+state ledger. The entry endpoints return 503 once the worker has stopped, while `GET /status`
+keeps answering 200 with `status: "stopped"` and `stop_reason: "asset_outbox_storage"`. Neither
+restarts a worker or erases its failure state.
 
 Released in 1.2.0 with local integration tests. The yhm01 production acceptance runs submit jobs
 directly to the asset updater, so this automatic dispatch path has not itself been exercised in a
@@ -172,6 +177,34 @@ updater's optional `user_agent_prefix` filter. Bearer credentials remain indepen
 Omitting the field preserves the existing transport behavior. It identifies the client, not
 a secret; do not place credentials in it. Changing it does not change durable job identity
 or create a second submission of the same catalog.
+
+## Worker status
+
+`GET /internal/v1/asset-dispatch/status` (regional deployments: `/internal/v1/{region}/...`)
+uses the same internal bearer as the other routes; a missing or wrong token returns 401. It
+always returns 200 once authorized. It does not use the 16-command queue, so it answers while a
+reconciliation holds the worker and after the worker has stopped or its task has exited. No
+configuration enables it; profiles without `asset_dispatch` have no route.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `pending` (built, no cycle yet), `observing`, `reconciling`, `idle` or `stopped`. |
+| `stop_reason` | Only when stopped: `shutdown`, `asset_outbox_storage` (persistence failure) or `exited` (the task ended without reporting, for example a panic or a worker that never ran). |
+| `updated_at` | Last time the worker published this status. |
+| `cycle_started_at` | Start of the current observation/reconciliation cycle; `null` otherwise. |
+| `last_cycle_at`, `next_cycle_at` | End of the last successful cycle and the next scheduled one. |
+| `last_observation` | `{at, result, resource_version}`. `result` is `recorded`, `unavailable` (no fresh game snapshot), `rejected`, `capacity_exhausted` or `storage_failed`; `resource_version` is set only for `recorded`. |
+| `last_reconcile` | `{at, result, batch, transport_errors}`. `result` is `completed` or `storage_failed`; `batch` is the number of entries selected (at most 16); `transport_errors` counts updater requests that failed without a definite answer in that pass. |
+| `entries` | Working-ledger counts: `total`, `capacity`, `pending`, `sending`, `submitted`, `completed`, `failed` and `busy_retrying` (pending entries the updater refused as busy and that will be resubmitted). |
+| `failed_by_code` | Failed working entries by code. Only codes this worker writes are named; any other persisted code counts as `other`. Zero counts are omitted. |
+
+Counts cover the working ledger only, like the list's `total`; archived completions are
+excluded. They are refreshed at each phase change, before each submission POST and after each
+management command, so during a long reconciliation they can lag by up to one batch;
+`updated_at` and `cycle_started_at` show how old they are. `last_*` values and `busy_retrying`
+live in memory and are `null`/zero after a restart; the ledger and entry routes remain the
+durable record. Every string is a fixed code: the status never includes origins, tokens,
+destination digests, updater responses or error text.
 
 ## Completed-history compaction
 

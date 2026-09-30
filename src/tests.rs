@@ -2089,11 +2089,31 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         region::Region,
     };
     let bundle = copy_protocol_bundle();
+    let dispatch_state = tempfile::tempdir().unwrap();
     let mut configs = BTreeMap::new();
     for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let mut c = regional_config(region);
         if region == Region::Jp {
             c.protocol_directory = bundle.path().into();
+            let token_env = format!("SIRIUS_DISPATCH_TEST_{}", uuid::Uuid::new_v4().simple());
+            std::env::set_var(&token_env, "dispatch-only-token");
+            c.asset_dispatch = Some(crate::asset_dispatch::Config {
+                state_directory: dispatch_state.path().join("jp"),
+                interval_seconds: 10,
+                request_timeout_ms: 1000,
+                history_capacity: 10,
+                targets: vec![crate::asset_dispatch::Target {
+                    user_agent: None,
+                    origin: "http://127.0.0.1:9".into(),
+                    token_env,
+                    allow_http: true,
+                    profile: "full".into(),
+                    profile_revision: "1".into(),
+                    require_full_catalog: true,
+                    require_full_export: true,
+                    require_publication: false,
+                }],
+            });
         }
         configs.insert(region.name().into(), c);
     }
@@ -2105,7 +2125,9 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         regions: configs,
     }));
     assert!(deployment.single().is_err());
-    let app = deployment.prepare().unwrap().router;
+    // Keep the prepared (not yet running) dispatch worker alive: its status is `pending`.
+    let prepared = deployment.prepare().unwrap();
+    let app = prepared.router.clone();
     async fn request(app: &axum::Router, path: &str, token: &str, method: &str) -> (u16, Value) {
         let response = app
             .clone()
@@ -2227,6 +2249,22 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         assert_eq!(body["generation"], 1);
         assert_eq!(body["codec"], "native");
     }
+    let path = "/internal/v1/jp/asset-dispatch/status";
+    let (status, body) = request(&app, path, "internal-jp", "GET").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "pending");
+    for token in ["public-jp", "internal-hk"] {
+        assert_eq!(request(&app, path, token, "GET").await.0, 401);
+    }
+    let (status, _) = request(
+        &app,
+        "/internal/v1/hk/asset-dispatch/status",
+        "internal-hk",
+        "GET",
+    )
+    .await;
+    assert_eq!(status, 404);
+    drop(prepared);
 }
 
 fn pool_config() -> Config {
@@ -6416,6 +6454,421 @@ async fn asset_dispatch_resubmits_busy_refusals_and_fails_definite_rejections() 
     assert_eq!(state["code"], "submission_ambiguous");
     assert_eq!(posts, 1);
 }
+/// A dispatch updater stub plus the configured values the status route must never echo.
+struct DispatchStatusHarness {
+    cfg: Config,
+    directory: tempfile::TempDir,
+    secrets: Vec<String>,
+    server: tokio::task::JoinHandle<()>,
+}
+impl Drop for DispatchStatusHarness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+async fn dispatch_status_harness(updater: axum::Router, capacity: usize) -> DispatchStatusHarness {
+    use crate::asset_dispatch::{Config as DispatchConfig, Target};
+    use sha2::{Digest, Sha256};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let origin = format!("http://{address}");
+    let server = tokio::spawn(async move { axum::serve(listener, updater).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let token_env = format!("SIRIUS_DISPATCH_STATUS_{}", uuid::Uuid::new_v4().simple());
+    let token = format!("status-secret-{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, &token);
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(url::Url::parse(&origin).unwrap().as_str().as_bytes())
+    );
+    let mut cfg = config();
+    cfg.asset_dispatch = Some(DispatchConfig {
+        state_directory: directory.path().join("outbox"),
+        interval_seconds: 10,
+        request_timeout_ms: 5000,
+        history_capacity: capacity,
+        targets: vec![Target {
+            user_agent: None,
+            origin: origin.clone(),
+            token_env: token_env.clone(),
+            allow_http: true,
+            profile: "full".into(),
+            profile_revision: "1".into(),
+            require_full_catalog: true,
+            require_full_export: true,
+            require_publication: false,
+        }],
+    });
+    DispatchStatusHarness {
+        cfg,
+        directory,
+        secrets: vec![
+            origin,
+            address,
+            token,
+            token_env,
+            digest[..12].to_owned(),
+            digest,
+            "must-not-leak".into(),
+        ],
+        server,
+    }
+}
+fn dispatch_status_admin(worker: &crate::asset_dispatch::Worker) -> axum::Router {
+    crate::asset_dispatch_admin::router(
+        worker.control(),
+        "/internal/v1/asset-dispatch",
+        "admin".into(),
+    )
+}
+fn dispatch_status_snapshot(resource_version: &str) -> crate::resources::ResourceSnapshot {
+    crate::resources::ResourceSnapshot {
+        schema_version: 2,
+        region: crate::region::Region::Jp,
+        environment: "release".into(),
+        platform: "iOS",
+        client_version: "1.0.3".into(),
+        protocol_version: "1.0.3".into(),
+        master_version: None,
+        resource_version: resource_version.into(),
+        platform_hash: "hash1".into(),
+        effective_cdn_root: String::new(),
+        credential_ref: String::new(),
+        observed_at: chrono::Utc::now(),
+        source: "remote",
+        catalog_layout: None,
+        catalog_url: None,
+        bundle_base_url: None,
+        cdn_authorization: None,
+    }
+}
+/// Reads the status with the internal bearer: always 200 and never echoing `secrets`.
+async fn dispatch_status(app: &axum::Router, secrets: &[String]) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/internal/v1/asset-dispatch/status")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let raw = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&raw).unwrap();
+    for secret in secrets {
+        assert!(!text.contains(secret.as_str()), "status echoed a secret");
+    }
+    serde_json::from_str(text).unwrap()
+}
+async fn dispatch_status_until(
+    app: &axum::Router,
+    secrets: &[String],
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = dispatch_status(app, secrets).await;
+            if done(&status) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("asset dispatch status did not settle")
+}
+fn dispatch_status_counts(status: &Value, expected: Value) {
+    let mut counts = json!({"total":0,"capacity":0,"pending":0,"sending":0,"submitted":0,
+        "completed":0,"failed":0,"busy_retrying":0});
+    for (key, value) in expected.as_object().unwrap() {
+        counts[key] = value.clone();
+    }
+    assert_eq!(status["entries"], counts);
+}
+#[tokio::test]
+async fn asset_dispatch_status_reports_pending_idle_and_stop_reasons() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 7).await;
+    let game = fixture(vec![]).await;
+    let gc = client(&game, h.cfg.clone());
+    let worker = Worker::new(&h.cfg, gc.clone()).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "pending");
+    for key in [
+        "stop_reason",
+        "cycle_started_at",
+        "last_cycle_at",
+        "next_cycle_at",
+        "last_observation",
+        "last_reconcile",
+    ] {
+        assert!(status[key].is_null(), "{key}");
+    }
+    dispatch_status_counts(&status, json!({"capacity":7}));
+    assert_eq!(status["failed_by_code"], json!({}));
+    for authorization in [None, Some("Bearer wrong"), Some("admin")] {
+        let mut request = Request::get("/internal/v1/asset-dispatch/status");
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    assert_eq!(
+        status["last_observation"]["result"], "unavailable",
+        "{status}"
+    );
+    assert!(status["last_observation"]["resource_version"].is_null());
+    assert_eq!(status["last_reconcile"]["result"], "completed");
+    assert_eq!(status["last_reconcile"]["batch"], 0);
+    assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+    assert!(status["cycle_started_at"].is_null());
+    let at = |key: &str| {
+        status[key]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    };
+    assert_eq!(
+        at("next_cycle_at") - at("last_cycle_at"),
+        chrono::TimeDelta::seconds(10)
+    );
+    // A stop during the pause still records the final status.
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["stop_reason"], "shutdown");
+    assert!(status["next_cycle_at"].is_null());
+    assert_eq!(status["last_reconcile"]["result"], "completed");
+    // A worker dropped without a final status (never run, or its task died) reads as exited.
+    let worker = Worker::new(&h.cfg, gc).unwrap();
+    let app = dispatch_status_admin(&worker);
+    assert_eq!(dispatch_status(&app, &h.secrets).await["status"], "pending");
+    drop(worker);
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["stop_reason"], "exited");
+}
+#[tokio::test]
+async fn asset_dispatch_status_answers_while_reconciling() {
+    use crate::asset_dispatch::Worker;
+    use axum::{http::HeaderMap, response::IntoResponse, routing::any};
+    use sha2::{Digest, Sha256};
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let updater = axum::Router::new().route(
+        "/{*path}",
+        any(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let held = held.clone();
+            async move {
+                held.notified().await;
+                let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                    "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+            }
+        }),
+    );
+    let h = dispatch_status_harness(updater, 10).await;
+    let game = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["entries"]["sending"] == 1).await;
+    assert_eq!(status["status"], "reconciling");
+    assert!(status["cycle_started_at"].is_string());
+    assert_eq!(status["last_observation"]["result"], "recorded");
+    assert_eq!(status["last_observation"]["resource_version"], "r1");
+    // The held POST occupies the worker; the status route does not wait on its queue.
+    let status = tokio::time::timeout(Duration::from_secs(1), dispatch_status(&app, &h.secrets))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "reconciling");
+    release.notify_one();
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    dispatch_status_counts(&status, json!({"total":1,"capacity":10,"submitted":1}));
+    assert_eq!(status["last_reconcile"]["batch"], 1);
+    assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn asset_dispatch_status_readable_after_storage_stop() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 10).await;
+    let game = fixture(vec![]).await;
+    let mut worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    worker.observe(&dispatch_status_snapshot("r1")).unwrap();
+    let app = dispatch_status_admin(&worker);
+    // A non-empty directory in place of the ledger fails the next commit on every platform.
+    let path = h.directory.path().join("outbox/outbox.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("occupied"), b"x").unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "stopped").await;
+    task.await.unwrap();
+    assert_eq!(status["stop_reason"], "asset_outbox_storage");
+    assert_eq!(status["last_reconcile"]["result"], "storage_failed");
+    assert_eq!(status["last_reconcile"]["batch"], 0);
+    dispatch_status_counts(&status, json!({"total":1,"capacity":10,"pending":1}));
+    assert_eq!(dispatch_status(&app, &h.secrets).await["status"], "stopped");
+    let response = app
+        .oneshot(
+            Request::get("/internal/v1/asset-dispatch/entries")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+}
+#[tokio::test]
+async fn asset_dispatch_status_counts_capacity_and_bucketed_failure_codes() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 2).await;
+    {
+        let mut store =
+            crate::asset_outbox::Outbox::open(&h.directory.path().join("outbox"), 2).unwrap();
+        for (version, code) in [("v1", "job_failed"), ("v2", "future_unknown_code")] {
+            let key = store
+                .observe(crate::asset_outbox::Identity {
+                    destination_sha256: "a".repeat(64),
+                    request: crate::asset_jobs::Request {
+                        region: crate::region::Region::Jp,
+                        profile: "full".into(),
+                        operation: crate::asset_jobs::Operation::Update,
+                    },
+                    profile_revision: "1".into(),
+                    environment: "release".into(),
+                    platform: "iOS".into(),
+                    resource_version: version.into(),
+                    platform_hash: "hash1".into(),
+                    require_full_catalog: true,
+                    require_full_export: true,
+                    require_publication: false,
+                })
+                .unwrap();
+            store.fail(&key, code).unwrap();
+        }
+    }
+    let game = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    assert_eq!(status["last_observation"]["result"], "capacity_exhausted");
+    assert!(status["last_observation"]["resource_version"].is_null());
+    dispatch_status_counts(&status, json!({"total":2,"capacity":2,"failed":2}));
+    assert_eq!(status["failed_by_code"], json!({"job_failed":1,"other":1}));
+    assert!(!status.to_string().contains("future_unknown_code"));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn asset_dispatch_status_counts_busy_retries_and_transport_errors() {
+    use crate::asset_dispatch::Worker;
+    use axum::{http::HeaderMap, response::IntoResponse, routing::any};
+    use sha2::{Digest, Sha256};
+    for (script, after) in [
+        (
+            vec![429, 202],
+            json!({"total":1,"capacity":10,"submitted":1}),
+        ),
+        (vec![429, 500], json!({"total":1,"capacity":10,"sending":1})),
+    ] {
+        let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+        let updater = axum::Router::new().route(
+            "/{*path}",
+            any(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let status = script.lock().unwrap().pop_front().unwrap_or(500);
+                async move {
+                    if status != 202 {
+                        let code = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (code, "updater detail must-not-leak").into_response();
+                    }
+                    let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                        "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                    (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+                }
+            }),
+        );
+        let h = dispatch_status_harness(updater, 10).await;
+        let game = fixture(vec![]).await;
+        let mut worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+        let app = dispatch_status_admin(&worker);
+        worker.observe(&dispatch_status_snapshot("r1")).unwrap();
+        worker.reconcile().await.unwrap();
+        let status = dispatch_status(&app, &h.secrets).await;
+        dispatch_status_counts(
+            &status,
+            json!({"total":1,"capacity":10,"pending":1,"busy_retrying":1}),
+        );
+        assert_eq!(status["last_reconcile"]["batch"], 1);
+        assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+        worker.reconcile().await.unwrap();
+        let status = dispatch_status(&app, &h.secrets).await;
+        dispatch_status_counts(&status, after.clone());
+        let transport_errors = usize::from(after["sending"] == 1);
+        assert_eq!(
+            status["last_reconcile"]["transport_errors"],
+            transport_errors
+        );
+        if transport_errors == 1 {
+            // The ambiguous POST is failed, not replayed, and the counter resets per pass.
+            worker.reconcile().await.unwrap();
+            let status = dispatch_status(&app, &h.secrets).await;
+            dispatch_status_counts(&status, json!({"total":1,"capacity":10,"failed":1}));
+            assert_eq!(status["failed_by_code"], json!({"submission_ambiguous":1}));
+            assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+        }
+    }
+}
+#[test]
+fn asset_dispatch_failure_codes_cover_worker() {
+    let source = include_str!("asset_dispatch.rs");
+    let known = crate::asset_dispatch::FAILURE_CODES;
+    let unique: std::collections::HashSet<_> = known.iter().collect();
+    assert_eq!(unique.len(), known.len());
+    assert!(!known.contains(&"other"));
+    let mut used = std::collections::HashSet::new();
+    let compact: String = source.split_whitespace().collect();
+    for literal in compact.split("self.fail(&key,&entry,\"").skip(1) {
+        used.insert(literal.split('"').next().unwrap());
+    }
+    let start = source.find("fn rejected_submission").unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap();
+    for literal in source[start..end].split("Some(\"").skip(1) {
+        used.insert(literal.split('"').next().unwrap());
+    }
+    // Every persisted literal is known, and no known code is stale.
+    assert_eq!(used, known.iter().copied().collect());
+}
 #[test]
 fn outbox_refusal_returns_only_sending_entries_to_pending() {
     use crate::asset_outbox::{Outbox, State};
@@ -9556,7 +10009,9 @@ async fn asset_dispatch_admin_pages_and_adopts_with_auth_and_durable_transitions
     let mut other = identity;
     other.resource_version = "2".into();
     let pending = store.observe(other).unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 10),
+    );
     let owner = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             crate::asset_dispatch_admin::handle(command, &mut store);
@@ -9715,7 +10170,9 @@ async fn asset_dispatch_admin_abandoned_commands_do_not_mutate_after_timeout() {
     let key = store.observe(identity).unwrap();
     store.begin_send(&key).unwrap();
     store.fail(&key, "submission_ambiguous").unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 1),
+    );
     let app = crate::asset_dispatch_admin::router(control, "/dispatch", "admin".into());
     let request = Request::post(format!("/dispatch/entries/{key}/adopt"))
         .header("authorization", "Bearer admin")
@@ -11577,7 +12034,9 @@ async fn dispatch_archive_admin_requires_auth_completion_and_survives_owner_rest
     store.acknowledge(&key, &job).unwrap();
     store.complete(&key, &job, &"b".repeat(64), None).unwrap();
     let pending = store.observe(archive_dispatch_identity("v2")).unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 2),
+    );
     let owner = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             crate::asset_dispatch_admin::handle(command, &mut store);

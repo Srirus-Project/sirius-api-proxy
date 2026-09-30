@@ -1,19 +1,124 @@
-//! Bounded administrative commands processed by the outbox's sole owner.
-use crate::asset_outbox::{Error, Outbox};
+//! Bounded administrative commands processed by the outbox's sole owner, and the worker status
+//! it publishes without going through that queue.
+use crate::asset_outbox::{Error, Outbox, State as EntryState};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Clone)]
 pub struct Control {
     sender: mpsc::Sender<Command>,
+    status: watch::Receiver<DispatchStatus>,
+}
+/// Worker state for `GET .../asset-dispatch/status`. Every string is a closed-set constant:
+/// no origin, token, target label, updater body or error text is ever stored here.
+#[derive(Clone, Serialize)]
+pub struct DispatchStatus {
+    /// `pending`, `observing`, `reconciling`, `idle` or `stopped`.
+    pub status: &'static str,
+    /// `shutdown`, `asset_outbox_storage` or `exited` once stopped.
+    pub stop_reason: Option<&'static str>,
+    pub updated_at: DateTime<Utc>,
+    pub cycle_started_at: Option<DateTime<Utc>>,
+    pub last_cycle_at: Option<DateTime<Utc>>,
+    pub next_cycle_at: Option<DateTime<Utc>>,
+    pub last_observation: Option<ObservationStatus>,
+    pub last_reconcile: Option<ReconcileStatus>,
+    pub entries: EntryCounts,
+    /// Working-ledger failures by code; unknown persisted codes count as `other`.
+    pub failed_by_code: BTreeMap<&'static str, usize>,
+}
+#[derive(Clone, Serialize)]
+pub struct ObservationStatus {
+    pub at: DateTime<Utc>,
+    /// `recorded`, `unavailable`, `rejected`, `capacity_exhausted` or `storage_failed`.
+    pub result: &'static str,
+    /// Only for `recorded`; already validated as a dispatch identity component.
+    pub resource_version: Option<String>,
+}
+#[derive(Clone, Serialize)]
+pub struct ReconcileStatus {
+    pub at: DateTime<Utc>,
+    /// `completed` or `storage_failed`.
+    pub result: &'static str,
+    pub batch: usize,
+    pub transport_errors: usize,
+}
+/// Working ledger only, like the list's `total`; archived completions are excluded.
+#[derive(Clone, Default, Serialize)]
+pub struct EntryCounts {
+    pub total: usize,
+    pub capacity: usize,
+    pub pending: usize,
+    pub sending: usize,
+    pub submitted: usize,
+    pub completed: usize,
+    pub failed: usize,
+    /// Pending entries the updater refused as busy since this process started.
+    pub busy_retrying: usize,
+}
+impl DispatchStatus {
+    pub(crate) fn pending(outbox: &Outbox, capacity: usize) -> Self {
+        let (entries, failed_by_code) = summarize(outbox, capacity, &HashMap::new());
+        Self {
+            status: "pending",
+            stop_reason: None,
+            updated_at: Utc::now(),
+            cycle_started_at: None,
+            last_cycle_at: None,
+            next_cycle_at: None,
+            last_observation: None,
+            last_reconcile: None,
+            entries,
+            failed_by_code,
+        }
+    }
+}
+/// One pass over the working ledger (at most `history_capacity` entries).
+pub(crate) fn summarize(
+    outbox: &Outbox,
+    capacity: usize,
+    refusals: &HashMap<String, u32>,
+) -> (EntryCounts, BTreeMap<&'static str, usize>) {
+    let mut counts = EntryCounts {
+        total: outbox.entries().len(),
+        capacity,
+        ..Default::default()
+    };
+    let mut failed = BTreeMap::new();
+    for (key, entry) in outbox.entries() {
+        match &entry.state {
+            EntryState::Pending => {
+                counts.pending += 1;
+                counts.busy_retrying += usize::from(refusals.contains_key(key));
+            }
+            EntryState::Sending { .. } => counts.sending += 1,
+            EntryState::Submitted { .. } => counts.submitted += 1,
+            EntryState::Completed { .. } => counts.completed += 1,
+            EntryState::Failed { code, .. } => {
+                counts.failed += 1;
+                let code = crate::asset_dispatch::FAILURE_CODES
+                    .iter()
+                    .find(|known| **known == code.as_str())
+                    .copied()
+                    .unwrap_or("other");
+                *failed.entry(code).or_default() += 1;
+            }
+        }
+    }
+    (counts, failed)
 }
 pub(crate) struct Command {
     action: Action,
@@ -36,9 +141,16 @@ struct Page {
 struct Adoption {
     job_id: String,
 }
-pub(crate) fn channel() -> (Control, mpsc::Receiver<Command>) {
+pub(crate) fn channel(
+    initial: DispatchStatus,
+) -> (
+    Control,
+    mpsc::Receiver<Command>,
+    watch::Sender<DispatchStatus>,
+) {
     let (sender, receiver) = mpsc::channel(16);
-    (Control { sender }, receiver)
+    let (publisher, status) = watch::channel(initial);
+    (Control { sender, status }, receiver, publisher)
 }
 fn valid_key(key: &str) -> bool {
     key.len() == 71
@@ -64,6 +176,7 @@ pub fn router(control: Control, prefix: &str, token: String) -> Router {
     Router::new().nest(
         prefix,
         Router::new()
+            .route("/status", get(status))
             .route("/entries", get(list))
             .route("/entries/{key}", get(detail))
             .route(
@@ -80,6 +193,19 @@ pub fn router(control: Control, prefix: &str, token: String) -> Router {
             ))
             .with_state(control),
     )
+}
+/// Always 200 and never queued: readable while a reconciliation holds the worker and after
+/// the worker has stopped. A dropped sender without a final status means the task exited.
+async fn status(State(control): State<Control>) -> Json<DispatchStatus> {
+    let exited = control.status.has_changed().is_err();
+    let mut status = control.status.borrow().clone();
+    if exited && status.status != "stopped" {
+        status.status = "stopped";
+        status.stop_reason = Some("exited");
+        status.cycle_started_at = None;
+        status.next_cycle_at = None;
+    }
+    Json(status)
 }
 async fn list(
     State(control): State<Control>,

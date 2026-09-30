@@ -76,6 +76,13 @@
   `timeout_seconds` (default 120) now answer 503 `master_unavailable` sooner; set
   `read_timeout_seconds` to keep the old budget. Publication, import and migration keep
   `timeout_seconds`. No circuit breaker or file fallback is added.
+- New `GET /internal/v1/asset-dispatch/status` (regional: `/internal/v1/{region}/...`, internal
+  bearer) reports the asset dispatch worker's phase (`pending`, `observing`, `reconciling`,
+  `idle`, `stopped` with `stop_reason`), the last observation and reconciliation outcomes,
+  working-ledger counts including busy retries, and failures by known code (others as `other`).
+  It always answers 200 without the 16-command queue, so a busy worker is distinguishable from a
+  stopped one where the entry routes answer 503. No configuration is added; existing routes,
+  the list's constant `status: "ready"`, the ledger and log events are unchanged.
 
 ## 1.2.4
 

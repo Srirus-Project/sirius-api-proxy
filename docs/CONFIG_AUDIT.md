@@ -53,7 +53,7 @@ Original: `Config`, `Haruki-Sekai-API@07da6b80:src/config.rs:515-538`.
 | `database` | ADAPTED | `client_auth.database` (`src/client_auth.rs:32-48`) | See [`database`](#database-user-database). |
 | `master_database` | ADAPTED | `master_database: {connection, interval_seconds}` (`src/master_database_worker.rs:9-15`) | See [`master_database`](#master_database). |
 | `apphash_sources[]` (`type`, `dir`, `url`) | IGNORED_BY_ORIGINAL / NOT_APPLICABLE | none | The original marks it deprecated and ignored (`Haruki-Sekai-API@07da6b80:src/config.rs:497-506`) and warns at startup (`:570-587`). Sekai app hash. Sirius client identity is the static `client_version` (`src/config.rs:41`); Global PlayerLogin sends it as `clientVersion` next to fixed OneSDK constants verified from the Global APK (`src/global_account.rs:19-24`, `:253-270`, `src/global_sdk.rs:25-38`). Nothing is fetched or hashed. |
-| `asset_updater_servers[]` | ADAPTED | `asset_dispatch.targets[]` (`src/asset_dispatch.rs:14-35`) | See [`asset_updater_servers`](#asset_updater_servers). |
+| `asset_updater_servers[]` | ADAPTED | `asset_dispatch.targets[]` (`src/asset_dispatch.rs:15-38`) | See [`asset_updater_servers`](#asset_updater_servers). |
 | `servers` (map region → `ServerConfig`) | ADAPTED | A single-region file is one region profile (`region`, `src/config.rs:28-29`). A multi-region file uses `regions: {jp: ..., hk: ...}` (`src/deployment.rs:23-24`), with 1–4 entries whose keys must equal `region` (a deprecated `tw` key is read as `hk`, `:27-48`) (`:113-123`), and root-only `listen`/`tls`/`logging`/`access_log` (`:124-132`). | See [`servers.<region>`](#serversregion). |
 | `registry` | ADAPTED | Separate `registry-serve REGISTRY_CONFIG` file (`src/main.rs:5-10`, `src/registry_service.rs:20-36`) | See [`registry`](#registry). |
 
@@ -227,8 +227,8 @@ Original: `AssetUpdaterInfo`, `Haruki-Sekai-API@07da6b80:src/config.rs:508-513`.
 
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `url` | ADAPTED | `asset_dispatch.targets[].origin` (`src/asset_dispatch.rs:26`) | Adds a durable outbox (`state_directory`, `history_capacity`), profile/revision identity and completion requirements (`:14-35`). HK/EN/KR dispatch from schema-3 resource snapshots when `resource_snapshot` is configured (`src/asset_dispatch.rs:294`, `src/client.rs:412`). |
-| `authorization` | ADAPTED | `targets[].token_env` (`src/asset_dispatch.rs:27`) | Adds optional `user_agent`. |
+| `url` | ADAPTED | `asset_dispatch.targets[].origin` (`src/asset_dispatch.rs:27`) | Adds a durable outbox (`state_directory`, `history_capacity`), profile/revision identity and completion requirements (`:15-38`). HK/EN/KR dispatch from schema-3 resource snapshots when `resource_snapshot` is configured (`src/asset_dispatch.rs:236-252`, `src/client.rs:412`). Worker health is at `GET /internal/v1/asset-dispatch/status`, never echoing the origin ([Decision 18](#decisions)). |
+| `authorization` | ADAPTED | `targets[].token_env` (`src/asset_dispatch.rs:28`) | Adds optional `user_agent`. |
 
 ## Environment variables
 
@@ -456,6 +456,15 @@ These generic capabilities are intentionally not restored in their original form
    PostgreSQL yet, so a breaker would only turn a 503 after 5 s into an immediate 503. An expired
    read answers the existing 503 `master_unavailable`. Publication, import and migration keep
    `timeout_seconds`.
+18. **Dispatch worker health is an internal status route, not `/health`.** The original reports
+   a failed mirror or updater push as `degraded` in its always-200 `/health`, with a closed-set
+   reason instead of Git error text (`Haruki-Sekai-API@9a53714:src/registry/http.rs:115-131`,
+   `src/updater/sync.rs:69-99`). Sirius keeps `/health` a liveness check. The asset dispatch
+   worker publishes its state through a watch channel to
+   `GET /internal/v1/asset-dispatch/status` under the internal token (`src/asset_dispatch.rs`,
+   `src/asset_dispatch_admin.rs`): always 200, independent of the command queue, readable
+   after the worker stopped, and made only of timestamps, counts, the recorded resource version
+   and closed-set codes. Unknown persisted failure codes count as `other`. No field is added.
 
 ## Original fields that were ignored by the original itself
 
@@ -590,3 +599,6 @@ classification and evidence:
   is added to the `master_database` `dsn` row and the reverse check; the moved
   `src/master_database.rs` references (including the environment variable list, Decisions 1 and
   16 and the `client_auth` rows) are refreshed.
+- **Dispatch worker status:** new [Decision 18](#decisions). The `asset_updater_servers[]` rows
+  point to the status route and their moved `src/asset_dispatch.rs` references are refreshed.
+  No field is added.
