@@ -39,7 +39,9 @@ on a UTF-8 boundary. Only application targets are enabled, even at debug/trace; 
 HTTP/TLS/debug payload logging is disabled. `RUST_LOG` is not an alternate configuration path.
 
 Allowed fields are message/event/stage/region/job_id/status/error_code, progress counters
-(completed/failed/total/bytes/cache_hits), listen/operation/attempt. Headers, bodies, URLs,
+(completed/failed/total/bytes/cache_hits), listen/operation/attempt, the asset dispatch
+profile/target (a destination digest prefix) and the node routing node/cooldown_ms/failover
+(a configured node name, never its origin). Headers, bodies, URLs,
 credentials, raw decoder errors and resource names are not recorded by application call sites.
 This is a field/target policy, not a sanitizer for arbitrary secrets embedded in allowed fields;
 keep future event messages static and use sanitized error codes. CLI error diagnostics and

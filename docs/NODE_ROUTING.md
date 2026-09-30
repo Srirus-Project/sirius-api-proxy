@@ -62,6 +62,13 @@ returns unavailable. Bounds: 100..300000 ms total timeout/cooldown, 1..4096 infl
 shows ordered names, priorities, failure counts, probe status and remaining cooldown. Origins,
 credential references and values are not returned. The public bearer cannot access this status.
 
+Health changes are logged once per transition, with the configured node name and the stable
+error `code` of the failure (never an origin or credential): `node_router_ready` (info, at
+startup), `node_cooldown_started` and `node_probe_failed` (warn, with `cooldown_ms`),
+`node_recovered` (info) and `node_unavailable` (warn, when no node completed a call). Every target
+failure is also logged at debug as `node_target_failed` with `failover` (whether another node is
+tried).
+
 ## Scope
 
 System/version, server discovery, announcements, public profiles, event decks and ranking routes

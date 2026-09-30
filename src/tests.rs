@@ -2638,6 +2638,24 @@ fn peer_maintenance_round_trips_through_the_observation() {
         AppError::Grpc(2)
     ));
 }
+#[test]
+fn node_health_reports_each_transition_once() {
+    let config = crate::node_routing::Config {
+        failure_threshold: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::node_routing::test_transitions(&config, &[true, true, true, false, true, false]),
+        [
+            "None",
+            "CooldownStarted",
+            "ProbeFailed",
+            "Recovered",
+            "None",
+            "None"
+        ]
+    );
+}
 #[tokio::test]
 async fn framework_client_errors_are_json_without_echoing_input() {
     let f = fixture(vec![]).await;

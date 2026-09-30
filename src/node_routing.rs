@@ -136,6 +136,14 @@ struct Permit<'a> {
     target: &'a Target,
     probe: bool,
 }
+/// A health change worth an operator log line; logged after the health lock is released.
+#[derive(Debug, PartialEq, Eq)]
+enum Transition {
+    None,
+    CooldownStarted,
+    ProbeFailed,
+    Recovered,
+}
 impl Target {
     fn admit(&self) -> Option<Permit<'_>> {
         let mut health = self.health.lock().ok()?;
@@ -152,18 +160,78 @@ impl Target {
     }
 }
 impl Permit<'_> {
-    fn finish(&self, failed: bool, config: &Config) {
-        if let Ok(mut health) = self.target.health.lock() {
-            if failed {
-                health.failures = health.failures.saturating_add(1);
-                if health.failures >= config.failure_threshold {
-                    health.open_until =
-                        Some(Instant::now() + Duration::from_millis(config.cooldown_ms));
-                }
-            } else {
-                health.failures = 0;
-                health.open_until = None;
+    fn finish(&self, failed: bool, config: &Config) -> Transition {
+        let Ok(mut health) = self.target.health.lock() else {
+            return Transition::None;
+        };
+        if failed {
+            health.failures = health.failures.saturating_add(1);
+            if health.failures >= config.failure_threshold {
+                let cooling = health.open_until.is_some();
+                health.open_until =
+                    Some(Instant::now() + Duration::from_millis(config.cooldown_ms));
+                return match (self.probe, cooling) {
+                    (true, _) => Transition::ProbeFailed,
+                    (false, false) => Transition::CooldownStarted,
+                    (false, true) => Transition::None,
+                };
             }
+            Transition::None
+        } else {
+            health.failures = 0;
+            if health.open_until.take().is_some() {
+                Transition::Recovered
+            } else {
+                Transition::None
+            }
+        }
+    }
+}
+/// Drives one target's health through `outcomes` (true = target fault), expiring any cooldown
+/// before each call so it is admitted as a probe, and returns the transitions.
+#[cfg(test)]
+pub(crate) fn test_transitions(config: &Config, outcomes: &[bool]) -> Vec<String> {
+    let target = Target {
+        name: "t".into(),
+        priority: 0,
+        remote: None,
+        health: Default::default(),
+    };
+    outcomes
+        .iter()
+        .map(|failed| {
+            if let Some(until) = target.health.lock().unwrap().open_until.as_mut() {
+                *until = Instant::now();
+            }
+            let permit = target.admit().expect("admitted");
+            format!("{:?}", permit.finish(*failed, config))
+        })
+        .collect()
+}
+fn log_transition(node: &str, transition: Transition, error: Option<&AppError>, config: &Config) {
+    let error_code = error.map(AppError::code);
+    match transition {
+        Transition::None => {}
+        Transition::CooldownStarted => tracing::warn!(
+            event = "node_cooldown_started",
+            node,
+            error_code,
+            cooldown_ms = config.cooldown_ms,
+            "Node reached the failure threshold; cooling down"
+        ),
+        Transition::ProbeFailed => tracing::warn!(
+            event = "node_probe_failed",
+            node,
+            error_code,
+            cooldown_ms = config.cooldown_ms,
+            "Node probe failed; cooldown extended"
+        ),
+        Transition::Recovered => {
+            tracing::info!(
+                event = "node_recovered",
+                node,
+                "Node recovered after cooldown"
+            )
         }
     }
 }
@@ -212,6 +280,11 @@ impl Router {
         }
         // Stable sort keeps local first on ties, followed by configured remote order.
         targets.sort_by_key(|target| target.priority);
+        tracing::info!(
+            event = "node_router_ready",
+            total = targets.len() as u64,
+            "Node routing enabled"
+        );
         let inflight = tokio::sync::Semaphore::new(config.max_inflight);
         Ok(Self {
             config,
@@ -324,11 +397,34 @@ impl Router {
                     | AppError::AccountUnavailable
                     | AppError::UnsupportedRegionOperation)
             );
-            permit.finish(target_fault, &self.config);
-            if !target_fault || (!definitely_not_executed && crate::client::authenticated(route)) {
+            let transition = permit.finish(target_fault, &self.config);
+            log_transition(
+                &target.name,
+                transition,
+                execution.result.as_ref().err(),
+                &self.config,
+            );
+            let stop = !definitely_not_executed && crate::client::authenticated(route);
+            if target_fault {
+                tracing::debug!(
+                    event = "node_target_failed",
+                    node = target.name.as_str(),
+                    error_code = execution.result.as_ref().err().map(AppError::code),
+                    failover = !stop,
+                    "Node call failed"
+                );
+            }
+            if !target_fault || stop {
                 return execution;
             }
             last = execution;
+        }
+        if let Err(error) = &last.result {
+            tracing::warn!(
+                event = "node_unavailable",
+                error_code = error.code(),
+                "No node completed the call"
+            );
         }
         last
     }
