@@ -36,6 +36,9 @@ pub struct Config {
     pub tls: Option<crate::server::TlsConfig>,
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
+    /// Opt-in negotiated gzip/zstd for public API JSON; absent or `enabled: false` is identity.
+    #[serde(default)]
+    pub http_compression: Option<crate::http_compression::Config>,
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,

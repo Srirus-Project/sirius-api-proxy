@@ -35,6 +35,8 @@ pub mod server;
 
 pub mod access_log;
 
+pub mod http_compression;
+
 pub mod application_log;
 
 pub mod asset_jobs;

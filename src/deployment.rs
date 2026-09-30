@@ -20,6 +20,8 @@ pub struct MultiConfig {
     pub tls: Option<crate::server::TlsConfig>,
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
+    #[serde(default)]
+    pub http_compression: Option<crate::http_compression::Config>,
     #[serde(deserialize_with = "region_map")]
     pub regions: BTreeMap<String, Config>,
 }
@@ -125,9 +127,10 @@ impl DeploymentConfig {
                         || c.tls.is_some()
                         || c.access_log.is_some()
                         || c.logging.is_some()
+                        || c.http_compression.is_some()
                     {
                         return Err(AppError::Config(
-                            "listen, tls, logging and access_log belong at the deployment root, not inside regions",
+                            "listen, tls, logging, access_log and http_compression belong at the deployment root, not inside regions",
                         ));
                     }
                     c.validate()?;
@@ -319,6 +322,11 @@ impl DeploymentConfig {
         let mut git_publishers = Vec::new();
         let mut notifiers = Vec::new();
         let mut router = api::health_router();
+        // Deployment-wide, like access_log; only the public API routers are wrapped.
+        let compression = match self {
+            Self::Single(c) => c.http_compression.clone(),
+            Self::Multi(m) => m.http_compression.clone(),
+        };
         let mut updaters = Vec::new();
         let mut syncers = Vec::new();
         let mut asset_dispatchers = Vec::new();
@@ -378,6 +386,7 @@ impl DeploymentConfig {
                 internal,
                 &api_prefix,
                 &internal_prefix,
+                compression.as_ref(),
             ));
         }
         let access = match self {

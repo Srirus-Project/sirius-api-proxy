@@ -27,6 +27,9 @@ backend:
 #   format: json
 #   output:
 #     type: stderr
+# Negotiated gzip/zstd for the public Master JSON routes; default off. See docs/HTTP_COMPRESSION.md.
+# http_compression:
+#   enabled: true
 
 # Optional verified Master owner (credentials must all differ):
 # owner:

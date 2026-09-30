@@ -117,7 +117,7 @@ pub fn json_client_errors(router: axum::Router) -> axum::Router {
     router.layer(axum::middleware::map_response(json_client_error))
 }
 async fn json_client_error(response: Response) -> Response {
-    use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+    use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
     let (error, code) = match response.status() {
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
             ("invalid request", "invalid_request")
@@ -139,6 +139,8 @@ async fn json_client_error(response: Response) -> Response {
     let (mut parts, _) = response.into_parts();
     parts.headers.remove(CONTENT_TYPE);
     parts.headers.remove(CONTENT_LENGTH);
+    // The replacement body is plain JSON, never the encoded original.
+    parts.headers.remove(CONTENT_ENCODING);
     let body = Json(json!({"error": error, "code": code})).into_response();
     let (body_parts, body) = body.into_parts();
     parts.headers.extend(body_parts.headers);

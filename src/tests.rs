@@ -44,6 +44,7 @@ fn config() -> Config {
         listen: Some("127.0.0.1:0".parse().unwrap()),
         tls: None,
         access_log: None,
+        http_compression: None,
         environment: "release".into(),
         endpoint: "https://api.bang-dream-on.jp".into(),
         client_version: "1.0.3".into(),
@@ -1026,6 +1027,8 @@ async fn remote_master_flow_downloads_verifies_publishes_and_skips_unchanged_ver
         );
         assert!(!headers.contains_key("x-player-credential"));
         assert!(!headers.contains_key("x-player-id"));
+        // Server-side compression must not turn on reqwest decoding (CDN fingerprint).
+        assert!(!headers.contains_key("accept-encoding"));
     }
     assert_eq!(game.received.lock().unwrap().len(), 3);
 }
@@ -2067,6 +2070,7 @@ fn deployment_rejects_ambiguous_region_and_token_scope() {
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: BTreeMap::new(),
     };
@@ -2147,6 +2151,7 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: configs,
     }));
@@ -5576,6 +5581,7 @@ fn deployment_tls_is_top_level_and_invalid_material_fails_preparation() {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), region)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(deployment.clone()))
@@ -6253,6 +6259,7 @@ async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
                     assert_eq!(headers["authorization"], "Bearer fixture-updater-only");
                     assert_eq!(headers["user-agent"], "SiriusClient/test");
                     assert!(!headers.contains_key("proxy-authorization"));
+                    assert!(!headers.contains_key("accept-encoding"));
                     if method == axum::http::Method::POST {
                         assert_eq!(headers["idempotency-key"], "key-1");
                         assert_eq!(
@@ -7116,6 +7123,7 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     let app=Router::new().route("/{*path}",any(|State(state):State<RemoteState>,method:axum::http::Method,headers:HeaderMap,body:axum::body::Bytes|async move{
         assert_eq!(headers["authorization"],"Bearer dispatch-only-token");
         assert_eq!(headers["user-agent"], "SiriusClient/dispatch");
+        assert!(!headers.contains_key("accept-encoding"));
         let mut state=state.lock().unwrap();
         if method==axum::http::Method::POST {
             state.1+=1;
@@ -7748,6 +7756,7 @@ async fn peer_deployment_is_opt_in_and_has_independent_region_credentials() {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), cfg), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(multi)).prepare().is_err());
@@ -7876,6 +7885,7 @@ async fn peer_transport_rejects_unbound_malformed_and_oversized_replies_without_
                 counter.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(headers["authorization"], "Bearer fixture-peer-only");
                 assert_eq!(headers["content-type"], "application/json");
+                assert!(!headers.contains_key("accept-encoding"));
                 let mut reply = json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":{"status":"success","data":{"largeId":"9223372036854775807"}}});
                 let mut mime = "application/json";
                 match case {
@@ -8494,6 +8504,7 @@ async fn node_routing_configuration_and_admin_scope_are_enforced_at_deployment()
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), cfg.clone()), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(deployment))
@@ -9188,6 +9199,7 @@ async fn master_current_conditional_read_works_on_regional_routes() {
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: BTreeMap::from([("hk".into(), hk)]),
     }));
@@ -14122,6 +14134,7 @@ fn standalone_registry_config(directory: std::path::PathBuf) -> crate::registry_
         tls: None,
         logging: None,
         access_log: None,
+        http_compression: None,
     }
 }
 #[tokio::test]
@@ -15689,9 +15702,16 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         DeploymentConfig::parse(multi).unwrap(),
         DeploymentConfig::Multi(_)
     ));
-    let optional = uncomment_block(&uncomment_block(multi, "tls:"), "access_log:");
+    let optional = uncomment_block(
+        &uncomment_block(&uncomment_block(multi, "tls:"), "access_log:"),
+        "http_compression:",
+    );
     assert!(optional.contains("\ntls:\n") && optional.contains("\naccess_log:\n"));
-    DeploymentConfig::parse(&optional).unwrap();
+    assert!(optional.contains("\nhttp_compression:\n"));
+    let DeploymentConfig::Multi(parsed) = DeploymentConfig::parse(&optional).unwrap() else {
+        panic!("multi-region example");
+    };
+    assert!(parsed.http_compression.unwrap().enabled);
     for (region, source) in [
         ("en", include_str!("../docs/examples/en.yaml")),
         ("hk", include_str!("../docs/examples/hk.yaml")),
@@ -15762,6 +15782,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         "accounts:",
         "tls:",
         "access_log:",
+        "http_compression:",
         "logging:",
         "asset_dispatch:",
         "node_routing:",
@@ -15785,7 +15806,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     assert!(git.commit.signing.is_some() && git.remote.is_some());
     let registry = &lf(include_str!("../docs/examples/master-registry.yaml"));
     yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
-    for block in ["tls:", "access_log:"] {
+    for block in ["tls:", "access_log:", "http_compression:"] {
         let uncommented = uncomment_block(registry, block);
         assert!(uncommented.contains(&format!("\n{block}\n")), "{block}");
         yaml_serde::from_str::<crate::registry_service::Config>(&uncommented).unwrap();
@@ -17821,6 +17842,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             format!("internal-{n}"),
             &format!("/api/v1/{n}"),
             &format!("/internal/v1/{n}"),
+            None,
         );
         let (status, body) = get_json(
             &app,
@@ -18549,6 +18571,7 @@ async fn hk_routes_serve_hk_and_alias_paths_are_not_found() {
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: BTreeMap::from([("hk".into(), regional_config(Region::Hk))]),
     }));
@@ -19421,6 +19444,7 @@ mod global_accounts {
             let requests = sdk.requests.lock().unwrap();
             let (_, headers, form) = &requests[0];
             assert_eq!(headers["user-agent"], "Mozilla/5.0 BSGameSDK");
+            assert!(!headers.contains_key("accept-encoding"));
             assert_eq!(headers["api-version"], "1");
             assert_eq!(headers["one-sdk-ver"], "1.25.0");
             assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
@@ -21928,4 +21952,650 @@ fn health_uptime_counts_from_first_mark_and_never_decreases() {
     let first = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
     let second = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
     assert!(second >= first);
+}
+
+fn compression_on() -> Option<crate::http_compression::Config> {
+    Some(crate::http_compression::Config { enabled: true })
+}
+/// A JSON string document of exactly `len` bytes.
+fn compression_json(len: usize) -> Vec<u8> {
+    let mut bytes = vec![b'"'];
+    bytes.extend((0..len - 2).map(|i| b"sirius-master-row-"[i % 18]));
+    bytes.push(b'"');
+    bytes
+}
+fn canned(
+    status: u16,
+    headers: &[(&'static str, &'static str)],
+    body: Vec<u8>,
+) -> axum::routing::MethodRouter {
+    let headers = headers.to_vec();
+    let body = Bytes::from(body);
+    axum::routing::get(move || {
+        let (headers, body) = (headers.clone(), body.clone());
+        async move {
+            let mut response = axum::http::Response::builder().status(status);
+            for (name, value) in headers {
+                response = response.header(name, value);
+            }
+            response.body(axum::body::Body::from(body)).unwrap()
+        }
+    })
+}
+const COMPRESSION_PATHS: [&str; 8] = [
+    "/json",
+    "/small",
+    "/threshold",
+    "/missing",
+    "/unavailable",
+    "/tar",
+    "/encoded",
+    "/not-modified",
+];
+fn compression_test_router() -> axum::Router {
+    const JSON: (&str, &str) = ("content-type", "application/json");
+    axum::Router::new()
+        .route(
+            "/json",
+            canned(
+                200,
+                &[
+                    JSON,
+                    ("etag", "\"fixture-etag\""),
+                    ("content-length", "65536"),
+                    ("x-master-version", "fixture-v1"),
+                ],
+                compression_json(65536),
+            ),
+        )
+        .route("/small", canned(200, &[JSON], compression_json(1023)))
+        .route("/threshold", canned(200, &[JSON], compression_json(1024)))
+        .route("/missing", canned(404, &[JSON], compression_json(2048)))
+        .route("/unavailable", canned(503, &[JSON], compression_json(2048)))
+        .route(
+            "/tar",
+            canned(
+                200,
+                &[
+                    ("content-type", "application/x-tar"),
+                    ("content-length", "2048"),
+                ],
+                vec![0; 2048],
+            ),
+        )
+        .route(
+            "/encoded",
+            canned(
+                200,
+                &[JSON, ("content-encoding", "gzip")],
+                compression_json(2048),
+            ),
+        )
+        .route(
+            "/not-modified",
+            canned(304, &[JSON, ("etag", "\"fixture-etag\"")], Vec::new()),
+        )
+}
+/// Sends `method path` with `headers`; answers (status, headers, raw body bytes).
+async fn negotiated(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+/// The representation bytes: decodes gzip/zstd, identity otherwise.
+fn decoded(headers: &axum::http::HeaderMap, bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    match headers.get("content-encoding").map(|v| v.to_str().unwrap()) {
+        None => bytes.to_vec(),
+        Some("gzip") => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .unwrap();
+            out
+        }
+        Some("zstd") => zstd::decode_all(bytes).unwrap(),
+        Some(other) => panic!("unexpected content-encoding {other}"),
+    }
+}
+fn varies_on_encoding(headers: &axum::http::HeaderMap) -> bool {
+    let vary = headers.get_all("vary").iter().collect::<Vec<_>>();
+    assert!(vary.len() <= 1, "duplicate Vary: {vary:?}");
+    vary.first()
+        .is_some_and(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept-encoding"))
+}
+/// A registry fixture whose single table is replaced by a >= 64 KiB JSON array with a matching
+/// tables.json index, so the served bytes cross the compression threshold.
+fn large_registry_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    crate::master::ImportReceipt,
+    Vec<u8>,
+) {
+    let (root, _input, output, receipt) = registry_fixture();
+    let rows = (0..2000)
+        .map(|i| json!({"id": i, "name": format!("fixture-row-{i}"), "value": i * 7}))
+        .collect::<Vec<_>>();
+    let table = serde_json::to_vec(&rows).unwrap();
+    assert!(table.len() >= 64 * 1024);
+    let snapshot = output.join(&receipt.snapshot);
+    std::fs::write(snapshot.join("MasterFixture.json"), &table).unwrap();
+    let mut index: crate::master_registry::Inventory =
+        serde_json::from_slice(&std::fs::read(snapshot.join("tables.json")).unwrap()).unwrap();
+    index.files = vec![crate::master_registry::file(
+        "MasterFixture.json".into(),
+        &table,
+    )];
+    std::fs::write(
+        snapshot.join("tables.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    (root, output, receipt, table)
+}
+
+#[tokio::test]
+async fn http_compression_layer_negotiates_gzip_zstd_and_identity() {
+    let app = crate::http_compression::wrap(compression_test_router(), compression_on().as_ref());
+    let original = compression_json(65536);
+    for (accept, expected) in [
+        (None, None),
+        (Some("gzip"), Some("gzip")),
+        (Some("zstd"), Some("zstd")),
+        (Some("gzip, zstd"), Some("zstd")),
+        (Some("gzip;q=1, zstd;q=0.5"), Some("gzip")),
+        (Some("br"), None),
+        (Some("*"), None),
+        (Some("gzip;q=0"), None),
+        (Some("identity"), None),
+    ] {
+        let headers = accept
+            .map(|a| vec![("accept-encoding", a)])
+            .unwrap_or_default();
+        let (status, headers, bytes) = negotiated(&app, "GET", "/json", &headers).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("content-encoding").map(|v| v.to_str().unwrap()),
+            expected,
+            "{accept:?}"
+        );
+        assert_eq!(decoded(&headers, &bytes), original, "{accept:?}");
+        assert!(varies_on_encoding(&headers), "{accept:?}");
+        assert_eq!(headers["x-master-version"], "fixture-v1");
+        assert_eq!(headers["content-type"], "application/json");
+        if expected.is_some() {
+            assert!(headers.get("content-length").is_none());
+            assert_eq!(headers["etag"], "W/\"fixture-etag\"");
+            assert!(bytes.len() < original.len() / 4);
+        } else {
+            assert_eq!(bytes, original);
+            assert_eq!(headers["content-length"], "65536");
+            assert_eq!(headers["etag"], "\"fixture-etag\"");
+        }
+    }
+    // The threshold is inclusive.
+    let (_, headers, bytes) =
+        negotiated(&app, "GET", "/threshold", &[("accept-encoding", "gzip")]).await;
+    assert_eq!(headers["content-encoding"], "gzip");
+    assert_eq!(decoded(&headers, &bytes), compression_json(1024));
+}
+
+#[tokio::test]
+async fn http_compression_skips_small_errors_non_json_and_conditional() {
+    let app = crate::http_compression::wrap(compression_test_router(), compression_on().as_ref());
+    let gzip = [("accept-encoding", "gzip, zstd")];
+    let (status, headers, bytes) = negotiated(&app, "GET", "/small", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(bytes, compression_json(1023));
+    assert!(varies_on_encoding(&headers));
+    for (path, code) in [("/missing", 404), ("/unavailable", 503)] {
+        let (status, headers, bytes) = negotiated(&app, "GET", path, &gzip).await;
+        assert_eq!(status, code);
+        assert!(headers.get("content-encoding").is_none(), "{path}");
+        assert!(headers.get("vary").is_none(), "{path}");
+        assert_eq!(bytes, compression_json(2048));
+    }
+    // Bundles keep their exact length and are never negotiated.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/tar", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    assert_eq!(headers["content-length"], "2048");
+    assert_eq!(bytes, vec![0; 2048]);
+    // Already-encoded bodies are passed through untouched.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/encoded", &gzip).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get_all("content-encoding")
+            .iter()
+            .collect::<Vec<_>>(),
+        ["gzip"]
+    );
+    assert_eq!(bytes, compression_json(2048));
+    // 304: empty, identity, strong validator, still varies.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/not-modified", &gzip).await;
+    assert_eq!(status, 304);
+    assert!(bytes.is_empty());
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["etag"], "\"fixture-etag\"");
+    assert!(varies_on_encoding(&headers));
+    // HEAD is answered normally, without a body.
+    let (status, _, bytes) = negotiated(&app, "HEAD", "/json", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn http_compression_disabled_is_byte_identical() {
+    let plain = compression_test_router();
+    let off = crate::http_compression::Config { enabled: false };
+    for app in [
+        crate::http_compression::wrap(compression_test_router(), None),
+        crate::http_compression::wrap(compression_test_router(), Some(&off)),
+    ] {
+        for path in COMPRESSION_PATHS {
+            for accept in [vec![], vec![("accept-encoding", "gzip, zstd")]] {
+                let expected = negotiated(&plain, "GET", path, &accept).await;
+                let actual = negotiated(&app, "GET", path, &accept).await;
+                assert!(actual.1.get("vary").is_none(), "{path}");
+                assert_eq!(actual, expected, "{path}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_api_compression_routing_and_conditional_revalidation() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let (_root, output, receipt, table) = large_registry_fixture();
+    let sha = crate::master_registry::digest(&table);
+    let mut cfg = regional_config(Region::Jp);
+    cfg.master_directory = Some(output);
+    cfg.http_compression = compression_on();
+    // Every route below is served locally; the configured game endpoint is never contacted.
+    let app = DeploymentConfig::Single(Box::new(cfg))
+        .prepare()
+        .unwrap()
+        .router;
+    let public = ("authorization", "Bearer public-jp");
+    let pinned = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{sha}",
+        receipt.snapshot
+    );
+    for (path, coding) in [
+        (pinned.as_str(), "gzip"),
+        ("/api/v1/master-data/tables/MasterFixture", "zstd"),
+    ] {
+        let (status, headers, bytes) =
+            negotiated(&app, "GET", path, &[public, ("accept-encoding", coding)]).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(headers["content-encoding"], coding);
+        assert_eq!(decoded(&headers, &bytes), table);
+        assert!(headers.get("content-length").is_none());
+        assert!(varies_on_encoding(&headers));
+        assert_eq!(headers["x-master-version"], "fixture-v1");
+        let weak = format!("W/\"{sha}\"");
+        assert_eq!(headers["etag"], weak.as_str());
+        // The weak validator revalidates; the empty 304 keeps the strong tag.
+        let (status, headers, bytes) = negotiated(
+            &app,
+            "GET",
+            path,
+            &[
+                public,
+                ("accept-encoding", coding),
+                ("if-none-match", &weak),
+            ],
+        )
+        .await;
+        assert_eq!(status, 304, "{path}");
+        assert!(bytes.is_empty());
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(headers["etag"], format!("\"{sha}\"").as_str());
+        assert!(varies_on_encoding(&headers));
+        // A client without Accept-Encoding sees 1.2.x bytes and the strong tag.
+        let (status, headers, bytes) = negotiated(&app, "GET", path, &[public]).await;
+        assert_eq!(status, 200);
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(bytes, table);
+        assert_eq!(headers["etag"], format!("\"{sha}\"").as_str());
+        assert!(varies_on_encoding(&headers));
+    }
+    let manifest = "/api/v1/master-data/manifest";
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        manifest,
+        &[public, ("accept-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(varies_on_encoding(&headers));
+    let published: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+    assert_eq!(published.files[0].sha256, sha);
+    let etag = headers["etag"].to_str().unwrap();
+    assert_eq!(
+        negotiated(&app, "GET", manifest, &[public, ("if-none-match", etag)])
+            .await
+            .0,
+        304
+    );
+    // Bundles stay identity with an exact length.
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        "/api/v1/master-data/bundle",
+        &[public, ("accept-encoding", "gzip, zstd")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-type"], "application/x-tar");
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    assert_eq!(headers["content-length"], bytes.len().to_string().as_str());
+    // Unauthenticated requests never cost encoder work.
+    let (status, headers, _) = negotiated(
+        &app,
+        "GET",
+        "/api/v1/master-data/tables/MasterFixture",
+        &[("accept-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    // Health and internal routes are never wrapped.
+    for (path, token) in [
+        ("/health", None),
+        ("/internal/v1/nodes", Some("Bearer internal-jp")),
+        ("/internal/v1/accounts", Some("Bearer internal-jp")),
+        ("/internal/v1/protocol", Some("Bearer internal-jp")),
+    ] {
+        let mut headers = vec![("accept-encoding", "gzip, zstd")];
+        headers.extend(token.map(|t| ("authorization", t)));
+        let (status, headers, _) = negotiated(&app, "GET", path, &headers).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(headers.get("content-encoding").is_none(), "{path}");
+        assert!(headers.get("vary").is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn multi_region_compression_is_root_only_and_peer_stays_identity() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        error::AppError,
+        region::Region,
+    };
+    let mut jp = regional_config(Region::Jp);
+    let peer = format!("SIRIUS_TEST_PEER_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&peer, "compression-peer");
+    jp.peer_token_env = Some(peer);
+    let identity = GameClient::new(jp.clone())
+        .unwrap()
+        .peer_identity()
+        .unwrap();
+    let mut m = MultiConfig {
+        logging: None,
+        tls: None,
+        access_log: None,
+        http_compression: compression_on(),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::from([
+            ("jp".into(), jp),
+            ("hk".into(), regional_config(Region::Hk)),
+        ]),
+    };
+    let app = DeploymentConfig::Multi(Box::new(m.clone()))
+        .prepare()
+        .unwrap()
+        .router;
+    for region in ["jp", "hk"] {
+        let (status, headers, bytes) = negotiated(
+            &app,
+            "GET",
+            &format!("/api/v1/{region}/regions"),
+            &[
+                ("authorization", &format!("Bearer public-{region}")),
+                ("accept-encoding", "gzip"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert!(varies_on_encoding(&headers));
+        let body: Value = serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+        assert_eq!(body["selected"], region);
+    }
+    // The peer wire stays identity for 1.2.x callers: a mismatched identity is answered
+    // locally without any game call.
+    let mut identity = identity;
+    identity.protocol_sha256 = "0".repeat(64);
+    let payload = peer_request(identity, json!({"type":"version"}));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/jp/peer/query")
+                .header("authorization", "Bearer compression-peer")
+                .header("content-type", "application/json")
+                .header("accept-encoding", "gzip, zstd")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("content-encoding").is_none());
+    assert!(response.headers().get("vary").is_none());
+    assert_eq!(
+        body(response).await["outcome"]["kind"]["type"],
+        "identity_mismatch"
+    );
+    // A region-level setting is rejected; the setting is deployment-wide.
+    m.regions.get_mut("hk").unwrap().http_compression = compression_on();
+    match DeploymentConfig::Multi(Box::new(m)).validate() {
+        Err(AppError::Config(message)) => assert!(message.contains("http_compression")),
+        _ => panic!("region-level http_compression must be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn standalone_registry_compression_public_only() {
+    let (_root, source, receipt, table) = large_registry_fixture();
+    let sha = crate::master_registry::digest(&table);
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.http_compression = compression_on();
+    let app = cfg.prepare().unwrap().router;
+    let read = ("authorization", "Bearer owner-read");
+    let zstd = ("accept-encoding", "zstd");
+    let (status, headers, bytes) =
+        negotiated(&app, "GET", "/api/v1/master-data/manifest", &[read, zstd]).await;
+    assert_eq!(status, 200);
+    assert!(varies_on_encoding(&headers));
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+    assert_eq!(manifest.snapshot, receipt.snapshot);
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        &format!(
+            "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{sha}",
+            manifest.snapshot
+        ),
+        &[read, zstd],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-encoding"], "zstd");
+    assert_eq!(headers["etag"], format!("W/\"{sha}\"").as_str());
+    assert_eq!(decoded(&headers, &bytes), table);
+    let (status, headers, bytes) =
+        negotiated(&app, "GET", "/api/v1/master-data/bundle", &[read, zstd]).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["content-length"], bytes.len().to_string().as_str());
+    let (status, headers, _) = negotiated(&app, "GET", "/health", &[zstd]).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none() && headers.get("vary").is_none());
+    // The real consumer sends no Accept-Encoding, receives identity and installs exactly.
+    let (origin, server) = peer_http_server(app).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let consumer_config = master_sync_config(origin, consumer.path().join("master"));
+    let sync = crate::master_sync::Syncer::new(
+        &consumer_config,
+        GameClient::new(consumer_config.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sync.update_once().await.unwrap()["action"], "updated");
+    assert_eq!(
+        crate::master::read_current(&consumer.path().join("master"), Some("MasterFixture"))
+            .unwrap()
+            .bytes,
+        table
+    );
+    server.abort();
+    // Internal owner routes stay identity.
+    let mut owner = registry_owner_config("http://127.0.0.1:1".into(), source);
+    owner.http_compression = compression_on();
+    let app = owner.prepare().unwrap().router;
+    let (status, headers, _) = negotiated(
+        &app,
+        "GET",
+        "/internal/v1/master-data/updater",
+        &[("authorization", "Bearer registry-admin"), zstd],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none() && headers.get("vary").is_none());
+}
+
+#[test]
+fn http_compression_config_is_strict() {
+    use crate::deployment::DeploymentConfig;
+    let single = lf(include_str!("../sirius-api-config.example.yaml"));
+    let multi = lf(include_str!("../sirius-multi-region-config.example.yaml"));
+    let registry = lf(include_str!("../docs/examples/master-registry.yaml"));
+    let with = |base: &str, block: &str| format!("{base}\n{block}");
+    for enabled in [true, false] {
+        let block = format!("http_compression:\n  enabled: {enabled}\n");
+        let DeploymentConfig::Single(c) = DeploymentConfig::parse(&with(&single, &block)).unwrap()
+        else {
+            panic!("single-region example");
+        };
+        assert_eq!(c.http_compression.unwrap().enabled, enabled);
+        let DeploymentConfig::Multi(m) = DeploymentConfig::parse(&with(&multi, &block)).unwrap()
+        else {
+            panic!("multi-region example");
+        };
+        assert_eq!(m.http_compression.unwrap().enabled, enabled);
+        let r: crate::registry_service::Config =
+            yaml_serde::from_str(&with(&registry, &block)).unwrap();
+        assert_eq!(r.http_compression.unwrap().enabled, enabled);
+    }
+    for block in [
+        "http_compression:\n  enabled: true\n  level: 9\n",
+        "http_compression: {}\n",
+        "http_compression:\n  enabled: \"true\"\n",
+        "http_compression: true\n",
+    ] {
+        assert!(
+            DeploymentConfig::parse(&with(&single, block)).is_err(),
+            "{block}"
+        );
+        assert!(
+            DeploymentConfig::parse(&with(&multi, block)).is_err(),
+            "{block}"
+        );
+        assert!(
+            yaml_serde::from_str::<crate::registry_service::Config>(&with(&registry, block))
+                .is_err(),
+            "{block}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_request_body_decompression() {
+    use std::io::Write;
+    let gzip = |bytes: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    let cfg = master_sync_config(
+        "http://127.0.0.1:9".into(),
+        tempfile::tempdir().unwrap().keep(),
+    );
+    let compression = compression_on();
+    let app = crate::error::json_client_errors(api::router_at(
+        GameClient::new(cfg).unwrap(),
+        "api".into(),
+        "internal".into(),
+        "/api/v1",
+        "/internal/v1",
+        compression.as_ref(),
+    ));
+    let hint =
+        serde_json::to_vec(&json!({"scope":registry_scope(),"content_sha256":"0".repeat(64)}))
+            .unwrap();
+    let bomb = gzip(&vec![b' '; 1024 * 1024]);
+    assert!(bomb.len() < 4096);
+    let send = |body: Vec<u8>, encoded: bool| {
+        let mut request = Request::post("/internal/v1/master-data/sync")
+            .header("authorization", "Bearer internal")
+            .header("content-type", "application/json");
+        if encoded {
+            request = request.header("content-encoding", "gzip");
+        }
+        app.clone()
+            .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+    };
+    // The plain hint is accepted; its gzip form and a small bomb are never inflated.
+    assert_eq!(send(hint.clone(), false).await.unwrap().status(), 202);
+    for encoded in [gzip(&hint), bomb] {
+        let response = send(encoded, true).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(response.headers().get("content-encoding").is_none());
+        assert_eq!(body(response).await["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn json_client_errors_drops_content_encoding() {
+    let app = crate::error::json_client_errors(axum::Router::new().route(
+        "/encoded",
+        canned(
+            404,
+            &[("content-type", "text/plain"), ("content-encoding", "gzip")],
+            b"not json".to_vec(),
+        ),
+    ));
+    let (status, headers, bytes) = negotiated(&app, "GET", "/encoded", &[]).await;
+    assert_eq!(status, 404);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":"not found","code":"not_found"})
+    );
 }

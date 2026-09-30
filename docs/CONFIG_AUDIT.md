@@ -54,7 +54,8 @@ Original: `Config`, `Haruki-Sekai-API@07da6b80:src/config.rs:515-538`.
 | `master_database` | ADAPTED | `master_database: {connection, interval_seconds}` (`src/master_database_worker.rs:9-15`) | See [`master_database`](#master_database). |
 | `apphash_sources[]` (`type`, `dir`, `url`) | IGNORED_BY_ORIGINAL / NOT_APPLICABLE | none | The original marks it deprecated and ignored (`Haruki-Sekai-API@07da6b80:src/config.rs:497-506`) and warns at startup (`:570-587`). Sekai app hash. Sirius client identity is the static `client_version` (`src/config.rs:41`); Global PlayerLogin sends it as `clientVersion` next to fixed OneSDK constants verified from the Global APK (`src/global_account.rs:19-24`, `:253-270`, `src/global_sdk.rs:25-38`). Nothing is fetched or hashed. |
 | `asset_updater_servers[]` | ADAPTED | `asset_dispatch.targets[]` (`src/asset_dispatch.rs:15-38`) | See [`asset_updater_servers`](#asset_updater_servers). |
-| `servers` (map region → `ServerConfig`) | ADAPTED | A single-region file is one region profile (`region`, `src/config.rs:28-29`). A multi-region file uses `regions: {jp: ..., hk: ...}` (`src/deployment.rs:23-24`), with 1–4 entries whose keys must equal `region` (a deprecated `tw` key is read as `hk`, `:27-48`) (`:113-123`), and root-only `listen`/`tls`/`logging`/`access_log` (`:124-132`). | See [`servers.<region>`](#serversregion). |
+| `servers` (map region → `ServerConfig`) | ADAPTED | A single-region file is one region profile (`region`, `src/config.rs:28-29`). A multi-region file uses `regions: {jp: ..., hk: ...}` (`src/deployment.rs:23-24`), with 1–4 entries whose keys must equal `region` (a deprecated `tw` key is read as `hk`, `:27-48`) (`:113-123`), and root-only `listen`/`tls`/`logging`/`access_log`/`http_compression` (`:126-135`). | See [`servers.<region>`](#serversregion). |
+| (no field; response compression on every route) | ADAPTED | Opt-in root `http_compression: {enabled}` (`src/config.rs:41`, `src/deployment.rs:24`, `src/registry_service.rs:37`, `src/http_compression.rs`) | The original applies `CompressionLayer::new()` unconditionally to all routes, internal and peer included (`Haruki-Sekai-API@9a53714:src/api/routes.rs:141`), and enables reqwest `gzip`/`brotli`/`zstd` for its outbound clients (`Haruki-Sekai-API@9a53714:Cargo.toml:17`). See [Decision 24](#decisions). |
 | `registry` | ADAPTED | Separate `registry-serve REGISTRY_CONFIG` file (`src/main.rs:5-10`, `src/registry_service.rs:20-36`) | See [`registry`](#registry). |
 
 ## Regions
@@ -212,7 +213,7 @@ Original: `RegistryConfig` / `MusicMetasConfig`, `Haruki-Sekai-API@07da6b80:src/
 
 | Original field | Status | Sirius mapping | Evidence/notes |
 | --- | --- | --- | --- |
-| `host`, `port` (`0.0.0.0:9998`) | ADAPTED | `listen` (required, `src/registry_service.rs:23`) | Also `tls`, `logging` and `access_log` (`:33-35`, `src/main.rs:11`, `src/registry_service.rs:245-247`). |
+| `host`, `port` (`0.0.0.0:9998`) | ADAPTED | `listen` (required, `src/registry_service.rs:23`) | Also `tls`, `logging`, `access_log` and `http_compression` (`:33-37`, `src/main.rs:11`, `src/registry_service.rs:220`, `:254-258`). |
 | `token` (mutations only, reads open) | ADAPTED | `token_env` for reads (reads are authenticated) and `owner.internal_token_env` for internal routes (`src/registry_service.rs:24`, `:105-116`; `src/registry_owner.rs:13`) | Stricter than the original. |
 | `state_dir` | ADAPTED | `backend: {kind: files, directory}` (`src/registry_service.rs:39`) | |
 | `state_dsn` | ADAPTED | `backend: {kind: postgres, connection}` (`src/registry_service.rs:40`) | |
@@ -519,6 +520,30 @@ These generic capabilities are intentionally not restored in their original form
    (`src/api.rs` `master_document`, `registry_document`), so a 304 never hides corruption. It
    sends `private, no-cache` like the manifest and no `Last-Modified`, whose file times differ
    per node and per reimport. No configuration surface.
+24. **Response compression is opt-in, negotiated, and limited to public reads.** The original
+   has no setting: `CompressionLayer::new()` wraps every route, including internal and peer
+   routes (`Haruki-Sekai-API@9a53714:src/api/routes.rs:141`), and its outbound reqwest clients
+   enable `gzip`, `brotli` and `zstd` (`Haruki-Sekai-API@9a53714:Cargo.toml:17`). Sirius adds a
+   root `http_compression: {enabled}` block (single file, multi-region root only, registry
+   root), absent by default so an unchanged configuration answers exactly as 1.2.x
+   (`src/http_compression.rs`, [HTTP_COMPRESSION.md](HTTP_COMPRESSION.md)):
+   - Only the public API router (`src/api.rs` `router_at`) and the registry's public Master
+     routes (`src/registry_service.rs`) are wrapped. `/health`, internal (accounts, identity,
+     player data, owner), peer and asset dispatch admin routes stay identity, which keeps the
+     peer wire compatible with 1.2.x and keeps private output out of compression length
+     oracles.
+   - gzip and zstd at the fastest level; status 200 `application/json` of at least 1024 bytes
+     only, so errors, 304s and unauthenticated requests never cost encoder work and bundles
+     keep their exact Content-Length. Encoded responses send a weak ETag and every negotiable
+     JSON response `Vary: Accept-Encoding`.
+   - No request decompression: a compressed request body is parsed as-is and rejected.
+   - Server-side encoders only (tower-http `compression-*` on the copy reqwest already uses).
+     reqwest features are unchanged, so outbound SDK, CDN, peer, dispatch and sync requests
+     keep sending no `Accept-Encoding`; tests assert the header's absence. Transport
+     compression for sync and peer traffic stays refused (no WAN sync; Cloudflare already
+     compresses; it would change outbound fingerprints; peers accept identity only).
+   - `json_client_errors` also drops `Content-Encoding` when it replaces a non-JSON body
+     (`src/error.rs`), so a rewritten error can never be labeled with the original coding.
 
 ## Original fields that were ignored by the original itself
 
@@ -557,7 +582,8 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | | `login_min_interval_seconds`, `max_logins_per_day` | `src/global_account.rs:218-235` |
 | | `aegis_cooldown_seconds`, `concurrent_device_limit` | `src/accounts.rs:330-345` |
 | Global identity file (1.2.1, `src/global_account.rs:83-106`, `src/global_sdk.rs:50-69`) | `schema`, `sdk.{uid, access_key, id_token, mid}`, `players.<region>.expected_player_id`, `device.{udid, model, pf_ver, dp, net, operators, adid, lang, time_zone, isRoot}`, `device.unity_{device_model, operating_system, device_id}` | `src/global_account.rs:127-162`, `:253-270`, `src/global_sdk.rs:101-114`, `:239-252`, `src/client.rs:854` |
-| `MultiConfig` (`src/deployment.rs:13-25`) | all; `regions` accepts the deprecated `tw` key (1.2.1) | `src/deployment.rs:156-201`, `:383-389`, `src/application_log.rs:78-93` |
+| `http_compression` (1.3.0, `src/http_compression.rs`) | `enabled` | `http_compression::wrap`, called by `api::router_at` (`src/api.rs:161`) with the root value chosen in `src/deployment.rs:326-329`, and by `src/registry_service.rs:220` ([Decision 24](#decisions)) |
+| `MultiConfig` (`src/deployment.rs:13-27`) | all; `regions` accepts the deprecated `tw` key (1.2.1) | `src/deployment.rs:156-201`, `:383-389`, `src/application_log.rs:78-93` |
 | Registry `Config`, `Backend` (`src/registry_service.rs:20-42`), `owner` (`src/registry_owner.rs:7-20`) | all | `src/registry_service.rs:56-247`, `src/registry_owner.rs:33-87`, `src/main.rs:11`; `owner.retention` (1.3.0) is passed to `Syncer::standalone` (`src/registry_owner.rs:62-71`) and requires `source` (`:52-59`) |
 | `master-db-*` `Import` (`src/master_database.rs:73-80`) | `source`, `scope`, `database` | `src/main.rs:92-113` |
 
@@ -582,16 +608,18 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 Every shipped example is parsed by tests, with its documented optional blocks uncommented:
 
 - `sirius-api-config.example.yaml` as shipped (`src/tests.rs:2080-2082`), and each commented
-  optional block (`master_update`, `master_sync`, `master_retention`, `accounts`, `tls`, `access_log`, `logging`,
+  optional block (`master_update`, `master_sync`, `master_retention`, `accounts`, `tls`, `access_log`,
+  `http_compression`, `logging`,
   `asset_dispatch`, `node_routing`, `master_notify`, `master_git` with its nested `signing`,
   `master_database`, `client_auth`) uncommented one at a time.
-- `sirius-multi-region-config.example.yaml` as shipped and with its commented `tls:` and
-  `access_log:` blocks uncommented, and with the deprecated `tw` region key
+- `sirius-multi-region-config.example.yaml` as shipped and with its commented `tls:`,
+  `access_log:` and `http_compression:` blocks uncommented, and with the deprecated `tw` region key
   (`multi_region_alias_key_maps_to_hk_and_both_keys_are_rejected`).
 - `docs/examples/{en,hk,kr}.yaml` as shipped and with every commented Master, resource snapshot
   and Global account line uncommented; `hk.yaml` also with the deprecated `tw` region.
 - `docs/examples/global-identity.example.json` through the identity-file parser.
-- `docs/examples/master-registry.yaml` as shipped and with `tls:`, `access_log:`, `notify:`, each
+- `docs/examples/master-registry.yaml` as shipped and with `tls:`, `access_log:`,
+  `http_compression:`, `notify:`, each
   of the two `owner:` variants (the synchronizing one with its `retention`) and the PostgreSQL
   `backend:` uncommented.
 - `docs/examples/master-database.yaml` as shipped and with `root_certificate` uncommented.
@@ -663,5 +691,8 @@ classification and evidence:
   No field is added.
 - **Health uptime:** new [Decision 21](#decisions). `/health` adds `uptime_secs` and remains
   liveness only. No field is added.
+- **Response compression:** new [Decision 24](#decisions) and a top-level row for the
+  original's unconditional `CompressionLayer`. Root `http_compression` joins the root-only
+  lists (`servers`, `registry`), the reverse check and the example coverage.
 - **Current Master ETag:** new [Decision 23](#decisions). A behavior-only change on the
   `/master-data` reads; no field is added.

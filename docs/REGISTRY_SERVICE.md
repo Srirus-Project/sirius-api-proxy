@@ -50,6 +50,10 @@ local snapshot UUID. Always use the ID returned by the registry; a local writer 
 a database registry address. Retention can remove old content, producing 404. Manifest ETags
 cover the adapted bytes, and manifests require revalidation. Verified table responses have
 immutable private caching. Integrity verification precedes conditional 304 handling.
+The optional root `http_compression: {enabled: true}` negotiates gzip/zstd on these public
+routes only, never on `/health` or the internal owner routes; an encoded response sends its
+ETag weak (`W/"<hash>"`), which `If-None-Match` still matches. See
+[response compression](HTTP_COMPRESSION.md).
 
 History returns `{backend, history}`. File history contains committed snapshot IDs and uses
 `next_before` as its snapshot cursor; since 1.3.0 its entries also include a nullable
@@ -88,10 +92,10 @@ successful partial archive. Build work is bounded to 120 seconds after manifest 
 additional simultaneous bundle requests return 503. Temporary files and permits are dropped on
 failure, disconnect or completion, including cancellation while a bounded blocking write finishes.
 
-The response includes exact Content-Length, an ETag covering the actual tar bytes, Master version,
-scoped content hash and a safe content-derived download filename. Bundle responses use private
-`no-cache`: reimporting identical file content can change the embedded local snapshot UUID and
-therefore the archive bytes. Conditional 304 is considered only after full source verification
+The response is never content-encoded. It includes exact Content-Length, an ETag covering the
+actual tar bytes, Master version, scoped content hash and a safe content-derived download
+filename. Bundle responses use private `no-cache`: reimporting identical file content can
+change the embedded local snapshot UUID and therefore the archive bytes. Conditional 304 is considered only after full source verification
 and archive construction, so it cannot conceal later corruption. Range/resume is not implemented.
 Clients must still check successful HTTP completion before using or extracting a downloaded file.
 

@@ -103,6 +103,10 @@ response_cache:
 #   trusted_proxies: [] # only configured CIDRs may supply forwarding headers
 #   proxy_header: x-forwarded-for
 
+# Optional negotiated gzip/zstd for public JSON responses; default off. See docs/HTTP_COMPRESSION.md.
+# http_compression:
+#   enabled: true
+
 # Optional application events; default is info/text on stderr. See docs/APPLICATION_LOG.md.
 # logging:
 #   level: info

@@ -61,6 +61,7 @@ pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String
         internal_token,
         "/api/v1",
         "/internal/v1",
+        None,
     ))
 }
 
@@ -102,6 +103,7 @@ pub fn router_at(
     internal_token: String,
     api_prefix: &str,
     internal_prefix: &str,
+    compression: Option<&crate::http_compression::Config>,
 ) -> Router {
     let api = Router::new()
         .route("/system", get(system))
@@ -155,6 +157,8 @@ pub fn router_at(
             (Arc::<str>::from(api_token), client.clone()),
             authorize_api,
         ));
+    // Public reads only; internal account, identity and player-data output stays identity.
+    let api = crate::http_compression::wrap(api, compression);
     let internal = Router::new()
         .route("/nodes", get(nodes))
         .route("/protocol", get(protocol_status))

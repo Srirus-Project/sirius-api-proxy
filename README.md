@@ -213,6 +213,9 @@ For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
 
 Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
 
+Negotiated gzip/zstd for public JSON responses is opt-in at the service root; see
+[response compression](docs/HTTP_COMPRESSION.md).
+
 See [application logging](docs/APPLICATION_LOG.md) for process logs, separate from HTTP access logs.
 
 Every configuration field of the original Haruki-Sekai-API is mapped, adapted or excluded with

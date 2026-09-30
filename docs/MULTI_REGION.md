@@ -6,7 +6,8 @@ remove regions you do not operate. Global CDN roots are the first line of each r
 verified server list; supply the corresponding environment secrets.
 
 The top-level `listen` binds one HTTP listener, or HTTPS when [top-level TLS](LISTENER_TLS.md) is configured. `regions` maps region names to the
-same client settings used by a single-region file, excluding `listen`, `tls` and `access_log`. Each map
+same client settings used by a single-region file, excluding `listen`, `tls`, `access_log` and
+[`http_compression`](HTTP_COMPRESSION.md), which are set once at the root. Each map
 key must match its client's region. A deprecated `tw` key is read as `hk`
 ([the `hk` identifier](REGIONS.md#the-hk-identifier)); a map with both is rejected. Empty maps, unknown settings, nested listeners,
 CN and mismatched known service roots fail at startup before binding the listener.

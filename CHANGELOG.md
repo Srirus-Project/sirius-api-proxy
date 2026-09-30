@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Optional negotiated response compression: root `http_compression: {enabled: true}` (single
+  file, multi-region root only, standalone registry) encodes status 200 `application/json`
+  bodies of at least 1024 bytes with gzip or zstd (fastest level) on the public API and the
+  registry's public Master routes, with a weak ETag and `Vary: Accept-Encoding`. `/health`,
+  internal, peer and asset dispatch admin routes, error bodies, 304s and bundles stay identity;
+  request bodies are never decoded. Absent or disabled, responses are byte-identical to 1.2.x.
+  Outbound SDK, CDN, peer, dispatch and sync requests still send no `Accept-Encoding`.
+- `json_client_errors` now also drops `Content-Encoding` when it replaces a non-JSON error body.
 - `GET /api/v1/master-data` and `/master-data/tables/{name}` (and their regional paths) now
   return a strong content ETag (the SHA-256 of the exact bytes; for a table it equals the pinned
   table ETag) with `Cache-Control: private, no-cache`, and answer `If-None-Match` with an empty

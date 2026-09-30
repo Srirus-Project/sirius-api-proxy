@@ -168,6 +168,8 @@ original bytes, `x-master-version` and a hash ETag. Manifest ETags cover the who
 manifest responses use `private, no-cache` because a pruned then republished content hash can
 have a different local snapshot UUID. Tables use immutable private caching. Hash verification
 runs before conditional 304 handling, so invalid stored bytes cannot be hidden by an old ETag.
+With [response compression](HTTP_COMPRESSION.md) negotiated, an encoded response sends the ETag
+weak (`W/"<hash>"`); weak `If-None-Match` values still match.
 
 A missing/pruned hash or unlisted table is 404. Missing configured database, connection failure,
 missing listed table, oversized or corrupt content is 503. There is no fallback to local files.

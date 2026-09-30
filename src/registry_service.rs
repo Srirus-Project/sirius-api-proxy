@@ -33,6 +33,8 @@ pub struct Config {
     pub tls: Option<crate::server::TlsConfig>,
     pub logging: Option<crate::application_log::Config>,
     pub access_log: Option<crate::access_log::Config>,
+    /// Opt-in negotiated gzip/zstd for the public Master routes only.
+    pub http_compression: Option<crate::http_compression::Config>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -214,6 +216,8 @@ impl Config {
                 crate::api::authorize,
             ))
             .with_state(state.clone());
+        // `/health` and the internal owner routes below stay identity.
+        let routes = crate::http_compression::wrap(routes, self.http_compression.as_ref());
         let prefix = if self.regional_paths {
             format!("/api/v1/{}/master-data", self.scope.region.name())
         } else {

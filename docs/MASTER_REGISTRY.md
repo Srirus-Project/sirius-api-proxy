@@ -74,6 +74,9 @@ A matching condition returns an empty 304. Digest-qualified table URLs return a 
 `private, max-age=31536000, immutable`. Authorization still precedes all handlers. A file is
 read and verified before returning a conditional response, so a missing/corrupted file cannot
 be concealed by a stale ETag. `x-master-version` is present on successful/conditional responses.
+When [response compression](HTTP_COMPRESSION.md) is enabled and negotiated, an encoded JSON
+response sends the same hash as a weak ETag (`W/"<hash>"`); weak `If-None-Match` values still
+match. Bundles are never content-encoded, so their exact Content-Length holds.
 
 The CURRENT-relative `/master-data` and `/master-data/tables/{name}` reads use the same
 conditional handling. Their strong ETag is the SHA-256 of the exact bytes returned, so a
