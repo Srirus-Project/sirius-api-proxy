@@ -118,6 +118,27 @@ network/protocol failures return 502 and timeouts return 504. Other upstream err
 502/503. Invalid caller tokens return 401; an unconfigured game account returns 503.
 Raw credential fields and grpc-message values are not returned to callers.
 
+Errors are JSON `{"error": "<message>", "code": "<code>"}`; game failures add `grpc_status`.
+Match on `code`, which is stable; the message may be reworded. Framework rejections (malformed
+path/query/body, unknown route, wrong method, oversized or wrongly typed body) use the same shape
+without echoing the input.
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `maintenance` | 503 | The game answered `UNDER_MAINTENANCE`; not retried, no account penalty |
+| `upstream_grpc` | 502 (503 for gRPC 14) | Another game gRPC failure; see `grpc_status` |
+| `upstream_timeout` / `upstream_transport` / `upstream_proxy` / `upstream_protocol` | 504 / 502 | Upstream call failed |
+| `account_unavailable` | 503 | No game account is configured or healthy |
+| `node_unavailable`, `peer_account_unavailable`, `snapshot_unavailable`, `master_unavailable`, `auth_unavailable` | 503 | Dependency temporarily unavailable |
+| `not_found` | 404 | Unknown route, Master item or looked-up player |
+| `invalid_request` | 400 (422 for a well-formed JSON body of the wrong shape) | Rejected input |
+| `method_not_allowed`, `payload_too_large`, `unsupported_media_type` | 405, 413, 415 | Framework rejections |
+| `unauthorized`, `forbidden` | 401, 403 | Caller authentication/authorization |
+| `unsupported_operation` | 501 | Not supported for this region's protocol |
+| `peer_identity_mismatch` | 409 | Peer protocol identity changed |
+| `protocol_definition_invalid` | 422 | Proto bundle reload failed |
+| `invalid_configuration` | 502 | Server-side configuration error |
+
 ## Master data and protocol updates
 
 ```sh

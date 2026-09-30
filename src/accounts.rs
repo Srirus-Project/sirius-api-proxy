@@ -304,7 +304,7 @@ impl Account {
             Err(error) => error,
         };
         let status = match error {
-            AppError::Grpc(status) => Some(*status),
+            AppError::Grpc(status) | AppError::Maintenance(status) => Some(*status),
             _ => None,
         };
         let code = code.filter(|c| {
@@ -559,6 +559,10 @@ impl Lease {
     ) {
         if let (Some(login), Some(_)) = (login, self.account.global()) {
             self.account.global_signal(result, code, policy, login);
+            return;
+        }
+        if code == Some("UNDER_MAINTENANCE") {
+            // Maintenance says nothing about this account (also covers gRPC 14 + maintenance).
             return;
         }
         let mut h = self.account.health();

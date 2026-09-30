@@ -49,7 +49,9 @@ immediately for authenticated reads. No concurrent hedging or same-target retry 
 the router. The executing node retains its existing local anonymous retry policy.
 
 Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a Global
-looked-up player that does not exist) are terminal rather than presumed target failures. Target failures increment a passive counter; after the threshold they enter
+looked-up player that does not exist) are terminal rather than presumed target failures. A peer
+reports maintenance as its gRPC status plus `observation.maintenance`; the caller answers 503
+`maintenance` (a 1.2.3 caller answers 502), so the wire format is unchanged. Target failures increment a passive counter; after the threshold they enter
 cooldown. An expired cooldown admits one probe while other calls use remaining targets. Successful
 execution or a valid game outcome resets the counter. Cancelling a probe releases its slot.
 Health is in-memory and resets on process restart. If every target is cooling down, the request

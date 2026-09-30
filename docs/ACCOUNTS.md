@@ -43,7 +43,9 @@ successful credential reload. Transport/protocol failures, deadlines and gRPC
 8/13/14 increment its failure count; reaching `failure_threshold` cools it down for
 `cooldown_seconds`. Threshold is 1..100 and cooldown is 1..3600 seconds. A successful
 call clears transient failures. Failures before an authenticated attempt (including
-anonymous bootstrap and queue deadlines) do not penalize the account. Exhaustion
+anonymous bootstrap and queue deadlines) do not penalize the account, and neither does a
+response carrying `UNDER_MAINTENANCE` (whatever its gRPC status; it answers 503 `maintenance`).
+Exhaustion
 returns 503. The failed logical request is never automatically replayed with another
 account; a later request can select another healthy account.
 

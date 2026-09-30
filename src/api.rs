@@ -277,7 +277,7 @@ async fn system(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppErro
         Ok(_) => Ok(Json(
             json!({"status":"available","region":c.region(),"area_id":c.region().area_id(),"platform":c.platform(),"protocol_family":c.region().family(),"supported_rpcs":c.supported_routes(),"observation":execution.observation}),
         )),
-        Err(AppError::Grpc(_)) => Ok(Json(
+        Err(AppError::Grpc(_) | AppError::Maintenance(_)) => Ok(Json(
             json!({"status":"unavailable","region":c.region(),"platform":c.platform(),"observation":execution.observation}),
         )),
         Err(e) => Err(e),

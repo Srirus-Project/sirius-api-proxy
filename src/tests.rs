@@ -2519,6 +2519,182 @@ async fn pool_bootstrap_failure_and_caller_cancellation_do_not_poison_health() {
     gate.add_permits(1);
 }
 
+fn maintenance_reply(grpc_status: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-status", grpc_status.parse().unwrap());
+    reply
+        .trailers
+        .insert("grpc-message", "secret%20must-not-leak".parse().unwrap());
+    reply
+        .trailers
+        .insert("x-sirius-error-code", "UNDER_MAINTENANCE".parse().unwrap());
+    reply
+}
+#[tokio::test]
+async fn maintenance_answers_503_with_a_code_and_never_penalizes_accounts() {
+    let f = fixture(vec![maintenance_reply("2")]).await;
+    let app = api::router(client(&f, config()), "api".into(), "internal".into());
+    let r = app
+        .oneshot(
+            Request::get("/api/v1/announcements")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    let value = body(r).await;
+    assert_eq!(
+        value,
+        json!({"error":"game is under maintenance","code":"maintenance","grpc_status":2})
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+
+    // gRPC 14 with the maintenance code does not count toward the cooldown threshold.
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg.account_pool.failure_threshold = 1;
+    cfg.account_pool.cooldown_seconds = 60;
+    let f = fixture(vec![
+        Reply::version(),
+        maintenance_reply("14"),
+        empty_profile_reply(),
+        unavailable_reply(),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Maintenance(14))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+    // Plain gRPC 14 still cools the account down.
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        1
+    );
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::AccountUnavailable)
+    ));
+}
+#[test]
+fn every_error_has_a_stable_code_and_json_body() {
+    use axum::response::IntoResponse;
+    let cases = [
+        (AppError::NotFound, 404, "not_found"),
+        (AppError::InvalidRequest, 400, "invalid_request"),
+        (AppError::AccountUnavailable, 503, "account_unavailable"),
+        (AppError::Maintenance(2), 503, "maintenance"),
+        (AppError::Grpc(2), 502, "upstream_grpc"),
+        (AppError::Grpc(14), 503, "upstream_grpc"),
+        (AppError::Timeout, 504, "upstream_timeout"),
+        (AppError::Config("x"), 502, "invalid_configuration"),
+    ];
+    for (error, status, code) in cases {
+        let response = error.into_response();
+        assert_eq!(response.status(), status);
+        let bytes = futures::executor::block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], code);
+        assert!(value["error"].is_string());
+        assert_eq!(
+            value.get("grpc_status").is_some(),
+            code.starts_with("upstream_grpc") || code == "maintenance"
+        );
+    }
+}
+#[test]
+fn peer_maintenance_round_trips_through_the_observation() {
+    let failure: crate::peer::Failure = AppError::Maintenance(2).into();
+    assert!(matches!(
+        failure,
+        crate::peer::Failure::Game { grpc_status: 2 }
+    ));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 2 }, true),
+        AppError::Maintenance(2)
+    ));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 2 }, false),
+        AppError::Grpc(2)
+    ));
+}
+#[tokio::test]
+async fn framework_client_errors_are_json_without_echoing_input() {
+    let f = fixture(vec![]).await;
+    let app = crate::error::json_client_errors(api::router(
+        client(&f, config()),
+        "api".into(),
+        "internal".into(),
+    ));
+    let send = |request: Request<axum::body::Body>| app.clone().oneshot(request);
+    let r = send(
+        Request::get("/api/v1/no-such-route")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(
+        body(r).await,
+        json!({"error":"not found","code":"not_found"})
+    );
+    let r = send(
+        Request::post("/api/v1/system")
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 405);
+    assert!(r.headers().contains_key("allow"));
+    assert_eq!(body(r).await["code"], "method_not_allowed");
+    let r = send(
+        Request::get("/api/v1/announcements?tab=secret-echo")
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 400);
+    let value = body(r).await;
+    assert_eq!(
+        value,
+        json!({"error":"invalid request","code":"invalid_request"})
+    );
+    // Handler errors are already JSON and pass through unchanged.
+    let r = send(
+        Request::get("/api/v1/system")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(body(r).await["code"], "unauthorized");
+}
 fn unavailable_reply() -> Reply {
     let mut reply = Reply::version();
     reply.trailers.insert("grpc-status", "14".parse().unwrap());
@@ -2589,7 +2765,7 @@ async fn retry_policy_never_replays_maintenance_or_authenticated_calls() {
     cfg.upstream.anonymous_attempts = 5;
     assert!(matches!(
         client(&f, cfg).call(VERSION, json!({})).await,
-        Err(AppError::Grpc(14))
+        Err(AppError::Maintenance(14))
     ));
     assert_eq!(f.received.lock().unwrap().len(), 1);
     let f = fixture(vec![Reply::version(), unavailable_reply()]).await;

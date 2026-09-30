@@ -267,9 +267,10 @@ impl Router {
                                     | Failure::UnavailableBeforeDispatch {}
                             }
                         );
+                        let maintenance = reply.observation.maintenance;
                         let result = match reply.outcome {
                             Outcome::Success { data } => Ok(data),
-                            Outcome::Failure { kind } => Err(failure_error(kind)),
+                            Outcome::Failure { kind } => Err(failure_error(kind, maintenance)),
                         };
                         (
                             Execution {
@@ -332,7 +333,7 @@ impl Router {
         last
     }
 }
-fn failure_error(failure: Failure) -> AppError {
+pub(crate) fn failure_error(failure: Failure, maintenance: bool) -> AppError {
     match failure {
         Failure::IdentityMismatch {} => AppError::PeerIdentityMismatch,
         Failure::UnsupportedOperation {} => AppError::UnsupportedRegionOperation,
@@ -341,6 +342,7 @@ fn failure_error(failure: Failure) -> AppError {
         Failure::Timeout {} => AppError::Timeout,
         Failure::Transport {} => AppError::Transport,
         Failure::Protocol {} => AppError::Protocol,
+        Failure::Game { grpc_status } if maintenance => AppError::Maintenance(grpc_status),
         Failure::Game { grpc_status } => AppError::Grpc(grpc_status),
         Failure::NotFound {} => AppError::NotFound,
     }

@@ -142,7 +142,10 @@ impl From<AppError> for Failure {
             AppError::AccountUnavailable => Self::AccountUnavailable {},
             AppError::Timeout => Self::Timeout {},
             AppError::Transport | AppError::Proxy => Self::Transport {},
-            AppError::Grpc(grpc_status) => Self::Game { grpc_status },
+            // Old receivers see the plain gRPC status; new ones use the reply's observation.
+            AppError::Grpc(grpc_status) | AppError::Maintenance(grpc_status) => {
+                Self::Game { grpc_status }
+            }
             AppError::PeerIdentityMismatch => Self::IdentityMismatch {},
             AppError::NotFound => Self::NotFound {},
             _ => Self::Protocol {},

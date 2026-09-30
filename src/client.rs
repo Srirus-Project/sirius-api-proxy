@@ -1162,6 +1162,10 @@ impl GameClient {
         }
         let status = status.ok_or(AppError::Protocol)?;
         if status != 0 {
+            // Maintenance is a game-wide state, not an account or node fault (503, no retry).
+            if code.as_deref() == Some("UNDER_MAINTENANCE") {
+                return Err(AppError::Maintenance(status));
+            }
             return Err(AppError::Grpc(status));
         }
         if header(&metadata, "grpc-encoding").is_some_and(|s| s != "identity") {

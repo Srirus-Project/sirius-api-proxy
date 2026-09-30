@@ -107,7 +107,8 @@ pub async fn serve(
     let server_handle = handle.clone();
     let listener = listener.into_std()?;
     let server = async move {
-        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        let service = crate::error::json_client_errors(router)
+            .into_make_service_with_connect_info::<SocketAddr>();
         let server = axum_server::from_tcp(listener)?.handle(server_handle);
         match tls {
             Some(tls) => {

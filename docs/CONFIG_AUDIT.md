@@ -325,6 +325,14 @@ These generic capabilities are intentionally not restored in their original form
 8. **Client authorization deviates from the original.** It fails closed, uses the Sirius header
    and table names, enforces `exp`, and uses an in-process cache instead of Redis. See
    [CLIENT_AUTH.md](CLIENT_AUTH.md#differences-from-the-original).
+9. **Error bodies keep the Sirius shape.** The original answers `{result, status, message}` and
+   passes the game's 400/404/409 bodies through (`Haruki-Sekai-API@9a53714:src/error.rs`,
+   `src/client/sekai_client.rs`). Sirius keeps `{error}` for v1 compatibility, adds a stable
+   `code` (and `grpc_status` for game failures) since 1.2.4, and never echoes upstream bodies or
+   grpc-message values. Maintenance maps to 503 like the original (1.2.4). The original's 426
+   for an outdated app is not reproduced: the game's `CLIENT_UPDATE_REQUIRED` stays
+   `upstream_grpc` and is visible as `observation.application_code` in `/system`, because it
+   means the operator must raise `client_version`, not that the caller should retry.
 
 ## Original fields that were ignored by the original itself
 
