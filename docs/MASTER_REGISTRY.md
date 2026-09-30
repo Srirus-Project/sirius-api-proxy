@@ -499,7 +499,11 @@ master_git:
 
 Omit `committer` to reuse `author`. Omit `signing` for explicitly unsigned new commits.
 SSH signing requires an absolute key path; use an agent-backed public key path or an
-unattended private key as appropriate for your deployment. OpenPGP uses `format: openpgp`
+unattended private key as appropriate for your deployment. The official image includes
+`ssh-keygen` since 1.2.4 (earlier images could not sign); mount the key read-only, for example
+as a Docker secret at `/run/secrets/master-signing-key` readable by the `sirius` user, or pass
+`SSH_AUTH_SOCK` with a public key path. OpenPGP signing needs `gpg`, which the image does not
+include: build a derived image that adds it. OpenPGP uses `format: openpgp`
 (`gpg` is also accepted) and a hexadecimal key fingerprint in `key`, referencing the service
 account's keyring. Keys and passphrases must not be embedded in YAML. An optional `program`
 selects one absolute executable path containing only ASCII letters/digits, `/`, `.`, `_`, `-`;

@@ -37,6 +37,13 @@ with tempfile.TemporaryDirectory() as tmp:
     else:
         # master_git runs the git executable inside the container.
         docker("run", "--rm", "--network", "none", "--entrypoint", "git", a.image, "--version")
+        # SSH commit signing (master_git.signing.format: ssh) needs ssh-keygen: sign and verify.
+        docker("run", "--rm", "--network", "none", "--entrypoint", "sh", a.image, "-c",
+               "set -e; cd /tmp; ssh-keygen -q -t ed25519 -N '' -f k; git init -q r; cd r; "
+               "git -c user.name=smoke -c user.email=smoke@example.invalid -c gpg.format=ssh "
+               "-c user.signingkey=/tmp/k.pub commit -q --allow-empty -S -m smoke; "
+               "echo \"smoke@example.invalid $(cat /tmp/k.pub)\" > /tmp/allowed; "
+               "git -c gpg.ssh.allowedSignersFile=/tmp/allowed verify-commit HEAD")
         container = docker("run", "-d", *options, a.image)
         try:
             for _ in range(60):

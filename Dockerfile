@@ -8,7 +8,8 @@ RUN cargo build --release --locked
 
 FROM alpine:3.24
 # git: master_git commits and pushes Master repositories by running the git executable.
-RUN apk add --no-cache ca-certificates tzdata git && addgroup -S sirius && adduser -S -G sirius sirius
+# openssh-keygen: git signs and verifies commits with it when master_git.signing.format is ssh.
+RUN apk add --no-cache ca-certificates tzdata git openssh-keygen && addgroup -S sirius && adduser -S -G sirius sirius
 WORKDIR /app
 COPY --from=builder /app/LICENSE* /usr/share/licenses/sirius-api-proxy/
 COPY --from=builder /app/target/release/sirius-api-proxy /usr/local/bin/sirius-api-proxy
