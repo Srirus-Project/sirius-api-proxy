@@ -182,6 +182,8 @@ See [protocol updates](docs/PROTO_RELOAD.md) and [deployment checks](docs/DEPLOY
 The Docker image contains the executable, protocol bundle and the `git` executable used by `master_git`. Mount configuration, supply
 secrets and set `listen: 0.0.0.0:9999` inside the container. Persist `/app/master-data` if enabled.
 Restrict internal routes at the reverse proxy as well as through their separate token.
+Image builds read only the Cargo files, `build.rs`, `src`, `protocol` and `LICENSE*`; local
+configuration never enters the build context.
 
 The current JP baseline has been exercised for identity, account data, public profiles,
 announcements, song rankings, 235 Master tables and native/dynamic protocol switching.

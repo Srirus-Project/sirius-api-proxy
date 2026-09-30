@@ -13,6 +13,8 @@ on:
       - '.github/workflows/docker.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'build.rs'
+      - 'LICENSE*'
       - 'src/**'
       - 'scripts/**'
       - 'protocol/**'

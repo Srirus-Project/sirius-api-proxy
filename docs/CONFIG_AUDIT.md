@@ -482,6 +482,19 @@ These generic capabilities are intentionally not restored in their original form
    update or sync result is settled (`retain`, called from `src/master_update.rs` and
    `src/master_sync.rs` `update_once`), under the writer lock and outside the update deadline,
    and removes at most 64 snapshots, oldest first. Nothing is pruned unless configured.
+20. **The Docker build caches dependencies, but CI does not reuse release binaries.** The
+   original splits its builder into cargo-chef planner and cook stages on the plain
+   `rust:*-alpine` image, installing `cargo-chef --version 0.1.78 --locked` rather than using a
+   cargo-chef base image, and builds from a whitelist `.dockerignore`
+   (`Haruki-Sekai-API@9a53714:Dockerfile:1-18`, `.dockerignore`). Sirius adopts the dependency
+   layer the same way: the planner also copies `build.rs`, so the cook compiles the protobuf
+   build-dependencies, and `ARG VERSION` is declared after the cook, so tag and `dev` builds
+   share it. cargo-chef masks the package version and replaces targets with `fn main() {}`
+   stubs; the real build recompiles the crate and reruns `build.rs`, and the container smoke
+   test's `codec == native` proves the generated codecs. The runtime stage is unchanged. The
+   context whitelist keeps local configuration, `*.env` and private files out of the builder.
+   CI reuse of release binaries is not adopted: main pushes build `VERSION=dev` images and
+   publish nothing, so there is no artifact to reuse.
 
 ## Original fields that were ignored by the original itself
 

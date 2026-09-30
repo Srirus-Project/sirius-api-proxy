@@ -94,6 +94,11 @@
   Update and sync results gain `pruned_snapshots` when retention is configured. Downgrade
   warning: after a pass has pruned, 1.2.x history, by-hash lookup and `master-db-migrate` fail on
   the missing directories (current reads, updates and sync are unaffected).
+- The Docker builder compiles dependencies in a separate cargo-chef 0.1.78 layer (installed
+  pinned and `--locked`), so source-only changes, version bumps and other `VERSION` build
+  arguments skip the dependency compile. The runtime stage, image contents and paths are
+  unchanged. The build context is now a whitelist (Cargo files, `build.rs`, `src`, `protocol`,
+  `LICENSE*`), and the Docker workflow also runs for pull requests that change `build.rs`.
 
 ## 1.2.4
 

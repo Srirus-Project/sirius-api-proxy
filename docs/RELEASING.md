@@ -19,7 +19,9 @@ Never include real configuration, credentials, game assets or private research.
    Updater checks validate the example configuration with synthetic environment secrets.
 5. Build the Dockerfile with `--build-arg VERSION=v1.2.2`. Validate non-root startup,
    mounted configuration and runtime dependencies with `python3 scripts/smoke-container.py IMAGE`.
-   The updater export command needs FFmpeg.
+   The updater export command needs FFmpeg. The builder still runs
+   `cargo build --release --locked` and checks the build argument against Cargo.toml; on a
+   cold cache it also installs the pinned cargo-chef from crates.io to cache dependencies.
 6. Audit the tracked tree and every public branch/tag for credentials, private paths and
    unnecessary history. Keep any development-history backup outside the repository.
 

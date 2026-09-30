@@ -21364,3 +21364,65 @@ async fn master_sync_prunes_owner_and_consumer_independently() {
     assert_eq!(master_snapshot_directories(&pruning_dir).len(), 2);
     server.abort();
 }
+fn dockerfile_stage<'a>(dockerfile: &'a str, header: &str) -> &'a str {
+    let start = dockerfile
+        .find(&format!("{header}\n"))
+        .unwrap_or_else(|| panic!("missing stage {header}"));
+    let body = &dockerfile[start + header.len()..];
+    body.find("\nFROM ").map_or(body, |end| &body[..end])
+}
+#[test]
+fn dockerfile_caches_dependencies_before_sources() {
+    let dockerfile = &lf(include_str!("../Dockerfile"));
+    assert!(!dockerfile.contains("COPY . ."));
+    let chef = dockerfile_stage(dockerfile, "FROM rust:1.96-alpine AS chef");
+    assert!(chef.contains("cargo install cargo-chef --version 0.1.78 --locked"));
+    let planner = dockerfile_stage(dockerfile, "FROM chef AS planner");
+    // Without build.rs the recipe has no build script and cook skips the build-dependencies.
+    assert!(planner.contains("COPY Cargo.toml Cargo.lock build.rs ./"));
+    assert!(planner.contains("cargo chef prepare --recipe-path recipe.json"));
+    let builder = dockerfile_stage(dockerfile, "FROM chef AS builder");
+    let at = |needle: &str| {
+        builder
+            .find(needle)
+            .unwrap_or_else(|| panic!("builder lacks {needle}"))
+    };
+    let cook = at("RUN cargo chef cook --release --locked --recipe-path recipe.json");
+    let build = at("RUN cargo build --release --locked");
+    for input in [
+        "COPY Cargo.toml Cargo.lock build.rs ./",
+        "COPY src ./src",
+        "COPY protocol ./protocol",
+        "COPY LICENSE* ./",
+    ] {
+        assert!(cook < at(input) && at(input) < build, "{input}");
+    }
+    // VERSION stays out of the cooked layer and is still checked before the real build.
+    let version = at("ARG VERSION=dev");
+    let check = at("grep -Fx \"version = \\\"${VERSION#v}\\\"\" Cargo.toml");
+    assert!(cook < version && version < check && check < build);
+    let runtime = dockerfile_stage(dockerfile, "FROM alpine:3.24");
+    for line in [
+        "RUN apk add --no-cache ca-certificates tzdata git openssh-keygen",
+        "COPY --from=builder /app/LICENSE* /usr/share/licenses/sirius-api-proxy/",
+        "COPY --from=builder /app/target/release/sirius-api-proxy /usr/local/bin/sirius-api-proxy",
+        "COPY --from=builder /app/protocol /app/protocol",
+        "USER sirius",
+    ] {
+        assert!(runtime.contains(line), "{line}");
+    }
+    // The context is a whitelist, so local configuration and secrets never reach the builder.
+    let ignore = lf(include_str!("../.dockerignore"));
+    let entries: Vec<&str> = ignore.lines().collect();
+    assert_eq!(entries.first(), Some(&"**"));
+    for input in [
+        "!Cargo.toml",
+        "!Cargo.lock",
+        "!build.rs",
+        "!src/**",
+        "!protocol/**",
+        "!LICENSE*",
+    ] {
+        assert!(entries.contains(&input), "{input}");
+    }
+}
