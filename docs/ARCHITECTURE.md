@@ -3,7 +3,7 @@
 HTTP routes → allowlisted RPCs → active native/dynamic codec → HTTP/2 unary gRPC.
 Each configured region owns its environment, protocol bundle, bounded account pool and state.
 Single-region deployments preserve the original routes; multi-region deployments add region prefixes.
-Authenticated queries first establish the Master version; anonymous RPCs omit account credentials.
+Authenticated queries first establish the Master version, which is refreshed by age and on a mismatch signal; anonymous RPCs omit account credentials.
 
 - `src/api.rs`: public queries and internal state/account routes.
 - `src/peer.rs`: separately authorized, local-only node query contract.

@@ -92,6 +92,8 @@ pub struct UpstreamConfig {
     /// Wait for a PING acknowledgement before closing the connection; omitted means
     /// min(5000, `timeout_ms` / 4).
     pub http2_keepalive_timeout_ms: Option<u64>,
+    /// Age after which `x-master-version` is refreshed by a Version call before the next RPC.
+    pub version_max_age_seconds: u64,
 }
 impl Default for UpstreamConfig {
     fn default() -> Self {
@@ -108,6 +110,7 @@ impl Default for UpstreamConfig {
             coalesce_public_reads: false,
             http2_keepalive_interval_ms: None,
             http2_keepalive_timeout_ms: None,
+            version_max_age_seconds: 600,
         }
     }
 }
@@ -137,6 +140,7 @@ impl UpstreamConfig {
                 .http2_keepalive_timeout_ms
                 .is_some_and(|v| !(1_000..=60_000).contains(&v))
             || self.explicit_keepalive_misses_deadline()
+            || !(60..=86_400).contains(&self.version_max_age_seconds)
         {
             return Err(AppError::Config(
                 "upstream request policy exceeds supported bounds",

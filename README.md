@@ -74,8 +74,8 @@ Set `session_lock: false` to allow concurrent upstream RPCs for the same configu
 restart the proxy to apply the change. Upstream concurrency support is not confirmed, and
 server instability can also cause request failures. Keep the default unless testing or
 operating with that uncertainty. The default 20-second request deadline includes time waiting for
-serialization, bootstrap or protocol activation. Initial authenticated Version discovery
-remains single-flight, and protocol reload waits for all active logical calls in either mode.
+serialization, bootstrap or protocol activation. Version discovery and freshness refresh
+remain single-flight, and protocol reload waits for all active logical calls in either mode.
 With concurrency enabled, upstream observations reflect response completion order.
 Calls without an account are not serialized by `session_lock`: up to
 `upstream.anonymous_max_inflight` (default 4; 1 restores the 1.2.x behavior) run at once, and

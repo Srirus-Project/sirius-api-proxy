@@ -76,6 +76,38 @@ struct State {
     /// Global only: last catalog `.hash` attempt as (root, resource version, hash or failure,
     /// attempted at). Failures are remembered too, so polling cannot multiply CDN requests.
     catalog_hash: Option<(String, String, Option<String>, tokio::time::Instant)>,
+    /// When the version headers from the last successful VERSION are due for a refresh.
+    version_fresh_until: Option<tokio::time::Instant>,
+    /// The game answered `MASTER_VERSION_MISMATCH` to the current `x-master-version`.
+    version_suspect: bool,
+    /// No refresh before this instant (after a failed refresh, or one that did not change the
+    /// version the game called stale).
+    version_retry_at: Option<tokio::time::Instant>,
+    /// `CLIENT_UPDATE_REQUIRED` was logged and no gRPC success has been seen since.
+    client_update_required: bool,
+}
+/// Wait between Master version refreshes that failed or did not change the version.
+const VERSION_RETRY: Duration = Duration::from_secs(30);
+/// `x-sirius-error-code` of a request whose `x-master-version` is no longer current.
+const MASTER_VERSION_MISMATCH: &str = "MASTER_VERSION_MISMATCH";
+/// `x-sirius-error-code` of a request whose `x-client-version` the game no longer accepts.
+const CLIENT_UPDATE_REQUIRED: &str = "CLIENT_UPDATE_REQUIRED";
+/// Application codes that describe this proxy's version headers, not the game account: both
+/// literals are in the JP 1.0.3 and Global 1.0.1 clients, next to their version check. They are
+/// recognized whatever gRPC status comes with them, which is not statically known.
+pub(crate) fn version_signal(code: Option<&str>) -> bool {
+    matches!(code, Some(MASTER_VERSION_MISMATCH | CLIENT_UPDATE_REQUIRED))
+}
+/// What a call needs before its RPC can carry usable version headers.
+#[derive(Clone, Copy, PartialEq)]
+enum VersionNeed {
+    Fresh,
+    /// No version yet: an authenticated call cannot be sent without one.
+    Required,
+    /// Too old or reported stale; `wait` when stale, so callers do not repeat the stale header.
+    Refresh {
+        wait: bool,
+    },
 }
 
 pub struct GameClient {
@@ -220,6 +252,10 @@ impl GameClient {
             credential_valid: cdn_secrets.contains_key(&config.default_cdn_root),
             global_version: None,
             catalog_hash: None,
+            version_fresh_until: None,
+            version_suspect: false,
+            version_retry_at: None,
+            client_update_required: false,
         };
         let snapshot_http = config
             .resource_snapshot
@@ -297,6 +333,27 @@ impl GameClient {
     pub(crate) fn set_test_timeout(client: &mut Arc<Self>, duration: Duration) {
         Arc::get_mut(client).unwrap().timeout = duration;
     }
+    /// Moves the version freshness deadline and the refresh retry window `by` into the past.
+    #[cfg(test)]
+    pub(crate) async fn age_version_for_test(&self, by: Duration) {
+        let mut state = self.state.lock().await;
+        let back = |at: tokio::time::Instant| at.checked_sub(by).expect("monotonic clock");
+        state.version_fresh_until = state.version_fresh_until.map(back);
+        state.version_retry_at = state.version_retry_at.map(back);
+    }
+    /// (time until the version is due for a refresh, suspect, retry window active).
+    #[cfg(test)]
+    pub(crate) async fn version_state_for_test(&self) -> (Option<Duration>, bool, bool) {
+        let state = self.state.lock().await;
+        let now = tokio::time::Instant::now();
+        (
+            state
+                .version_fresh_until
+                .map(|at| at.saturating_duration_since(now)),
+            state.version_suspect,
+            state.version_retry_at.is_some_and(|at| at > now),
+        )
+    }
     pub fn protocol_status(&self) -> Result<ProtocolStatus, AppError> {
         Ok(self
             .protocol
@@ -341,6 +398,9 @@ impl GameClient {
         state.observation = Observation::default();
         state.master_pair = None;
         state.global_version = None;
+        state.version_fresh_until = None;
+        state.version_suspect = false;
+        state.version_retry_at = None;
         state.snapshot_stale = true;
         Ok(status)
     }
@@ -839,13 +899,9 @@ impl GameClient {
                     .read()
                     .map_err(|_| AppError::ProtocolDefinition)?
                     .clone();
-                if authenticated(route) && !identity_only && self.needs_bootstrap().await {
-                    let _bootstrap = self.bootstrap_lock.lock().await;
-                    if self.needs_bootstrap().await {
-                        self.admit_path(&mut path_ticket)?;
-                        self.execute(&protocol, VERSION, json!({}), None, deadline)
-                            .await?;
-                    }
+                if !identity_only {
+                    self.ensure_version(&protocol, route, &mut path_ticket, deadline)
+                        .await?;
                 }
                 let cache_key = self
                     .response_cache_key(&protocol, route, &input, account)
@@ -944,8 +1000,19 @@ impl GameClient {
                 }
                 account_attempted = authenticated(route);
                 if route == PLAYER_DATA && !global {
-                    self.execute(&protocol, WHOAMI, json!({}), auth.as_ref(), deadline)
-                        .await?;
+                    // The identity check reports its own application code, so a version signal
+                    // on it does not count against the account.
+                    let (checked, code) = self
+                        .execute_once(&protocol, WHOAMI, json!({}), auth.as_ref(), deadline)
+                        .await;
+                    if let Err(error) = checked {
+                        let failed = Err(error);
+                        if let Some(lease) = &lease {
+                            self.report_lease(lease, &failed, code.as_deref());
+                        }
+                        account_attempted = false;
+                        return failed;
+                    }
                 }
                 let (response, code) = if authenticated(route) {
                     // Authenticated reads are never replayed.
@@ -1016,11 +1083,87 @@ impl GameClient {
         result
     }
     /// Authenticated calls need the Master version (and, on Global, the resource version).
-    async fn needs_bootstrap(&self) -> bool {
+    /// Headers older than `version_max_age_seconds`, or reported stale by the game, are due for
+    /// a refresh unless a failed refresh is still backing off. Version itself and PlayerLogin
+    /// never wait for one.
+    async fn version_need(&self, route: &str) -> VersionNeed {
+        if matches!(route, VERSION | PLAYER_LOGIN) {
+            return VersionNeed::Fresh;
+        }
         let state = self.state.lock().await;
-        state.observation.master_version.is_none()
+        let missing = state.observation.master_version.is_none()
             || (self.config.region.family() == "global"
-                && state.observation.resource_version.is_none())
+                && state.observation.resource_version.is_none());
+        if missing && authenticated(route) {
+            return VersionNeed::Required;
+        }
+        let now = tokio::time::Instant::now();
+        if state.observation.master_version.is_none()
+            || state.version_retry_at.is_some_and(|at| now < at)
+        {
+            return VersionNeed::Fresh;
+        }
+        if state.version_suspect {
+            VersionNeed::Refresh { wait: true }
+        } else if state.version_fresh_until.is_none_or(|at| now >= at) {
+            VersionNeed::Refresh { wait: false }
+        } else {
+            VersionNeed::Fresh
+        }
+    }
+    /// Runs the Version call a route needs first, single-flight under `bootstrap_lock`. Without
+    /// a version an authenticated call fails closed with the bootstrap error. A refresh keeps the
+    /// previous headers when it fails, uses at most half of the remaining deadline, and is
+    /// skipped (not awaited) by others while an age-only refresh runs. Version is anonymous:
+    /// neither kind touches account health.
+    async fn ensure_version<'s>(
+        &'s self,
+        protocol: &ProtocolBundle,
+        route: &str,
+        ticket: &mut Option<Ticket<'s>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), AppError> {
+        let _lock = match self.version_need(route).await {
+            VersionNeed::Fresh => return Ok(()),
+            VersionNeed::Refresh { wait: false } => match self.bootstrap_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Ok(()),
+            },
+            _ => self.bootstrap_lock.lock().await,
+        };
+        match self.version_need(route).await {
+            VersionNeed::Fresh => Ok(()),
+            VersionNeed::Required => {
+                self.admit_path(ticket)?;
+                self.execute(protocol, VERSION, json!({}), None, deadline)
+                    .await
+                    .map(drop)
+            }
+            VersionNeed::Refresh { .. } => {
+                // An open path refuses the call itself later, unless a cache hit answers it.
+                if self.admit_path(ticket).is_err() {
+                    return Ok(());
+                }
+                let now = tokio::time::Instant::now();
+                let until = now + deadline.saturating_duration_since(now) / 2;
+                let refreshed = tokio::time::timeout_at(
+                    until,
+                    self.execute(protocol, VERSION, json!({}), None, until),
+                )
+                .await
+                .unwrap_or(Err(AppError::Timeout));
+                if let Err(error) = refreshed {
+                    self.state.lock().await.version_retry_at =
+                        Some(tokio::time::Instant::now() + VERSION_RETRY);
+                    tracing::warn!(
+                        error_code = error.code(),
+                        region = self.config.region.name(),
+                        "Master version refresh failed; keeping the previous version headers"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
     /// Game headers for `account`. A Global account without a session logs in first: SDK
     /// `cache.login` (first login of the process, or after a TOKEN_* signal) and PlayerLogin,
@@ -1316,12 +1459,14 @@ impl GameClient {
         };
         let mut attempt = 0;
         loop {
-            let (result, _) = self
+            let (result, code) = self
                 .execute_once(protocol, route, input.clone(), auth, deadline)
                 .await;
             attempt += 1;
+            // A version signal would repeat with the same headers; the next call refreshes.
             if attempt >= attempts
                 || !matches!(result, Err(AppError::Transport | AppError::Grpc(14)))
+                || version_signal(code.as_deref())
                 || self.state.lock().await.observation.maintenance
             {
                 return result;
@@ -1401,13 +1546,16 @@ impl GameClient {
         let login = route == PLAYER_LOGIN;
         let (master_version, resource_version) = {
             let state = self.state.lock().await;
+            // Global PlayerLogin is sent like the client's login: no version or player headers.
+            // A Version call after a mismatch omits the rejected header, like the first Version
+            // call of every process.
+            let omit = login || (route == VERSION && state.version_suspect);
             (
-                state.observation.master_version.clone(),
+                state.observation.master_version.clone().filter(|_| !omit),
                 state.observation.resource_version.clone(),
             )
         };
-        // Global PlayerLogin is sent like the client's login: no version or player headers.
-        if let Some(version) = master_version.filter(|_| !login) {
+        if let Some(version) = &master_version {
             request = request.header("x-master-version", version);
         }
         // Anonymous endpoints never receive game credentials.
@@ -1476,7 +1624,8 @@ impl GameClient {
             Some(14) if attempt.code.is_none() => Outcome::Fault(AppError::Grpc(14).code()),
             Some(_) => Outcome::Healthy,
         }));
-        self.observe(&metadata, status).await;
+        self.observe(&metadata, status, master_version.as_deref())
+            .await;
         if !http_ok || !content_ok {
             return Err(AppError::Protocol);
         }
@@ -1539,6 +1688,23 @@ impl GameClient {
                     .filter(|v| crate::master::safe_version(v))
             });
             let mut state = self.state.lock().await;
+            let now = tokio::time::Instant::now();
+            if state.version_suspect && state.observation.master_version.as_deref() == Some(version)
+            {
+                // The game still announces the version it called stale: do not refresh on
+                // every mismatch.
+                state.version_retry_at = Some(now + VERSION_RETRY);
+                tracing::warn!(
+                    error_code = MASTER_VERSION_MISMATCH,
+                    region = self.config.region.name(),
+                    "Version returned the Master version the game reported as stale"
+                );
+            } else {
+                state.version_retry_at = None;
+            }
+            state.version_suspect = false;
+            state.version_fresh_until =
+                Some(now + Duration::from_secs(self.config.upstream.version_max_age_seconds));
             state.observation.master_version = Some(version.to_string());
             if self.config.region.family() == "global" {
                 // Global responses carry `x-asset-version: unknown`; only the body counts.
@@ -1555,13 +1721,44 @@ impl GameClient {
             .await;
         Ok(value)
     }
-    async fn observe(&self, md: &HeaderMap, status: Option<u16>) {
+    /// Records a gRPC answer; `sent_version` is the `x-master-version` the request carried.
+    async fn observe(&self, md: &HeaderMap, status: Option<u16>, sent_version: Option<&str>) {
         let mut s = self.state.lock().await;
         s.observation.observed_at = Some(Utc::now());
         s.observation.grpc_status = status;
         s.observation.application_code = application_code(md);
         s.observation.maintenance =
             s.observation.application_code.as_deref() == Some("UNDER_MAINTENANCE");
+        let region = self.config.region.name();
+        match s.observation.application_code.as_deref() {
+            // Only a mismatch for the version still in use: a late answer to a replaced header
+            // says nothing about the current one. The trailer's own version is never adopted;
+            // VERSION stays the only source of the version pair.
+            Some(MASTER_VERSION_MISMATCH)
+                if !s.version_suspect
+                    && sent_version.is_some()
+                    && sent_version == s.observation.master_version.as_deref() =>
+            {
+                s.version_suspect = true;
+                tracing::warn!(
+                    error_code = MASTER_VERSION_MISMATCH,
+                    region,
+                    status,
+                    "game reported a stale Master version; refreshing before the next call"
+                );
+            }
+            Some(CLIENT_UPDATE_REQUIRED) if !s.client_update_required => {
+                s.client_update_required = true;
+                tracing::warn!(
+                    error_code = CLIENT_UPDATE_REQUIRED,
+                    region,
+                    status,
+                    "game requires a newer client; raise client_version"
+                );
+            }
+            _ if status == Some(0) => s.client_update_required = false,
+            _ => {}
+        }
         s.observation.server_time = header(md, "x-server-time")
             .filter(|v| DateTime::parse_from_rfc3339(v).is_ok())
             .map(str::to_owned);

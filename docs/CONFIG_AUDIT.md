@@ -332,7 +332,8 @@ These generic capabilities are intentionally not restored in their original form
    grpc-message values. Maintenance maps to 503 like the original (1.2.4). The original's 426
    for an outdated app is not reproduced: the game's `CLIENT_UPDATE_REQUIRED` stays
    `upstream_grpc` and is visible as `observation.application_code` in `/system`, because it
-   means the operator must raise `client_version`, not that the caller should retry.
+   means the operator must raise `client_version`, not that the caller should retry. Since
+   1.3.0 it never counts against the account ([Decision 14](#decisions)).
 10. **Busy updaters are retried by status, not by body text.** The original retries a 409 every
    60 s up to 10 times and treats a body containing "is disabled" as permanent
    (`Haruki-Sekai-API@9a53714:src/updater/master.rs`). The Sirius updater answers busy with
@@ -376,7 +377,7 @@ These generic capabilities are intentionally not restored in their original form
    which the kernel acts on after minutes. Sirius's game client multiplexes calls over pooled
    HTTP/2 connections whose idle timer is renewed by every call, so a blackholed connection kept
    every call on it waiting for its deadline (504, not retried, charged like any timeout). Since
-   1.3.0 the pool sends HTTP/2 PINGs with `while_idle` off (`src/client.rs:188-198`): only while
+   1.3.0 the pool sends HTTP/2 PINGs with `while_idle` off (`src/client.rs:220-230`): only while
    a call is open on a connection silent for `upstream.http2_keepalive_interval_ms`, and a missed
    acknowledgement within `http2_keepalive_timeout_ms` closes the connection, failing its calls
    as `upstream_transport` (502) so the next call reconnects. Differences: defaults are derived
@@ -387,6 +388,21 @@ These generic capabilities are intentionally not restored in their original form
    configures `Http2KeepAliveInterval`/`Http2KeepAliveTimeout` on its HTTP/2 handler (no
    `WhileIdle`), so PINGs during an open call match its behavior. Peer, SDK, CDN and Git clients
    are unchanged.
+14. **The Master version header is refreshed ahead of time, not on a 426.** The original learns
+   that its app/data version is outdated from Sekai's HTTP 426, then refreshes and replays the
+   request (`Haruki-Sekai-API@9a53714:src/client/sekai_client.rs:848-959`); that mechanism is
+   Sekai-specific and is not restored. Before 1.3.0 Sirius read `x-master-version` once and never
+   refreshed it while the process ran, and a game answer of gRPC 7/16 about a stale version
+   would have disabled the account. Since 1.3.0 a call refreshes the header by a Version call
+   first when it is older than `upstream.version_max_age_seconds` (600 s, 60..86400), or after a
+   response carried `MASTER_VERSION_MISMATCH` for the header in use (`src/client.rs:1089-1167`,
+   `:1733-1761`); `MASTER_VERSION_MISMATCH` and `CLIENT_UPDATE_REQUIRED` never penalize a JP or
+   Global account (`src/accounts.rs:417`, `:634`). Differences: authenticated calls are never
+   replayed (the call that received the code still fails); the version is read only from
+   Version, never from an error trailer, so the Master and asset versions stay one pair; a failed
+   refresh keeps the previous header for 30 s instead of failing the call; detection keys on the
+   application code, found statically in the JP 1.0.3 and Global 1.0.1 clients, because the gRPC
+   status that comes with it and whether the game enforces freshness at all are unverified.
 
 ## Original fields that were ignored by the original itself
 
@@ -413,7 +429,7 @@ re-checked against the current code; the 1.2.1 additions are listed field by fie
 | Section | Fields | Read at |
 | --- | --- | --- |
 | Root profile (`src/config.rs:5-70`) | `region`, `platform`, `protocol_directory`, `environment`, `endpoint`, `client_version`, `session_lock`, `api_token_env`, `internal_token_env`, `peer_token_env`, `player_id_env`, `player_credential_env`, `master_directory`, `default_cdn_root`, `cdn_credential_env` and the section fields below | `src/client.rs` (scope, headers, CDN state at `:133-147`), `src/deployment.rs:173-201`, `src/accounts.rs:369-410` |
-| `upstream` (`src/config.rs:72-95`) | all, including `anonymous_max_inflight`, `coalesce_public_reads`, `http2_keepalive_interval_ms` and `http2_keepalive_timeout_ms` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:171`, `:184`, keepalive at `:188-198` (derived by `src/config.rs:151-167`), `:230-232`, `:753`, `:1313`, `:1333`, `:1455`, SDK proxy at `:1788-1800`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
+| `upstream` (`src/config.rs:72-97`) | all, including `anonymous_max_inflight`, `coalesce_public_reads`, `http2_keepalive_interval_ms`, `http2_keepalive_timeout_ms` and `version_max_age_seconds` (1.3.0) | `src/transport.rs:35-66`, `src/client.rs:203`, `:216`, keepalive at `:220-230` (derived by `src/config.rs:155-171`), `:266-268`, `:813`, `:1456`, `:1478`, `:1603`, version age at `:1707`, SDK proxy at `:1985-1997`; `coalesces` also gates `src/node_routing.rs` `Router::call` |
 | `master_update` (`src/config.rs:130-146`) and `network` (`src/master_update.rs:44-56`) | all, including `cdn_authorization` (1.2.1) | `src/master_update.rs:160-200`, `:97-137` |
 | `resource_snapshot` (1.2.1, `src/config.rs:148-163`) | `cdn_authorization`, `username_env`, `catalog_hash_ttl_seconds`; `network.{connect_timeout_ms, request_timeout_ms, update_timeout_seconds, attempts, retry_delay_ms, max_retry_delay_ms, proxy_url_env, proxy_authorization_env}` | `src/client.rs:150-156`, `:1254-1325`, `src/resources.rs:106-110`. `network.update_timeout_seconds` bounds all `.hash` attempts and retry delays together, as for Master updates; see [Findings](#findings). |
 | `master_git` (`src/master_git_worker.rs:9-25`), `commit`, `remote` | all, including `layout` and `branch` (1.2.1) | `src/master_git_worker.rs:31-37`, `:153-172`, `:208`; `src/master_git.rs:266-290`, `:838-866`; CLI subset in [Decision 7](#decisions) |
@@ -502,3 +518,6 @@ classification and evidence:
 - **Connection liveness:** new [Decision 13](#decisions). `upstream.http2_keepalive_interval_ms` and
   `upstream.http2_keepalive_timeout_ms` are added to the reverse check, whose `upstream` line
   references are updated.
+- **Version header freshness:** new [Decision 14](#decisions); Decision 9 notes that
+  `CLIENT_UPDATE_REQUIRED` no longer penalizes accounts. `upstream.version_max_age_seconds` is
+  added to the reverse check, whose `upstream` line references are updated.

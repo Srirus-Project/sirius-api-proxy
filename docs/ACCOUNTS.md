@@ -39,7 +39,7 @@ session. Actual game-server support for single-session concurrency remains unpro
 Anonymous calls carry no account headers. They no longer share one regional lock: with
 `session_lock: true` up to `upstream.anonymous_max_inflight` of them (default 4, at most
 `max_inflight`; 1 restores the 1.2.x serialization) run at once. The Version bootstrap of
-authenticated calls stays single-flight. With `upstream.coalesce_public_reads: true`, one
+authenticated calls and the version freshness refresh stay single-flight. With `upstream.coalesce_public_reads: true`, one
 account's ranking result (or failure) answers every identical concurrent ranking request and
 is reported to account health once; the default runs each ranking request on its own account
 selection.
@@ -50,7 +50,11 @@ successful credential reload. gRPC 8/13 increment its failure count; reaching
 1..3600 seconds. A successful call clears transient failures. Failures before an authenticated
 attempt (including anonymous bootstrap and queue deadlines) do not penalize the account, and
 neither does a response carrying `UNDER_MAINTENANCE` (whatever its gRPC status; it answers 503
-`maintenance`). Exhaustion returns 503. The failed logical request is never automatically
+`maintenance`). Responses carrying `MASTER_VERSION_MISMATCH` or `CLIENT_UPDATE_REQUIRED`, on
+the request or on the identity check before private data, do not count either, whatever their
+gRPC status: they describe the proxy's version headers, not the account (see
+[version header freshness](REQUEST_POLICY.md#version-header-freshness)). gRPC 7 or 16 with any
+other code, or none, still disables the account. Exhaustion returns 503. The failed logical request is never automatically
 replayed with another account; a later request can select another healthy account.
 
 Path-class faults (transport and protocol failures, deadlines, and gRPC 14 without an
@@ -205,6 +209,7 @@ request that received a signal is never replayed.
 | `BAN_*` | Disable the account |
 | `AEGIS_*` (login queue, server full) | Cool down for `aegis_cooldown_seconds`; the queue is never polled |
 | `UNDER_MAINTENANCE` | Recorded as maintenance; no account penalty |
+| `MASTER_VERSION_MISMATCH` / `CLIENT_UPDATE_REQUIRED` | Recorded in `last_error_code`; no session drop, no penalty (a failed PlayerLogin still answers 503 and counts toward the login limits); a mismatch refreshes the Master version before the next call |
 | gRPC 7 without a code | Disable the account |
 | SDK code 200007 (CAPTCHA), other nonzero SDK codes, a changed uid | Disable the account; complete verification in the official client |
 | SDK transport failure, deadline or malformed response (`SDK_TRANSPORT`, `SDK_PROTOCOL`) | Recorded as `last_error_code`; counts toward the SDK path, never cools the account (the login interval and daily cap bound retries). `failure_threshold` consecutive failures open the SDK path |

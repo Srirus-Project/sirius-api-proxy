@@ -17538,6 +17538,87 @@ regions:
         ))
         .is_err());
     }
+
+    #[tokio::test]
+    async fn global_mismatch_keeps_session_and_account_and_logins_never_carry_versions() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        let push = |status: u16, code: &'static str| {
+            e.script
+                .call_errors
+                .lock()
+                .unwrap()
+                .push_back((status, code))
+        };
+        push(16, "MASTER_VERSION_MISMATCH");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::Grpc(16))
+        ));
+        // The next call refreshes Version first, without the rejected header; the game still
+        // announces the same version, so refreshes back off instead of repeating per call.
+        push(16, "MASTER_VERSION_MISMATCH");
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["session_state"], "active");
+        assert_eq!(s["last_error_code"], "MASTER_VERSION_MISMATCH");
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(count(&e.f, V), 2);
+        assert!(c.version_state_for_test().await.2);
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, V), 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        // A relogin after the retry window, once the version is due for a refresh again.
+        c.age_version_for_test(Duration::from_secs(601)).await;
+        push(16, "TOKEN_ILLEGAL");
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 2);
+        let received = e.f.received.lock().unwrap();
+        let versions = received
+            .iter()
+            .filter(|r| r.0 == V)
+            .map(|r| r.1.contains_key("x-master-version"))
+            .collect::<Vec<_>>();
+        // The second mismatch left the version suspect until a Version call succeeds.
+        assert_eq!(versions, [false, false, false]);
+        for login in received.iter().filter(|r| r.0 == PLAYER_LOGIN) {
+            assert!(!login.1.contains_key("x-master-version"));
+            assert!(!login.1.contains_key("x-resource-version"));
+        }
+        assert_eq!(count_in(&received, WHOAMI), 0);
+    }
+    fn count_in(received: &[(String, HeaderMap, Vec<u8>)], path: &str) -> usize {
+        received.iter().filter(|r| r.0 == path).count()
+    }
+
+    #[tokio::test]
+    async fn global_login_client_update_required_does_not_disable() {
+        let e = env(Region::En).await;
+        e.script.login_errors.lock().unwrap().extend([
+            (16, "CLIENT_UPDATE_REQUIRED"),
+            (16, "CLIENT_UPDATE_REQUIRED"),
+        ]);
+        let c = GameClient::for_test(e.cfg.clone());
+        for _ in 0..2 {
+            assert!(matches!(
+                c.call(PLAYER_DATA, json!({})).await,
+                Err(AppError::AccountUnavailable)
+            ));
+        }
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["last_error_code"], "CLIENT_UPDATE_REQUIRED");
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        // The SDK identity was never marked stale: one cache.login for three PlayerLogins.
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 3);
+        assert_eq!(count(&e.f, V), 1);
+        assert_eq!(status(&c)["session_state"], "active");
+    }
 }
 
 #[tokio::test]
@@ -17564,4 +17645,503 @@ async fn catalog_hash_fetch_honors_the_overall_update_deadline() {
     assert!(matches!(result, Err(AppError::SnapshotUnavailable)));
     assert!(started.elapsed() < Duration::from_secs(5));
     server.abort();
+}
+
+fn master_version_reply(version: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message(
+        "app.masterdata.VersionResponse",
+        json!({ "version": version }),
+    ));
+    reply
+}
+/// A failed answer carrying an application code and a `grpc-message` that must never escape.
+fn signal_reply(grpc_status: &str, code: &str) -> Reply {
+    let mut reply = grpc_reply(grpc_status);
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-message", "SECRET-version-message".parse().unwrap());
+    reply
+        .trailers
+        .insert("x-sirius-error-code", code.parse().unwrap());
+    reply
+}
+fn single_account_config() -> Config {
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg
+}
+/// (route, x-master-version) of every request the fixture received.
+fn sent_versions(f: &Fixture) -> Vec<(String, Option<String>)> {
+    f.received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(route, headers, _)| {
+            (
+                route.clone(),
+                headers
+                    .get("x-master-version")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+            )
+        })
+        .collect()
+}
+fn sent(route: &str, version: Option<&str>) -> (String, Option<String>) {
+    (route.to_owned(), version.map(str::to_owned))
+}
+async fn profile_call(c: &Arc<GameClient>) -> Result<Value, AppError> {
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+}
+
+#[test]
+fn upstream_version_max_age_is_bounded() {
+    let parse = |input: &str| yaml_serde::from_str::<crate::config::UpstreamConfig>(input);
+    assert_eq!(config().upstream.version_max_age_seconds, 600);
+    for (input, valid) in [
+        ("version_max_age_seconds: 59", false),
+        ("version_max_age_seconds: 86401", false),
+        ("version_max_age_seconds: 60", true),
+        ("version_max_age_seconds: 86400", true),
+    ] {
+        assert_eq!(parse(input).unwrap().validate().is_ok(), valid, "{input}");
+    }
+    assert!(parse("version_max_age: 600").is_err());
+    // A 1.2.x block without the key keeps the default.
+    let old = parse("timeout_ms: 20000\nanonymous_attempts: 1").unwrap();
+    assert!(old.validate().is_ok());
+    assert_eq!(old.version_max_age_seconds, 600);
+}
+
+#[tokio::test]
+async fn stale_version_refreshes_before_the_call_and_fresh_version_does_not() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        empty_profile_reply(),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    profile_call(&c).await.unwrap();
+    profile_call(&c).await.unwrap();
+    let (remaining, suspect, backoff) = c.version_state_for_test().await;
+    assert!(remaining.unwrap() > Duration::from_secs(590));
+    assert!(!suspect && !backoff);
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    profile_call(&c).await.unwrap();
+    // The age refresh keeps the steady-state Version shape, current header included.
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+    assert!(c.version_state_for_test().await.0.unwrap() > Duration::from_secs(590));
+}
+
+#[tokio::test]
+async fn mismatch_with_grpc_16_and_7_keeps_jp_account_enabled_and_refreshes_first() {
+    use crate::client::PROFILE;
+    for status in ["16", "7"] {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("application.log");
+        let (default, guard, second) = capture_application_log(&log);
+        let f = fixture(vec![
+            master_version_reply("v1"),
+            signal_reply(status, "MASTER_VERSION_MISMATCH"),
+            master_version_reply("v2"),
+            empty_profile_reply(),
+        ])
+        .await;
+        let c = client(&f, single_account_config());
+        c.call(VERSION, json!({})).await.unwrap();
+        let app = api::router(c.clone(), "api".into(), "internal".into());
+        let get = |path: &'static str, token: &'static str| {
+            app.clone().oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+        };
+        // The call that received the signal fails as before and is not replayed.
+        let response = get("/api/v1/players/by-profile-id/1", "api").await.unwrap();
+        assert_eq!(response.status(), 502);
+        let value = body(response).await;
+        assert_eq!(value["code"], "upstream_grpc");
+        assert_eq!(value["grpc_status"], status.parse::<u16>().unwrap());
+        assert!(!value.to_string().contains("SECRET"));
+        assert_eq!(f.received.lock().unwrap().len(), 2);
+        let accounts = body(get("/internal/v1/accounts", "internal").await.unwrap()).await;
+        assert_eq!(accounts["accounts"][0]["disabled"], false, "{status}");
+        assert_eq!(accounts["accounts"][0]["consecutive_failures"], 0);
+        assert!(c.version_state_for_test().await.1);
+        // The next call refreshes first, without the rejected header.
+        profile_call(&c).await.unwrap();
+        assert_eq!(
+            sent_versions(&f)[2..],
+            [sent(VERSION, None), sent(PROFILE, Some("v2"))]
+        );
+        assert!(!c.version_state_for_test().await.1);
+        drop((default, second));
+        drop(guard);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let row = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| row["fields"]["error_code"] == "MASTER_VERSION_MISMATCH")
+            .expect("mismatch logged");
+        assert_eq!(row["level"], "WARN");
+        assert_eq!(row["fields"]["region"], "jp");
+        assert_eq!(row["fields"]["status"], status.parse::<u16>().unwrap());
+        assert!(!text.contains("SECRET") && !text.contains("secret-one"));
+    }
+}
+
+#[tokio::test]
+async fn client_update_required_keeps_account_and_does_not_refresh() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "CLIENT_UPDATE_REQUIRED"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(profile_call(&c).await, Err(AppError::Grpc(16))));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    assert!(!c.version_state_for_test().await.1);
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn jp_player_data_whoami_mismatch_does_not_disable_the_account() {
+    use crate::client::{PLAYER_DATA, WHOAMI};
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        master_version_reply("v2"),
+        whoami_reply("player-one"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(
+        c.call_account("one", PLAYER_DATA).await,
+        Err(AppError::Grpc(16))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    c.call_account("one", WHOAMI).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(WHOAMI, Some("v1")),
+            sent(VERSION, None),
+            sent(WHOAMI, Some("v2")),
+        ]
+    );
+    // A plain 16 on the identity check still disables, as before.
+    let f = fixture(vec![Reply::version(), grpc_reply("16")]).await;
+    let c = client(&f, single_account_config());
+    assert!(c.call_account("one", PLAYER_DATA).await.is_err());
+    assert_eq!(c.account_status().unwrap()["accounts"][0]["disabled"], true);
+}
+
+#[tokio::test]
+async fn concurrent_suspect_calls_refresh_once() {
+    use crate::client::PROFILE;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut refreshed = master_version_reply("v2");
+    refreshed.gate = Some(gate.clone());
+    let mut replies = vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        refreshed,
+    ];
+    replies.extend(std::iter::repeat_n(empty_profile_reply(), 20));
+    let f = fixture(replies).await;
+    let c = client(&f, pool_config());
+    assert!(profile_call(&c).await.is_err());
+    let calls = (0..20)
+        .map(|_| {
+            let c = c.clone();
+            tokio::spawn(async move { profile_call(&c).await })
+        })
+        .collect::<Vec<_>>();
+    wait_for_requests(&f, 3).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Everyone waits for the refresh instead of repeating the rejected header.
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    gate.add_permits(1);
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    let seen = sent_versions(&f);
+    assert_eq!(seen.iter().filter(|(route, _)| route == VERSION).count(), 2);
+    assert_eq!(seen[2], sent(VERSION, None));
+    assert!(seen[3..].iter().all(|s| *s == sent(PROFILE, Some("v2"))));
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["disabled"], false);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_age_refresh_does_not_block_callers() {
+    use crate::client::PROFILE;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut refreshed = master_version_reply("v2");
+    refreshed.gate = Some(gate.clone());
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        refreshed,
+        empty_profile_reply(),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, pool_config());
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    let refreshing = {
+        let c = c.clone();
+        tokio::spawn(async move { profile_call(&c).await })
+    };
+    wait_for_requests(&f, 3).await;
+    // Another caller does not wait for an age-only refresh: it keeps the current header.
+    tokio::time::timeout(Duration::from_secs(2), profile_call(&c))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!refreshing.is_finished());
+    gate.add_permits(1);
+    refreshing.await.unwrap().unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failed_refresh_keeps_old_header_and_backs_off() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        unavailable_reply(),
+        empty_profile_reply(),
+        empty_profile_reply(),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    profile_call(&c).await.unwrap();
+    let (_, suspect, backoff) = c.version_state_for_test().await;
+    assert!(!suspect && backoff);
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    assert_eq!(status["accounts"][0]["cooldown_remaining_seconds"], 0);
+    // Inside the retry window the old header is used without another Version.
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(31)).await;
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+    assert!(!c.version_state_for_test().await.2);
+}
+
+#[tokio::test]
+async fn refresh_uses_at_most_half_the_remaining_deadline() {
+    let mut slow = master_version_reply("v2");
+    slow.delay = Duration::from_secs(2);
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        slow,
+        empty_profile_reply(),
+    ])
+    .await;
+    let mut c = client(&f, single_account_config());
+    GameClient::set_test_timeout(&mut c, Duration::from_secs(1));
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    let started = tokio::time::Instant::now();
+    profile_call(&c).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[3].1["x-master-version"], "v1");
+    let budget: u64 = seen[3].1["grpc-timeout"]
+        .to_str()
+        .unwrap()
+        .strip_suffix('m')
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(budget <= 500, "{budget}");
+}
+
+#[tokio::test]
+async fn bootstrap_without_version_still_fails_closed() {
+    let f = fixture(vec![unavailable_reply()]).await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(profile_call(&c).await, Err(AppError::Grpc(14))));
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert_eq!(c.version_state_for_test().await, (None, false, false));
+}
+
+#[tokio::test]
+async fn late_mismatch_for_replaced_version_is_ignored() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut late = signal_reply("16", "MASTER_VERSION_MISMATCH");
+    late.gate = Some(gate.clone());
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        late,
+        master_version_reply("v2"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let pending = {
+        let c = c.clone();
+        tokio::spawn(async move { profile_call(&c).await })
+    };
+    wait_for_requests(&f, 2).await;
+    c.call(VERSION, json!({})).await.unwrap();
+    gate.add_permits(1);
+    assert!(matches!(pending.await.unwrap(), Err(AppError::Grpc(16))));
+    assert!(!c.version_state_for_test().await.1);
+    assert_eq!(c.observation().await.master_version.as_deref(), Some("v2"));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["disabled"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn mismatch_with_status_14_is_not_retried_anonymously() {
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("14", "MASTER_VERSION_MISMATCH"),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 3;
+    cfg.upstream.retry_delay_ms = 1;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    assert!(matches!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    assert!(c.version_state_for_test().await.1);
+    // An application code on 14 is an answer, not a path fault.
+    assert_eq!(c.account_status().unwrap()["path"]["failures"], 0);
+}
+
+#[tokio::test]
+async fn protocol_reload_resets_version_freshness() {
+    use crate::client::PROFILE;
+    let directory = copy_protocol_bundle();
+    let mut cfg = single_account_config();
+    cfg.protocol_directory = directory.path().into();
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    assert!(profile_call(&c).await.is_err());
+    assert!(c.version_state_for_test().await.1);
+    edit_version_proto(
+        directory.path(),
+        "string version = 1;",
+        "string version = 1;\n  string extra = 2;",
+    );
+    std::fs::write(
+        directory.path().join("bundle.json"),
+        r#"{"version":"1.0.4"}"#,
+    )
+    .unwrap();
+    c.reload_protocol().await.unwrap();
+    assert_eq!(c.version_state_for_test().await, (None, false, false));
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f)[2..],
+        [sent(VERSION, None), sent(PROFILE, Some("v2"))]
+    );
+}
+
+#[tokio::test]
+async fn peer_executor_mismatch_keeps_the_game_failure_wire_format() {
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(
+        c.peer_identity().unwrap(),
+        json!({"type":"profile","profile_id":1}),
+    );
+    let reply = body(peer_send(app, "peer", request).await).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"game","grpc_status":16}})
+    );
+    assert!(!reply.to_string().contains("SECRET"));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 16 }, false),
+        AppError::Grpc(16)
+    ));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["disabled"],
+        false
+    );
 }

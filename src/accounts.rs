@@ -413,6 +413,8 @@ impl Account {
                 }
             }
             Some("UNDER_MAINTENANCE") => {}
+            // Stale proxy version headers: the session and the account are fine.
+            Some(c) if crate::client::version_signal(Some(c)) => {}
             _ => match (error, status) {
                 (_, Some(16)) => {
                     if invalidate(true) >= 2 {
@@ -629,8 +631,9 @@ impl Lease {
                 .global_signal(result, code, policy, login, charge);
             return;
         }
-        if code == Some("UNDER_MAINTENANCE") {
-            // Maintenance says nothing about this account (also covers gRPC 14 + maintenance).
+        if code == Some("UNDER_MAINTENANCE") || crate::client::version_signal(code) {
+            // Maintenance and stale version headers say nothing about this account, whatever
+            // the gRPC status (also covers gRPC 14 + maintenance).
             return;
         }
         let mut h = self.account.health();

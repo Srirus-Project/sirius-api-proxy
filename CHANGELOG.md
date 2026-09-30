@@ -27,6 +27,18 @@
   reconnects. Idle connections are not pinged. New keys `upstream.http2_keepalive_interval_ms`
   (0 disables) and `upstream.http2_keepalive_timeout_ms`; profiles with `timeout_ms` below 4000
   keep the 1.2.x behavior unless a key is set. API and peer wire format are unchanged.
+- `x-master-version` no longer stays at the first observed value for the life of the process: a
+  call first refreshes it by a Version call once it is older than the new
+  `upstream.version_max_age_seconds` (600, 60..86400; other calls do not wait, the refresh uses at
+  most half the remaining deadline, a failure keeps the old header for 30 s), and after a response
+  carried `MASTER_VERSION_MISMATCH`, in which case the next call waits for one Version call sent
+  without the rejected header. The failed call is not replayed.
+- `MASTER_VERSION_MISMATCH` and `CLIENT_UPDATE_REQUIRED` no longer count against JP or Global
+  accounts, whatever their gRPC status (7/16 used to disable the account; on Global 16 dropped the
+  session), including on the JP identity check before private data, and are never retried as
+  anonymous reads. Both codes are in the JP 1.0.3 and Global 1.0.1 clients; their gRPC status and
+  whether the game enforces a fresh version are unverified, and the design depends on neither.
+  API and peer wire format are unchanged.
 
 ## 1.2.4
 

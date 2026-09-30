@@ -77,6 +77,7 @@ upstream:
   # coalesce_public_reads: false # true also shares identical concurrent ranking reads
   # http2_keepalive_interval_ms: 10000 # 0 disables; see docs/REQUEST_POLICY.md
   # http2_keepalive_timeout_ms: 5000
+  # version_max_age_seconds: 600 # refresh x-master-version when older; see docs/REQUEST_POLICY.md
 
 # Public announcement/ranking response cache; defaults to disabled.
 # See docs/RESPONSE_CACHE.md for memory/Redis, per-route TTL and opt-in stale-while-revalidate.

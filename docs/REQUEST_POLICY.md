@@ -17,9 +17,10 @@ Master CDN downloads have their separate existing limits.
 | `coalesce_public_reads` | false | `true` also shares identical ranking reads |
 | `http2_keepalive_interval_ms` | omitted: min(10000, `timeout_ms` / 2); off when `timeout_ms` < 4000 and neither keepalive key is set | 0 disables keepalive, otherwise 1000..300000 |
 | `http2_keepalive_timeout_ms` | omitted: min(5000, `timeout_ms` / 4) | 1000..60000; not with interval 0 |
+| `version_max_age_seconds` | 600 | 60..86400 |
 
 A logical call includes admission wait, per-account session or anonymous slot wait, protocol activation
-wait, anonymous Version bootstrap, optional identity verification, retries and the
+wait, anonymous Version bootstrap or refresh, optional identity verification, retries and the
 requested RPC. These share one deadline; entering another stage never resets it.
 The gRPC timeout header advertises the remaining budget, rounded up to milliseconds.
 Timeout/cancellation returns the regional admission permit. The response cap applies
@@ -35,8 +36,8 @@ With `session_lock: true`, calls without an account (Version, server list, annou
 peer and cache-refresh calls of those routes) no longer share one regional lock: up to
 `anonymous_max_inflight` of them run at once, so a slow Version does not hold back an
 announcement read. `anonymous_max_inflight: 1` restores the 1.2.x serialization. The Version
-bootstrap of an authenticated call stays single-flight under its own lock and does not take
-an anonymous slot. With `session_lock: false` only `max_inflight` bounds anonymous calls.
+bootstrap of an authenticated call and the [freshness refresh](#version-header-freshness) stay
+single-flight under their own lock and do not take an anonymous slot. With `session_lock: false` only `max_inflight` bounds anonymous calls.
 
 ## Connection liveness
 
@@ -89,8 +90,39 @@ If the running request is cancelled (client disconnect), one waiting request con
 its own call and deadline; requests arriving after that start a new execution. A finished
 call is never handed to a later request: this is not a cache, and the table lives in each
 process only (not in Redis). A joined request can receive a response to an RPC sent up to one
-round trip before it arrived. The Version bootstrap of authenticated calls never joins, since
-it already holds admission and the protocol barrier.
+round trip before it arrived. The Version bootstrap of authenticated calls and the version
+refresh never join, since they already hold admission and the protocol barrier.
+
+## Version header freshness
+
+Every game RPC except Global PlayerLogin carries `x-master-version`, the version of the last
+successful Version call. Authenticated calls without one first run Version and fail with its
+error if it fails, as before. Afterwards the header is kept fresh, whatever the game enforces:
+
+- **By age.** A call that finds the header older than `version_max_age_seconds` first runs
+  Version (single-flight). Other calls arriving meanwhile do not wait; they go out with the
+  current header. The refresh shares the call's deadline and uses at most half of what remains.
+  It only happens while traffic flows, so an idle region sends nothing.
+- **On `MASTER_VERSION_MISMATCH`.** When a response carries this `x-sirius-error-code` for the
+  header currently in use, the version becomes suspect: the next call waits for one Version call,
+  which is sent without `x-master-version` (exactly like the first Version call of the process),
+  before it sends its own RPC. The call that received the code is not replayed; it fails as
+  before (502 `upstream_grpc`, or 503 for gRPC 14) and never counts against the account (see
+  [ACCOUNTS.md](ACCOUNTS.md)). The code is recognized whatever gRPC status comes with it. A late
+  answer to a header that was already replaced is ignored, and the version in an error response
+  is never adopted: only Version sets the version pair.
+- **Failures back off.** A failed refresh keeps the previous headers, is logged
+  (`error_code` is the refresh's error), and no refresh is tried for 30 s. So is a Version call
+  that still returns the version the game called stale, to avoid one Version per call.
+- `CLIENT_UPDATE_REQUIRED` is logged once (warn, until the next successful answer) and needs a
+  new `client_version`; it does not trigger a refresh and never penalizes an account.
+
+Workers' own Version calls (Master update, resource snapshots) refresh the header too. A
+protocol activation clears it together with the other version observations.
+
+Both codes are string literals next to the version check of the official JP 1.0.3 and Global
+1.0.1 clients. Which gRPC status the game pairs with them, and whether it rejects an old
+`x-master-version` at all, is not verified; the design depends on neither.
 
 ## Upstream path health
 
@@ -140,7 +172,9 @@ remain pinned for the logical call.
 
 Authenticated profile/ranking/account calls never automatically replay or switch
 accounts within a request. Authentication errors, maintenance responses, rate limiting,
-invalid protocol data and application failures do not trigger retries. Anonymous
+invalid protocol data and application failures do not trigger retries. Neither do
+`MASTER_VERSION_MISMATCH` and `CLIENT_UPDATE_REQUIRED`, even with gRPC 14: the same headers
+would be sent again, so the next call refreshes the version instead. Anonymous
 Version bootstrap may retry before any account credential has been sent; its failure
 does not penalize account health. This policy does not add registration or mutation RPCs.
 
