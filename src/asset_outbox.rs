@@ -311,6 +311,14 @@ impl Outbox {
             _ => Err(Error::Invalid),
         })
     }
+    /// The updater answered the POST with a definite refusal (busy): nothing was accepted, so the
+    /// entry may be submitted again with the same Idempotency-Key.
+    pub fn refused(&mut self, key: &str) -> Result<(), Error> {
+        self.change(key, |state| match state {
+            State::Sending { .. } => Ok(State::Pending),
+            _ => Err(Error::Invalid),
+        })
+    }
     pub fn acknowledge(&mut self, key: &str, id: &str) -> Result<(), Error> {
         if !uuid(id) {
             return Err(Error::Invalid);

@@ -4771,6 +4771,176 @@ fn asset_outbox_failed_writes_and_corrupt_state_never_acknowledge_dispatch() {
     assert!(matches!(invalid.key(), Err(Error::Invalid)));
 }
 
+/// Runs `rounds` reconciliations against an updater whose POSTs answer `statuses` in order
+/// (202 accepts). Returns the entry's final state, the POST count and the distinct keys sent.
+async fn dispatch_submissions(statuses: Vec<u16>, rounds: usize) -> (Value, usize, usize) {
+    use crate::asset_dispatch::{Config as DispatchConfig, Target, Worker};
+    use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::any, Router};
+    use sha2::{Digest, Sha256};
+    type Script = Arc<std::sync::Mutex<(std::collections::VecDeque<u16>, Vec<String>)>>;
+    let script: Script = Arc::new(std::sync::Mutex::new((statuses.into(), Vec::new())));
+    let app = Router::new()
+        .route(
+            "/{*path}",
+            any(
+                |State(script): State<Script>, headers: HeaderMap, body: axum::body::Bytes| async move {
+                    let mut script = script.lock().unwrap();
+                    let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                    script.1.push(key.clone());
+                    let status = script.0.pop_front().unwrap_or(500);
+                    if status != 202 {
+                        let code = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (code, "updater detail must-not-leak").into_response();
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                        "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                    (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+                },
+            ),
+        )
+        .with_state(script.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    let token = format!("SIRIUS_DISPATCH_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "dispatch-only-token");
+    cfg.asset_dispatch = Some(DispatchConfig {
+        state_directory: directory.path().join("outbox"),
+        interval_seconds: 10,
+        request_timeout_ms: 1000,
+        history_capacity: 100,
+        targets: vec![Target {
+            user_agent: None,
+            origin,
+            token_env: token,
+            allow_http: true,
+            profile: "full".into(),
+            profile_revision: "1".into(),
+            require_full_catalog: true,
+            require_full_export: true,
+            require_publication: false,
+        }],
+    });
+    let mut worker = Worker::new(&cfg, client(&game, cfg.clone())).unwrap();
+    worker
+        .observe(&crate::resources::ResourceSnapshot {
+            schema_version: 2,
+            region: crate::region::Region::Jp,
+            environment: "release".into(),
+            platform: "iOS",
+            client_version: "1.0.3".into(),
+            protocol_version: "1.0.3".into(),
+            master_version: None,
+            resource_version: "r1".into(),
+            platform_hash: "hash1".into(),
+            effective_cdn_root: String::new(),
+            credential_ref: String::new(),
+            observed_at: chrono::Utc::now(),
+            source: "remote",
+            catalog_layout: None,
+            catalog_url: None,
+            bundle_base_url: None,
+            cdn_authorization: None,
+        })
+        .unwrap();
+    for _ in 0..rounds {
+        worker.reconcile().await.unwrap();
+    }
+    drop(worker);
+    server.abort();
+    let ledger: Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("outbox/outbox.json")).unwrap(),
+    )
+    .unwrap();
+    let state = ledger["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["state"]
+        .clone();
+    if state["state"] == "failed" {
+        let key = ledger["entries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let mut outbox =
+            crate::asset_outbox::Outbox::open(&directory.path().join("outbox"), 100).unwrap();
+        let adoptable = outbox
+            .adopt(&key, &uuid::Uuid::new_v4().to_string())
+            .is_ok();
+        assert_eq!(adoptable, state["code"] == "submission_ambiguous");
+    }
+    let script = script.lock().unwrap();
+    let keys: std::collections::HashSet<_> = script.1.iter().collect();
+    (state, script.1.len(), keys.len())
+}
+#[tokio::test]
+async fn asset_dispatch_resubmits_busy_refusals_and_fails_definite_rejections() {
+    // Busy answers are resubmitted with the same Idempotency-Key until accepted.
+    let (state, posts, keys) = dispatch_submissions(vec![429, 503, 202], 3).await;
+    assert_eq!(state["state"], "submitted");
+    assert_eq!((posts, keys), (3, 1));
+    // ... but only a bounded number of times.
+    let (state, posts, _) = dispatch_submissions(vec![503; 12], 12).await;
+    assert_eq!(
+        state,
+        json!({"state":"failed","job_id":null,"code":"submission_refused"})
+    );
+    assert_eq!(posts, 10);
+    // A definite rejection is terminal after one POST and is not adoptable.
+    for (status, code) in [
+        (400, "submission_rejected"),
+        (422, "submission_rejected"),
+        (401, "submission_unauthorized"),
+        (403, "submission_unauthorized"),
+        (409, "idempotency_conflict"),
+    ] {
+        let (state, posts, _) = dispatch_submissions(vec![status], 2).await;
+        assert_eq!(state["code"], code, "{status}");
+        assert_eq!(posts, 1, "{status}");
+    }
+    // Other failures may have been accepted: never replayed, left for the operator.
+    let (state, posts, _) = dispatch_submissions(vec![502], 2).await;
+    assert_eq!(state["code"], "submission_ambiguous");
+    assert_eq!(posts, 1);
+}
+#[test]
+fn outbox_refusal_returns_only_sending_entries_to_pending() {
+    use crate::asset_outbox::{Outbox, State};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Outbox::open(directory.path(), 4).unwrap();
+    let identity = crate::asset_outbox::Identity {
+        destination_sha256: "a".repeat(64),
+        request: crate::asset_jobs::Request {
+            region: crate::region::Region::Jp,
+            profile: "full".into(),
+            operation: crate::asset_jobs::Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "production".into(),
+        platform: "iOS".into(),
+        resource_version: "version-1".into(),
+        platform_hash: "hash-1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let key = store.observe(identity).unwrap();
+    assert!(store.refused(&key).is_err());
+    store.begin_send(&key).unwrap();
+    store.refused(&key).unwrap();
+    assert_eq!(store.entries()[&key].state, State::Pending);
+    store.fail(&key, "submission_refused").unwrap();
+    assert!(store.refused(&key).is_err());
+}
 #[tokio::test]
 async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     type RemoteState = Arc<std::sync::Mutex<(Option<Value>, usize, bool)>>;

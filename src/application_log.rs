@@ -146,6 +146,8 @@ fn permitted(name: &str) -> bool {
             | "listen"
             | "operation"
             | "attempt"
+            | "profile"
+            | "target"
     )
 }
 fn bounded(value: &str) -> String {

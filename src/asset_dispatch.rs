@@ -1,7 +1,7 @@
 //! Background catalog observation and durable updater reconciliation.
 use crate::{
     asset_jobs::{self, Operation, Request, Status},
-    asset_outbox::{Identity, Outbox, State},
+    asset_outbox::{Entry, Identity, Outbox, State},
     client::GameClient,
     config::Config as GameConfig,
     error::AppError,
@@ -133,6 +133,26 @@ pub struct Worker {
     remotes: Vec<Remote>,
     control: crate::asset_dispatch_admin::Control,
     commands: tokio::sync::mpsc::Receiver<crate::asset_dispatch_admin::Command>,
+    /// Busy answers (429/503) per entry since this process started; bounded by
+    /// [`MAX_REFUSALS`] before the entry fails as `submission_refused`.
+    refusals: std::collections::HashMap<String, u32>,
+}
+/// Like the original's busy retry (10 × one interval), but only for answers that guarantee the
+/// updater did not accept the job; the same Idempotency-Key is reused.
+const MAX_REFUSALS: u32 = 10;
+/// Terminal classification of a submission the updater answered with a definite HTTP status.
+fn rejected_submission(status: u16) -> Option<&'static str> {
+    match status {
+        400 | 404 | 405 | 413 | 415 | 422 => Some("submission_rejected"),
+        401 | 403 => Some("submission_unauthorized"),
+        409 => Some("idempotency_conflict"),
+        _ => None,
+    }
+}
+/// Log label for a target without its origin or token.
+fn target_label(entry: &Entry) -> &str {
+    let digest = &entry.identity.destination_sha256;
+    &digest[..digest.len().min(12)]
 }
 impl Worker {
     pub fn new(
@@ -182,6 +202,7 @@ impl Worker {
             config: cfg,
             outbox,
             remotes,
+            refusals: Default::default(),
         })
     }
     pub fn control(&self) -> crate::asset_dispatch_admin::Control {
@@ -212,9 +233,10 @@ impl Worker {
                 r.digest == entry.identity.destination_sha256
                     && r.config.profile == entry.identity.request.profile
             }) else {
-                self.fail(&key, "target_removed")?;
+                self.fail(&key, &entry, "target_removed", None)?;
                 continue;
             };
+            let pending = matches!(entry.state, State::Pending);
             let result = match &entry.state {
                 State::Pending => {
                     self.outbox.begin_send(&key)?;
@@ -222,7 +244,7 @@ impl Worker {
                 }
                 State::Sending { .. } => {
                     // No remote retention guarantee exists: never replay an ambiguous POST automatically.
-                    self.fail(&key, "submission_ambiguous")?;
+                    self.fail(&key, &entry, "submission_ambiguous", None)?;
                     continue;
                 }
                 State::Submitted { job_id } => {
@@ -234,15 +256,16 @@ impl Worker {
                 Ok(job) => {
                     let expected = format!("{:x}", Sha256::digest(key.as_bytes()));
                     if job.idempotency_sha256.as_deref() != Some(expected.as_str()) {
-                        self.fail(&key, "job_identity_mismatch")?;
+                        self.fail(&key, &entry, "job_identity_mismatch", None)?;
                         continue;
                     }
-                    if matches!(entry.state, State::Pending) {
+                    if pending {
                         self.outbox.acknowledge(&key, &job.id)?;
+                        self.refusals.remove(&key);
                     }
                     match job.status {
-                        Status::Failed => self.fail(&key, "job_failed")?,
-                        Status::Cancelled => self.fail(&key, "job_cancelled")?,
+                        Status::Failed => self.fail(&key, &entry, "job_failed", None)?,
+                        Status::Cancelled => self.fail(&key, &entry, "job_cancelled", None)?,
                         Status::Completed => {
                             if let Some(outcome) =
                                 job.outcome.filter(|o| matches_outcome(&entry.identity, o))
@@ -254,7 +277,7 @@ impl Worker {
                                     outcome.publication_id,
                                 )?;
                             } else {
-                                self.fail(&key, "outcome_mismatch")?;
+                                self.fail(&key, &entry, "outcome_mismatch", None)?;
                             }
                         }
                         _ => {}
@@ -263,27 +286,79 @@ impl Worker {
                 Err(asset_jobs::Error::Status(404))
                     if matches!(entry.state, State::Submitted { .. }) =>
                 {
-                    self.fail(&key, "job_pruned")?
+                    self.fail(&key, &entry, "job_pruned", Some(404))?
                 }
-                Err(asset_jobs::Error::Protocol) => self.fail(&key, "invalid_job_response")?,
-                Err(_) => {
-                    tracing::warn!(
-                        error_code = "asset_dispatch_transport",
-                        "Asset job request failed; persisted state retained"
-                    );
+                // A definite answer to the POST: the updater did not accept the job.
+                Err(asset_jobs::Error::Status(status @ (429 | 503))) if pending => {
+                    let refusals = self.refusals.entry(key.clone()).or_default();
+                    *refusals += 1;
+                    if *refusals >= MAX_REFUSALS {
+                        self.refusals.remove(&key);
+                        self.fail(&key, &entry, "submission_refused", Some(status))?;
+                    } else {
+                        self.outbox.refused(&key)?;
+                        tracing::warn!(
+                            region = self.region.name(),
+                            profile = entry.identity.request.profile.as_str(),
+                            target = target_label(&entry),
+                            stage = "submit",
+                            status,
+                            error_code = "asset_dispatch_busy",
+                            "Asset updater is busy; the job will be submitted again"
+                        );
+                    }
                 }
+                Err(asset_jobs::Error::Status(status)) if pending => {
+                    if let Some(code) = rejected_submission(status) {
+                        self.refusals.remove(&key);
+                        self.fail(&key, &entry, code, Some(status))?;
+                    } else {
+                        self.transport_warning(&entry, pending, Some(status));
+                    }
+                }
+                // Raised before any request is sent (invalid key or request).
+                Err(asset_jobs::Error::Config) if pending => {
+                    self.fail(&key, &entry, "asset_dispatch_request_invalid", None)?
+                }
+                Err(asset_jobs::Error::Protocol) => {
+                    self.fail(&key, &entry, "invalid_job_response", None)?
+                }
+                Err(asset_jobs::Error::Status(status)) => {
+                    self.transport_warning(&entry, pending, Some(status))
+                }
+                Err(_) => self.transport_warning(&entry, pending, None),
             }
         }
         Ok(())
     }
-    fn fail(&mut self, key: &str, code: &str) -> Result<(), crate::asset_outbox::Error> {
+    fn fail(
+        &mut self,
+        key: &str,
+        entry: &Entry,
+        code: &str,
+        status: Option<u16>,
+    ) -> Result<(), crate::asset_outbox::Error> {
         self.outbox.fail(key, code)?;
         tracing::warn!(
             region = self.region.name(),
+            profile = entry.identity.request.profile.as_str(),
+            target = target_label(entry),
+            status,
             error_code = code,
             "Asset dispatch requires operator reconciliation"
         );
         Ok(())
+    }
+    fn transport_warning(&self, entry: &Entry, pending: bool, status: Option<u16>) {
+        tracing::warn!(
+            region = self.region.name(),
+            profile = entry.identity.request.profile.as_str(),
+            target = target_label(entry),
+            stage = if pending { "submit" } else { "poll" },
+            status,
+            error_code = "asset_dispatch_transport",
+            "Asset job request failed; persisted state retained"
+        );
     }
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) {
         loop {

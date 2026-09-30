@@ -333,6 +333,12 @@ These generic capabilities are intentionally not restored in their original form
    for an outdated app is not reproduced: the game's `CLIENT_UPDATE_REQUIRED` stays
    `upstream_grpc` and is visible as `observation.application_code` in `/system`, because it
    means the operator must raise `client_version`, not that the caller should retry.
+10. **Busy updaters are retried by status, not by body text.** The original retries a 409 every
+   60 s up to 10 times and treats a body containing "is disabled" as permanent
+   (`Haruki-Sekai-API@9a53714:src/updater/master.rs`). The Sirius updater answers busy with
+   429/503 and uses 409 for an Idempotency-Key conflict, so Sirius resubmits 429/503 (same key,
+   one reconciliation interval apart, 10 times) and treats 409 and other 4xx as terminal without
+   reading the body. See [ASSET_DISPATCH.md](ASSET_DISPATCH.md#durable-state-and-recovery-boundaries).
 
 ## Original fields that were ignored by the original itself
 

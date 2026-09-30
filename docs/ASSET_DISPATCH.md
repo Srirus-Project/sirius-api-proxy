@@ -77,7 +77,24 @@ Temporary GET failures leave the job submitted for the next cycle. Terminal fail
 404 for a previously acknowledged job, malformed replies and removed targets are recorded as failed
 and logged with sanitized codes. They are not repeatedly exported.
 
-A POST transport failure or shutdown can leave acceptance ambiguous. Because remote job retention
+A POST answered with a definite status was not accepted, so it is classified instead of being
+left ambiguous (1.2.4; earlier releases recorded every failed POST as `submission_ambiguous`):
+
+| Updater answer to the POST | Result |
+| --- | --- |
+| 429 (queue full) or 503 (draining) | Back to pending; submitted again at the next cycle with the same Idempotency-Key. After 10 such answers since the process started: `submission_refused` |
+| 400, 404, 405, 413, 415, 422 | `submission_rejected` (for example an unknown profile) |
+| 401, 403 | `submission_unauthorized` (wrong or unauthorized token) |
+| 409 | `idempotency_conflict` (the key is already bound to a different request) |
+| Invalid key or request detected before sending | `asset_dispatch_request_invalid` |
+
+These codes are terminal and cannot be adopted: nothing was accepted. Fix the target or updater
+configuration, then raise `profile_revision` to dispatch again. Warnings carry `region`,
+`profile`, `target` (the first 12 hex digits of the destination digest, never the origin),
+`stage` (`submit`/`poll`) and the HTTP `status`; response bodies are never read or logged.
+
+Any other POST failure (transport error, timeout, other 5xx) or a shutdown can leave acceptance
+ambiguous. Because remote job retention
 has no minimum time guarantee, the worker does **not** blindly replay such submissions after a
 restart or lost response. The next reconciliation records `submission_ambiguous`. Operators must
 inspect the updater's retained job list before intentionally requesting new execution. Use a new
