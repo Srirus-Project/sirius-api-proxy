@@ -130,7 +130,10 @@ pub fn default_protocol_directory() -> std::path::PathBuf {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasterUpdateConfig {
-    #[serde(default)]
+    #[serde(
+        default = "crate::master_update::Network::master",
+        deserialize_with = "crate::master_update::Network::deserialize_master"
+    )]
     pub network: crate::master_update::Network,
     /// `basic` (default) sends HTTP Basic with `username_env` and the credential referenced for
     /// the effective CDN root. `none` sends no Authorization header; it is accepted only for

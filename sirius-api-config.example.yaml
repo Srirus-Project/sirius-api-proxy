@@ -32,8 +32,8 @@ internal_token_env: SIRIUS_INTERNAL_TOKEN
 #     connect_timeout_ms: 10000
 #     request_timeout_ms: 60000
 #     update_timeout_seconds: 600
-#     attempts: 1
-#     retry_delay_ms: 250
+#     attempts: 3
+#     retry_delay_ms: 1000
 #     max_retry_delay_ms: 5000
 #     # proxy_url_env: SIRIUS_MASTER_PROXY_URL
 #     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION

@@ -13,8 +13,8 @@ master_update:
     connect_timeout_ms: 10000
     request_timeout_ms: 60000
     update_timeout_seconds: 600
-    attempts: 1
-    retry_delay_ms: 250
+    attempts: 3
+    retry_delay_ms: 1000
     max_retry_delay_ms: 5000
     # proxy_url_env: SIRIUS_MASTER_PROXY_URL
     # proxy_authorization_env: SIRIUS_MASTER_PROXY_AUTHORIZATION
@@ -24,7 +24,11 @@ master_update:
 `username_env` and a credential for the CDN root. `none` sends no Authorization header and is
 limited to HK/EN/KR (see [region support](REGIONS.md#cdn-authorization)).
 
-The defaults retain one request attempt and the original connection/request/update timeouts.
+The shown values are the defaults. Since 1.2.4 a Master update makes 3 attempts per request
+(1–2 s backoff), like the original updater's Master downloads; 1.2.0–1.2.3 made one attempt.
+Omitted fields keep these Master defaults even when the block is partly written; set
+`attempts: 1` to restore the old behavior. The `.hash` request of `resource_snapshot.network`
+still defaults to one attempt and 250 ms.
 Connection and request timeouts allow 100–300000 ms. Request timeout includes the response body.
 The whole-update deadline allows 1–3600 seconds and includes waiting for another update's lock,
 version checks, all downloads and retry backoffs. A queued call that expires before acquiring the

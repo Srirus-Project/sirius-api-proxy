@@ -4229,9 +4229,28 @@ fn master_network_configuration_is_bounded_and_old_yaml_keeps_defaults() {
         "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60",
     )
     .unwrap();
-    assert_eq!(old.network.attempts, 1);
+    // Master downloads retry by default (3 attempts), also when the block is partly written.
+    assert_eq!(old.network.attempts, 3);
+    assert_eq!(old.network.retry_delay_ms, 1_000);
     assert_eq!(old.network.update_timeout_seconds, 600);
     assert!(old.network.proxy_url_env.is_none());
+    let partial: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60\nnetwork:\n  request_timeout_ms: 5000",
+    )
+    .unwrap();
+    assert_eq!(partial.network.attempts, 3);
+    assert_eq!(partial.network.request_timeout_ms, 5_000);
+    let single: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60\nnetwork:\n  attempts: 1",
+    )
+    .unwrap();
+    assert_eq!(single.network.attempts, 1);
+    // Other network blocks (the resource snapshot `.hash` request) keep one attempt.
+    let snapshot: crate::config::ResourceSnapshotConfig =
+        yaml_serde::from_str("network:\n  request_timeout_ms: 5000").unwrap();
+    assert_eq!(snapshot.network.attempts, 1);
+    let snapshot: crate::config::ResourceSnapshotConfig = yaml_serde::from_str("{}").unwrap();
+    assert_eq!(snapshot.network.attempts, 1);
     for yaml in [
         "attempts: 0",
         "attempts: 9",

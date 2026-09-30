@@ -42,8 +42,10 @@ impl From<MasterError> for UpdateError {
     }
 }
 /// HTTP policy for Master CDN traffic, independent of game RPC transport.
-#[derive(Clone, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
+///
+/// Omitted fields take the defaults of where the block appears: [`Network::master`] under
+/// `master_update`, [`Network::default`] elsewhere (see [`Network::deserialize_master`]).
+#[derive(Clone)]
 pub struct Network {
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
@@ -68,7 +70,57 @@ impl Default for Network {
         }
     }
 }
+/// The written fields of a `network` block; the rest come from the context's defaults.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialNetwork {
+    connect_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    update_timeout_seconds: Option<u64>,
+    attempts: Option<usize>,
+    retry_delay_ms: Option<u64>,
+    max_retry_delay_ms: Option<u64>,
+    proxy_url_env: Option<String>,
+    proxy_authorization_env: Option<String>,
+}
+impl PartialNetwork {
+    fn over(self, base: Network) -> Network {
+        Network {
+            connect_timeout_ms: self.connect_timeout_ms.unwrap_or(base.connect_timeout_ms),
+            request_timeout_ms: self.request_timeout_ms.unwrap_or(base.request_timeout_ms),
+            update_timeout_seconds: self
+                .update_timeout_seconds
+                .unwrap_or(base.update_timeout_seconds),
+            attempts: self.attempts.unwrap_or(base.attempts),
+            retry_delay_ms: self.retry_delay_ms.unwrap_or(base.retry_delay_ms),
+            max_retry_delay_ms: self.max_retry_delay_ms.unwrap_or(base.max_retry_delay_ms),
+            proxy_url_env: self.proxy_url_env.or(base.proxy_url_env),
+            proxy_authorization_env: self
+                .proxy_authorization_env
+                .or(base.proxy_authorization_env),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for Network {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(PartialNetwork::deserialize(d)?.over(Self::default()))
+    }
+}
 impl Network {
+    /// Master CDN defaults. A Master update downloads every table, so like the original
+    /// updater (3 attempts, `Haruki-Sekai-API@9a53714:src/updater/master.rs:22-23`) a
+    /// transient failure is retried instead of discarding the whole pass.
+    pub fn master() -> Self {
+        Self {
+            attempts: 3,
+            retry_delay_ms: 1_000,
+            ..Self::default()
+        }
+    }
+    /// `deserialize_with` for `master_update.network`: omitted fields use [`Network::master`].
+    pub fn deserialize_master<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(<PartialNetwork as serde::Deserialize>::deserialize(d)?.over(Self::master()))
+    }
     pub fn validate(&self) -> Result<(), UpdateError> {
         if !(100..=300_000).contains(&self.connect_timeout_ms)
             || !(100..=300_000).contains(&self.request_timeout_ms)
