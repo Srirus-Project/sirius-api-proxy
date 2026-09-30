@@ -544,6 +544,18 @@ These generic capabilities are intentionally not restored in their original form
      compresses; it would change outbound fingerprints; peers accept identity only).
    - `json_client_errors` also drops `Content-Encoding` when it replaces a non-JSON body
      (`src/error.rs`), so a rewritten error can never be labeled with the original coding.
+25. **The Git link is a commit trailer, not a manifest or notification field.** The original
+   reads its worktree HEAD after a publication and carries it as `gitCommit` in the registry
+   notification (`Haruki-Sekai-API@9a53714:src/api/internal.rs:492-505`, `:581`;
+   `src/registry/service.rs:51-58`). Sirius publishes Git asynchronously from its own managed
+   repository, and identical trees reuse a commit while one content identity can span several
+   commits, so a `git_commit` in manifests, history or hints stays refused. Instead each new
+   commit carries `Sirius-Content-SHA256: <content_sha256>` as a trailer paragraph after the
+   unchanged subject (`src/master_git.rs` `CONTENT_TRAILER`, `commit_internal`). The hash is
+   checked as 64 lowercase hex before any Git command (`prepare`), so it cannot inject message
+   lines; signatures cover it. Sirius never reads it back: adoption still matches the subject
+   and verifies the tree. Existing commits are not rewritten and no commit is created only to
+   add a trailer. No configuration surface.
 
 ## Original fields that were ignored by the original itself
 
@@ -696,3 +708,5 @@ classification and evidence:
   lists (`servers`, `registry`), the reverse check and the example coverage.
 - **Current Master ETag:** new [Decision 23](#decisions). A behavior-only change on the
   `/master-data` reads; no field is added.
+- **Git content trailer:** new [Decision 25](#decisions). New Master Git commits add a
+  `Sirius-Content-SHA256` trailer; no field is added.

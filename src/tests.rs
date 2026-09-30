@@ -11147,6 +11147,17 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
         serde_json::from_slice(&git(&["show", "HEAD:sirius-publication.json"])).unwrap();
     assert!(metadata.get("snapshot").is_none());
     assert_eq!(metadata["content_sha256"], first.content_sha256);
+    // The subject is unchanged; a second paragraph is a real Git trailer.
+    assert_eq!(
+        master_git_message(&repository, &first.commit),
+        (
+            format!(
+                "Sirius Master jp {}\n\nSirius-Content-SHA256: {}\n",
+                manifest.version, first.content_sha256
+            ),
+            first.content_sha256.clone()
+        )
+    );
     let (mut manifest, decoder, _) = master_fixture();
     master::import_directory(&input, &source, &decoder).unwrap();
     let repeated = master_git::commit(&source, &state, registry_scope())
@@ -11154,6 +11165,12 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
         .unwrap();
     assert!(!repeated.changed);
     assert_eq!(repeated.commit, first.commit);
+    assert_eq!(
+        String::from_utf8(git(&["rev-list", "--count", "HEAD"]))
+            .unwrap()
+            .trim(),
+        "1"
+    );
     manifest.version = "git-next".into();
     std::fs::write(
         input.join("MasterManifest.json"),
@@ -11171,6 +11188,16 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
             .unwrap()
             .trim(),
         first.commit
+    );
+    assert_eq!(
+        master_git_message(&repository, &next.commit),
+        (
+            format!(
+                "Sirius Master jp git-next\n\nSirius-Content-SHA256: {}\n",
+                next.content_sha256
+            ),
+            next.content_sha256.clone()
+        )
     );
     let current = std::fs::read(source.join("CURRENT")).unwrap();
     assert_ne!(current, before);
@@ -12042,6 +12069,10 @@ async fn master_git_policy_signs_with_ssh_and_preserves_refs_when_signer_fails()
         verify.status.success(),
         "SSH signature must verify against independently supplied public key"
     );
+    // The signature covers the whole message, including the trailer.
+    let (message, trailer) = master_git_message(&repo, &first.commit);
+    assert_eq!(message.matches("\nSirius-Content-SHA256: ").count(), 1);
+    assert_eq!(trailer, first.content_sha256);
     assert!(
         !master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
             .await
@@ -12225,6 +12256,10 @@ async fn master_git_openpgp_policy_signs_and_verifies_with_isolated_keyring() {
     assert!(
         verified.status.success(),
         "OpenPGP commit signature verification failed"
+    );
+    assert_eq!(
+        master_git_message(&state.join("repository.git"), &receipt.commit).1,
+        receipt.content_sha256
     );
 }
 
@@ -16464,6 +16499,22 @@ fn git_output(repository: &std::path::Path, args: &[&str]) -> Option<String> {
         .success()
         .then(|| String::from_utf8(output.stdout).unwrap())
 }
+/// The raw message of `commit` (after its headers) and its parsed content trailer values.
+fn master_git_message(repository: &std::path::Path, commit: &str) -> (String, String) {
+    let raw = git_output(repository, &["cat-file", "commit", commit]).unwrap();
+    let message = raw.split_once("\n\n").unwrap().1.to_owned();
+    let trailer = git_output(
+        repository,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Sirius-Content-SHA256,valueonly)",
+            commit,
+        ],
+    )
+    .unwrap();
+    (message, trailer.trim().to_owned())
+}
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
@@ -16533,6 +16584,16 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     )
     .unwrap();
     assert_eq!(first.content_sha256, manifest.content_sha256);
+    assert_eq!(
+        master_git_message(&repository, &first.commit),
+        (
+            format!(
+                "Sirius Master jp 1.0.0\n\nSirius-Content-SHA256: {}\n",
+                first.content_sha256
+            ),
+            first.content_sha256.clone()
+        )
+    );
     // Repeated publication and an identical reinstall (new snapshot UUID) reuse the commit.
     assert!(!commit(options.clone()).await.unwrap().changed);
     install_plain_master(
@@ -16544,11 +16605,42 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     let repeated = commit(options.clone()).await.unwrap();
     assert!(!repeated.changed);
     assert_eq!(repeated.commit, first.commit);
+    // Only the asset version changed: version.json differs, so a new commit carries the same
+    // content identity as its predecessor. The trailer is not a one-to-one link.
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-2"),
+        &[("MasterAlpha", alpha), ("MasterBeta", beta)],
+    );
+    let asset_only = commit(options.clone()).await.unwrap();
+    assert!(asset_only.changed);
+    assert_eq!(asset_only.content_sha256, first.content_sha256);
+    assert_eq!(git(&["rev-parse", "main^"]).trim(), first.commit);
+    assert_eq!(
+        master_git_message(&repository, &asset_only.commit),
+        master_git_message(&repository, &first.commit)
+    );
+    assert_eq!(
+        git(&["log", "-1", "--format=%s", "main"]).trim(),
+        "Sirius Master jp 1.0.0"
+    );
     // A table removed upstream disappears from the tree; history is linear.
     install_plain_master(&source, "1.0.1", Some("asset-2"), &[("MasterAlpha", alpha)]);
     let next = commit(options.clone()).await.unwrap();
     assert!(next.changed);
-    assert_eq!(git(&["rev-parse", "main^"]).trim(), first.commit);
+    assert_ne!(next.content_sha256, first.content_sha256);
+    assert_eq!(git(&["rev-parse", "main^"]).trim(), asset_only.commit);
+    assert_eq!(
+        master_git_message(&repository, &next.commit),
+        (
+            format!(
+                "Sirius Master jp 1.0.1\n\nSirius-Content-SHA256: {}\n",
+                next.content_sha256
+            ),
+            next.content_sha256.clone()
+        )
+    );
     assert_eq!(
         git(&["ls-tree", "--name-only", "main"]),
         "MasterAlpha.json\nversion.json\n"
@@ -16664,9 +16756,66 @@ async fn master_git_indented_root_pushes_configured_branch_to_remote() {
         git_output(&remote_path, &["show", "release/main:MasterOnly.json"]).unwrap(),
         "{\n  \"a\": {}\n}\n"
     );
+    // The pushed commit keeps its trailer.
+    assert_eq!(
+        master_git_message(&remote_path, &receipt.commit),
+        (
+            format!(
+                "Sirius Master jp 2.0.0\n\nSirius-Content-SHA256: {}\n",
+                receipt.content_sha256
+            ),
+            receipt.content_sha256.clone()
+        )
+    );
     let again = publish().await.unwrap();
     assert!(!again.changed && again.remote_verified);
     assert_eq!(again.commit, receipt.commit);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_trailer_is_not_added_to_reused_pre_1_3_commits() {
+    use crate::master_git;
+    let (root, _, source, _) = registry_fixture();
+    let state = root.path().join("git-state");
+    let repository = state.join("repository.git");
+    let first = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(first.changed);
+    // A 1.2.x publication of the same tree: subject only, no trailer.
+    let subject = git_output(&repository, &["log", "-1", "--format=%s", &first.commit]).unwrap();
+    let legacy = adopt_fixture_commit(
+        &repository,
+        "master-data",
+        &adopt_tree_entries(&repository, &first.commit),
+        None,
+        subject.trim(),
+    );
+    assert_ne!(legacy, first.commit);
+    assert_eq!(
+        master_git_message(&repository, &legacy),
+        (format!("{}\n", subject.trim()), String::new())
+    );
+    let reused = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(!reused.changed);
+    assert_eq!(reused.commit, legacy);
+    assert_eq!(reused.content_sha256, first.content_sha256);
+    assert_eq!(
+        git_output(&repository, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        legacy
+    );
+    assert_eq!(
+        git_output(&repository, &["rev-list", "--count", "master-data"])
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    assert_eq!(master_git_message(&repository, &legacy).1, "");
 }
 
 /// A local bare repository reached over `file://`, for offline remote Git tests.
@@ -17918,6 +18067,13 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         assert_eq!(
             git_output(&repository, &["log", "-1", "--format=%s", "main"]).unwrap(),
             format!("Sirius Master {n} master-fixture\n")
+        );
+        assert_eq!(
+            master_git_message(&repository, &receipt.commit).0,
+            format!(
+                "Sirius Master {n} master-fixture\n\nSirius-Content-SHA256: {}\n",
+                manifest.content_sha256
+            )
         );
         // The Git state is owned by this region; another region's scope is refused.
         let other = [Region::Jp, Region::Hk, Region::En, Region::Kr][(index + 2) % 4];

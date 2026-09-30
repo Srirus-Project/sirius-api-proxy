@@ -216,7 +216,8 @@ publication, sync and new installations all refuse a snapshot recorded for anoth
 `master-import IN OUT --region hk|en|kr` records a Global import; without `--region` it records
 JP as before. Content identity, update hints and notifications carry the scope's region.
 Regional routes use `/api/v1/{region}/master-data/...` and `/internal/v1/{region}/...`. Git
-commit messages are `Sirius Master <region> <version>`. In a multi-region deployment, each
+commit subjects are `Sirius Master <region> <version>`, and since 1.3.0 new commits add a
+`Sirius-Content-SHA256` trailer with the scoped content identity. In a multi-region deployment, each
 region needs its own `master_directory`, `master_git.state_directory`, Git remote and Git token.
 See [the multi-region publisher example](examples/master-publisher.yaml) and
 [Master snapshot publication](MASTER_REGISTRY.md).

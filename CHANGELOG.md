@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- New Master Git commits end with a second paragraph holding one trailer,
+  `Sirius-Content-SHA256: <content_sha256>`, the scoped content identity served at
+  `by-hash/{content_sha256}/manifest`. The subject, tree, manifest, receipt and adoption are
+  unchanged, existing commits are not rewritten, and identical content still reuses the previous
+  commit, so a reused commit may carry another identity's trailer or none. The trailer is
+  informational: Sirius never reads it, and it is not proof of content. Tooling that compares
+  the full message (`%B`) byte-for-byte with 1.2.x sees the extra paragraph; `%s` is unaffected.
 - Optional negotiated response compression: root `http_compression: {enabled: true}` (single
   file, multi-region root only, standalone registry) encodes status 200 `application/json`
   bodies of at least 1024 bytes with gzip or zstd (fastest level) on the public API and the

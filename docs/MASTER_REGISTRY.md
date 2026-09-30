@@ -428,6 +428,20 @@ publication attempt (init, ref reads, remote check, hashing, commit, signing, pu
 verification) share one deadline, `master_git.timeout_seconds` (default 120; range 10–600). It
 starts after local preparation; synchronous local reads can exceed that preparation time.
 
+Each new commit has the subject `Sirius Master <region> <version>`. Since 1.3.0 it is followed
+by a second paragraph holding one Git trailer, `Sirius-Content-SHA256: <content_sha256>`: the
+scoped content identity served at [`by-hash/{content_sha256}/manifest`](#lookup-by-content-identity).
+Read it with `git log --format='%h %(trailers:key=Sirius-Content-SHA256,valueonly)'`.
+
+- The trailer is informational. Sirius never reads it back, and it is not proof of content:
+  anyone who can push to a repository can forge it. Verify the tree or the registry manifest.
+- It is not a one-to-one link. Identical trees reuse the earlier commit, which keeps its
+  message: its trailer may name another content identity with the same tree, and commits made
+  before 1.3.0 have none. No commit is created only to add a trailer. With `indented_root`,
+  one content identity can appear in several commits, for example when only the asset version
+  changes. Changing the branch or layout starts separate commits.
+- Git is an asynchronous downstream mirror, so the registry's CURRENT may already have moved on.
+
 By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and are unsigned.
 The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
 repository redirects, injected config and trace destinations; terminal prompting is disabled.
@@ -511,7 +525,8 @@ environment and platform), version and table names as the tree. For `indented_ro
 `version.json` must be byte-for-byte the document Sirius writes for that version.
 `indented_root` commits record only the region, so they cannot distinguish two environments
 that share a branch; configure one remote branch per deployment. Older commits are never
-consulted once a `Sirius Master` subject is found.
+consulted once a `Sirius Master` subject is found. The `Sirius-Content-SHA256` trailer is
+never consulted either: it comes from the remote and proves nothing.
 
 | Local and remote | Result |
 |---|---|
@@ -594,8 +609,9 @@ reserialize: object key order, duplicate keys, number spellings (`1.0`, `1e3`, `
 escapes and non-ASCII text are copied exactly; only insignificant whitespace changes. Empty
 objects and arrays are written `{}` and `[]`. Content hashes and sizes in manifests still refer
 to the original bytes; Git holds the formatted form. Tables removed upstream disappear from the
-next tree, and identical content reuses the existing commit. Commit messages keep
-`Sirius Master <region> <version>`.
+next tree, and identical content reuses the existing commit. The commit subject stays
+`Sirius Master <region> <version>`, followed since 1.3.0 by the
+[content trailer paragraph](#local-master-git-commits).
 
 If the pinned snapshot has no recorded asset version, `indented_root` publication fails with
 error code `asset_version_unavailable` before any Git command runs, leaving refs untouched. It
@@ -660,6 +676,7 @@ default. Configure any required agent/keyring for unattended operation before st
 Signers run inside the existing publication deadline and owned process group. Signing failures
 return a static error and do not advance the branch or alter installed Master data. The next
 retry can publish after the signer is repaired. No raw signer diagnostics are returned over HTTP.
+Signatures cover the full commit message, including the `Sirius-Content-SHA256` trailer.
 
 Identity/signing changes apply to newly created commits. Identical content still reuses the
 existing commit, including an older unsigned commit: enabling signing does not retroactively

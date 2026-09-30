@@ -192,6 +192,9 @@ pub fn reindent(input: &[u8]) -> Option<Vec<u8>> {
     out.push(b'\n');
     Some(out)
 }
+/// Trailer linking a new commit to its scoped content identity. Informational only: written
+/// on newly created commits and never read back by Sirius.
+const CONTENT_TRAILER: &str = "Sirius-Content-SHA256";
 /// Root `version.json` of the indented layout.
 pub fn version_document(data_version: &str, asset_version: &str) -> Vec<u8> {
     format!(
@@ -457,6 +460,10 @@ fn prepare(
     let document = master_registry::manifest(source, None, scope).map_err(|_| Error::Snapshot)?;
     let manifest: PublishedManifest =
         serde_json::from_slice(&document.bytes).map_err(|_| Error::Snapshot)?;
+    // The hash becomes a commit trailer; lowercase hex cannot inject lines into the message.
+    if !master_registry::hash_valid(&manifest.content_sha256) {
+        return Err(Error::Snapshot);
+    }
     // Fail before any Git command: an indented publication never carries a synthesized value.
     let asset_version = match options.layout {
         Layout::IndentedRoot => Some(
@@ -730,6 +737,9 @@ async fn commit_internal(
             prepared.manifest.version
         )
         .into(),
+        // A second `-m` is a separate paragraph, so the subject stays unchanged.
+        "-m".into(),
+        format!("{CONTENT_TRAILER}: {}", prepared.manifest.content_sha256).into(),
     ];
     if let Some(parent) = &parent {
         args.extend(["-p".into(), parent.into()]);
