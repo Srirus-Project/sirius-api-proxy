@@ -65,8 +65,9 @@ Keys are SHA-256 digests covering cache schema, region, environment, platform,
 upstream origin, client version, protocol fingerprint/generation, observed Master
 version, route, request JSON and account identity/credential digest/generation.
 No raw game credential is part of a Redis key or cached value. Two accounts with
-the same public query do not share entries. Different regions/protocols/upstreams
-cannot collide through a common URL or namespace.
+the same public query do not share entries; only the
+[quarantine fallback](#hits-before-admission) reads (never writes) another pool account's entry.
+Different regions/protocols/upstreams cannot collide through a common URL or namespace.
 
 Account/protocol reload changes generations before subsequent calls can access
 entries. Changed credentials and protocol fingerprints also change keys across
@@ -74,7 +75,39 @@ process restarts. Entries from previous scopes expire naturally without flushing
 an operator's shared database. A cache hit does not count as an upstream health
 success and cannot re-enable a quarantined account. Known maintenance bypasses hits. Hits
 are served while the region's [upstream path is open](REQUEST_POLICY.md#upstream-path-health):
-lookups come before path admission.
+lookups come before path admission, and since 1.3.0 also before regional admission (below).
+
+## Hits before admission
+
+Since 1.3.0 the lookup runs before regional admission (`upstream.max_inflight`), the protocol
+reload barrier, [shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads) and account
+leasing. A fresh entry, or a stale one inside the window, answers from there: the request takes
+no admission permit and never waits for one, is not counted in an account's `active_calls` and
+reports nothing to account or path health. The key is the one the call would use once admitted;
+an authenticated ranking uses the account that selection would lease at that moment, without
+leasing it. A miss continues through admission as before, where the same key is not read again
+(the fill-lock recheck still catches a concurrent fill); if selection then picks a different
+account, that account's key is read normally.
+
+The early lookup is skipped, and the request is answered after admission exactly as before,
+for named-account calls and background refreshes, during known maintenance, when the call must
+first bootstrap the Master version or the game has reported the header in use as stale, and for
+a peer query whose schema hash differs from the executor's (it still gets `identity_mismatch`).
+An age-only version refresh does not skip it: callers that do not wait for that refresh use the
+current key too. The lookup uses at most a quarter of the remaining deadline; one that does not
+finish in time is repeated after admission.
+
+When every account is cooling down or disabled and `stale_while_revalidate_ms` is above 0, the
+lookup reads the same public query under each pool account's scope, in rotation order, and
+answers with the first entry still retained, fresh or stale. This fallback never schedules a
+refresh and never re-enables an account. On Redis it uses pipelines of at most four bounded
+GETRANGE reads (never MGET, which has no per-value bound), each within `operation_timeout_ms`,
+and the whole probe stays within a quarter of the remaining deadline. With a window of 0, or once
+every entry is hard-expired, the region answers 503 `account_unavailable` (peers
+`unavailable_before_dispatch`) as in 1.2.x.
+
+Lookups before admission are bounded by these budgets rather than by `max_inflight`. The memory
+backend parses an entry outside its lock, so concurrent hits do not serialize on it.
 
 TTL accepts 1..300000 ms. Memory accepts 1..100000 entries, a 1 KiB..1 GiB total
 budget and a 256-byte..8 MiB entry cap no larger than the total. Redis entry caps
@@ -96,7 +129,7 @@ the cache; waiters check it again before executing. Waiting remains inside each
 request's original deadline. Failed fills do not populate the cache, and cancelling
 a winner releases its lock so another request can proceed. A fixed set of 64 lock
 stripes bounds coordination memory; digest collisions can serialize unrelated fills.
-Fresh hits do not wait for a fill lock. This is not a distributed Redis lease.
+Fresh hits do not wait for a fill lock or for admission. This is not a distributed Redis lease.
 
 Anonymous routes (announcement list/detail) are also coalesced before the cache is consulted,
 independently of it, so identical concurrent requests share one RPC even with `backend:
@@ -108,8 +141,8 @@ with concurrent misses.
 ## Stale-while-revalidate
 
 Both backends accept `stale_while_revalidate_ms`, default 0 (disabled), range 0..300000.
-Between freshness expiry and TTL plus this window, return the cached public response immediately
-and attempt one background refresh per key/process. Hard-expired entries are misses and wait for
+Between freshness expiry and TTL plus this window, return the cached public response immediately,
+before admission, and attempt one background refresh per key/process. Hard-expired entries are misses and wait for
 normal request processing. Route TTL 0 still bypasses caching entirely. Changing the window changes
 cache identity. Old records without a retention timestamp retain their original freshness expiry.
 
@@ -126,6 +159,8 @@ maintenance invalidate the scheduled work instead of refreshing another scope. R
 fields are stripped on stale reads as well as writes. No private/profile/deck caching is enabled.
 Successful refresh replaces the entry with a new TTL/window; failures leave its original hard
 expiry unchanged. Later stale requests may try again under normal account-health limits. A server
-outage can therefore be masked only within the explicitly configured window. Background work is
+outage can therefore be masked only within the explicitly configured window; the same window
+bounds how long retained entries answer while every account is quarantined
+([hits before admission](#hits-before-admission)). Background work is
 bounded by the normal request deadline and is disposable on process shutdown; it is not a durable
 job. Cache responses keep the existing JSON contract and do not add a freshness metadata field.

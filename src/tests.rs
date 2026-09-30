@@ -3990,6 +3990,18 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
         .await
         .unwrap();
     assert!(c.get("oversized").await.is_none());
+    // Probing several scopes skips the oversized value and spans more than one pipeline.
+    c.put("any-last".into(), &json!({"value":44})).await;
+    let keys = ["oversized", "any-1", "any-2", "any-3", "any-4", "any-last"].map(String::from);
+    let found = c.get_any_with_state(&keys).await.unwrap();
+    assert_eq!(found.value["value"], 44);
+    assert!(!found.stale);
+    let pair = ["oversized".to_string(), "any-last".to_string()];
+    assert_eq!(
+        c.get_any_with_state(&pair).await.unwrap().value["value"],
+        44
+    );
+    assert!(c.get_any_with_state(&keys[..5]).await.is_none());
     tokio::time::sleep(Duration::from_millis(120)).await;
     assert!(c.get("safe").await.is_none());
     assert_eq!(c.get("override").await.unwrap()["value"], 43);
@@ -4066,6 +4078,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     server.0.wait().unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         assert!(c.get("outage").await.is_none());
+        assert!(c.get_any_with_state(&keys).await.is_none());
         c.put("outage".into(), &json!({"value":1})).await;
     })
     .await
@@ -4177,6 +4190,365 @@ async fn concurrent_cache_misses_coalesce_and_cancelled_fill_releases_waiters() 
         );
         gate.add_permits(1);
     }
+}
+
+#[test]
+fn pool_peek_matches_select_without_rotating_or_counting() {
+    let mut pool = crate::accounts::Pool::load(&pool_config(), 1).unwrap();
+    let names = |accounts: Vec<Arc<crate::accounts::Account>>| {
+        accounts.iter().map(|a| a.name.clone()).collect::<Vec<_>>()
+    };
+    let active = |pool: &crate::accounts::Pool| {
+        serde_json::to_value(pool.status()).unwrap()[0]["active_calls"]
+            .as_u64()
+            .unwrap()
+    };
+    for _ in 0..2 {
+        assert_eq!(pool.peek_public().unwrap().name, "one");
+    }
+    assert_eq!(active(&pool), 0);
+    assert_eq!(names(pool.rotation()), ["one", "two"]);
+    let first = pool.select(None, false).unwrap();
+    assert_eq!(first.account.name, "one");
+    assert_eq!(active(&pool), 1);
+    // The next lease rotates to the idle account; peek agrees and still leases nothing.
+    assert_eq!(pool.peek_public().unwrap().name, "two");
+    assert_eq!(names(pool.rotation()), ["two", "one"]);
+    let second = pool.select(None, false).unwrap();
+    assert_eq!(second.account.name, "two");
+    drop(second);
+    // Fewest active calls wins over rotation order.
+    assert_eq!(pool.peek_public().unwrap().name, "two");
+    assert_eq!(pool.select(None, false).unwrap().account.name, "two");
+    drop(first);
+    pool.find("two")
+        .unwrap()
+        .cool_down(std::time::Instant::now() + Duration::from_secs(60));
+    assert_eq!(pool.peek_public().unwrap().name, "one");
+    pool.cool_down_all_for_test(Duration::from_secs(60));
+    assert!(pool.peek_public().is_none());
+    assert!(matches!(
+        pool.select(None, false),
+        Err(AppError::AccountUnavailable)
+    ));
+    // Retained entries do not depend on health: the rotation still lists every account.
+    assert_eq!(names(pool.rotation()).len(), 2);
+    let empty = crate::accounts::Pool::load(&config(), 1).unwrap();
+    assert!(empty.peek_public().is_none());
+    assert!(empty.rotation().is_empty());
+}
+
+#[tokio::test]
+async fn cache_hits_skip_admission_and_account_lease() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        announcements_reply(),
+        blocked,
+        ranking_reply(2),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    // The ranking bootstraps the Master version first, which anonymous keys include too.
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    let announcements = c
+        .call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+        .await
+        .unwrap();
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 4).await;
+    // The only permit is held: hits are answered without waiting for it.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert_eq!(
+            c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+                .await
+                .unwrap(),
+            announcements
+        );
+        let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+        assert_eq!(value["players"][0]["score"], 1);
+        assert!(value.get("myRank").is_none());
+    })
+    .await
+    .expect("cache hits must not wait for admission");
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        1
+    );
+    // A miss is still admitted and queues behind the held permit.
+    let a = c.clone();
+    let miss = tokio::spawn(async move { a.call(route, json!({"musicId":"2"})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!miss.is_finished());
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    assert_eq!(miss.await.unwrap().unwrap()["players"][0]["score"], 2);
+    assert_eq!(f.received.lock().unwrap().len(), 5);
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        0
+    );
+}
+
+fn stale_cache(ttl_ms: u64, stale_ms: u64) -> crate::response_cache::Config {
+    let mut cache = memory_cache(ttl_ms);
+    if let crate::response_cache::Config::Memory {
+        stale_while_revalidate_ms,
+        ..
+    } = &mut cache
+    {
+        *stale_while_revalidate_ms = stale_ms;
+    }
+    cache
+}
+#[tokio::test]
+async fn quarantined_accounts_serve_retained_entries_only_within_stale_window() {
+    let f = fixture(vec![
+        Reply::version(),
+        empty_profile_reply(),
+        ranking_reply(1),
+    ])
+    .await;
+    let mut cfg = pool_config();
+    cfg.response_cache = stale_cache(50, 400);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    // The first account serves the profile, so the second one fills the ranking entry.
+    profile_call(&c).await.unwrap();
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    c.cool_down_accounts_for_test(Duration::from_secs(60));
+    let before = c.account_status().unwrap()["accounts"].clone();
+    let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert_eq!(value["players"][0]["score"], 1);
+    assert!(value.get("myRank").is_none());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Stale inside the window: still answered, without a refresh.
+    let sha = c.peer_identity().unwrap().protocol_sha256;
+    assert_eq!(
+        c.call_peer(route, json!({"musicId":"1"}), &sha)
+            .await
+            .unwrap()["players"][0]["score"],
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    // A hit never re-enables or charges an account.
+    assert_eq!(c.account_status().unwrap()["accounts"], before);
+    assert!(matches!(
+        c.call(route, json!({"musicId":"2"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    assert!(matches!(
+        c.call_peer(route, json!({"musicId":"1"}), &sha).await,
+        Err(AppError::PeerAccountUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+
+    // Without a stale window a fresh entry does not outlive the quarantine.
+    let f = fixture(vec![Reply::version(), ranking_reply(1)]).await;
+    let mut cfg = single_account_config();
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    c.cool_down_accounts_for_test(Duration::from_secs(60));
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn maintenance_bypasses_pre_admission_hits() {
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        maintenance_reply("14"),
+        maintenance_reply("2"),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.response_cache = stale_cache(60_000, 60_000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert!(matches!(
+        profile_call(&c).await,
+        Err(AppError::Maintenance(14))
+    ));
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::Maintenance(2))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn peer_cache_hit_requires_matching_schema() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![Reply::version(), ranking_reply(1), blocked]).await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    let sha = c.peer_identity().unwrap().protocol_sha256;
+    c.call_peer(route, json!({"musicId":"1"}), &sha)
+        .await
+        .unwrap();
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 3).await;
+    let value = tokio::time::timeout(
+        Duration::from_secs(1),
+        c.call_peer(route, json!({"musicId":"1"}), &sha),
+    )
+    .await
+    .expect("a matching schema is answered before admission")
+    .unwrap();
+    assert_eq!(value["players"][0]["score"], 1);
+    assert!(value.get("myRank").is_none());
+    // Another schema never reads the entry: it is admitted and refused there.
+    let a = c.clone();
+    let mismatch = tokio::spawn(async move {
+        a.call_peer(route, json!({"musicId":"1"}), &"0".repeat(64))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!mismatch.is_finished());
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    assert!(matches!(
+        mismatch.await.unwrap(),
+        Err(AppError::PeerIdentityMismatch)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn stale_hit_before_admission_spawns_one_pinned_refresh() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        blocked,
+        ranking_reply(2),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = stale_cache(100, 5000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 3).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..12 {
+            let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+            assert_eq!(value["players"][0]["score"], 1);
+            assert!(value.get("myRank").is_none());
+        }
+    })
+    .await
+    .expect("stale callers must not wait for admission");
+    // The single background refresh is admitted like any call: it waits for the permit.
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+            if value["players"][0]["score"] == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn get_any_with_state_returns_first_retained_entry_in_order() {
+    use crate::response_cache::{Cache, Config, Route};
+    let cache = Cache::new(Config::Memory {
+        stale_while_revalidate_ms: 200,
+        route_ttl_ms: BTreeMap::from([(Route::Announcement, 20)]),
+        ttl_ms: 5000,
+        max_entries: 10,
+        max_bytes: 8192,
+        max_entry_bytes: 4096,
+    })
+    .unwrap();
+    let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    cache
+        .put_route(ANNOUNCEMENT, "expired".into(), &json!({"value":1}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    cache
+        .put_route(ANNOUNCEMENT, "stale".into(), &json!({"value":2}))
+        .await;
+    cache.put("fresh".into(), &json!({"value":3})).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let first = cache
+        .get_any_with_state(&keys(&["missing", "expired", "stale", "fresh"]))
+        .await
+        .unwrap();
+    assert!(first.stale);
+    assert_eq!(first.value["value"], 2);
+    let first = cache
+        .get_any_with_state(&keys(&["missing", "expired", "fresh", "stale"]))
+        .await
+        .unwrap();
+    assert!(!first.stale);
+    assert_eq!(first.value["value"], 3);
+    assert!(cache
+        .get_any_with_state(&keys(&["missing", "expired"]))
+        .await
+        .is_none());
+    assert!(cache.get_any_with_state(&[]).await.is_none());
+    // The hard-expired entry was dropped; the key fills again normally.
+    assert!(cache.get_with_state("expired").await.is_none());
+    cache
+        .put_route(ANNOUNCEMENT, "expired".into(), &json!({"value":4}))
+        .await;
+    assert_eq!(cache.get("expired").await.unwrap()["value"], 4);
 }
 
 #[test]

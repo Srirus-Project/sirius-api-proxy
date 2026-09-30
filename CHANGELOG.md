@@ -39,6 +39,15 @@
   anonymous reads. Both codes are in the JP 1.0.3 and Global 1.0.1 clients; their gRPC status and
   whether the game enforces a fresh version are unverified, and the design depends on neither.
   API and peer wire format are unchanged.
+- Response-cache hits (fresh, or stale inside `stale_while_revalidate_ms`) no longer queue behind
+  `upstream.max_inflight`, the protocol reload barrier or account selection: they take no permit,
+  do not count in `active_calls` and never touch account or path health. Misses, maintenance,
+  calls that must bootstrap the Master version and peer queries with another schema hash are
+  admitted as before.
+- With every account cooling or disabled, a region with a stale window now answers a query from
+  an entry still retained for any pool account instead of 503 `account_unavailable` (peers:
+  instead of `unavailable_before_dispatch`), without refreshing it. With a window of 0 nothing
+  changes. No configuration or wire change.
 
 ## 1.2.4
 

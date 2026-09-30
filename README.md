@@ -81,6 +81,8 @@ Calls without an account are not serialized by `session_lock`: up to
 `upstream.anonymous_max_inflight` (default 4; 1 restores the 1.2.x behavior) run at once, and
 identical concurrent anonymous reads share one upstream RPC, errors included
 ([shared in-flight reads](docs/REQUEST_POLICY.md#shared-in-flight-reads)).
+Response-cache hits are answered before any of this queueing and lease no account
+([hits before admission](docs/RESPONSE_CACHE.md#hits-before-admission)).
 A pooled game connection that stops answering is detected by HTTP/2 PING and fails its calls as
 `upstream_transport` well before the deadline
 ([connection liveness](docs/REQUEST_POLICY.md#connection-liveness)).

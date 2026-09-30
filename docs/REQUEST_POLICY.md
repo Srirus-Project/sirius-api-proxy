@@ -28,7 +28,9 @@ to accumulated HTTP DATA bytes, including the five-byte gRPC frame header, befor
 protobuf decoding. Oversized or malformed data is rejected without retry.
 
 `max_inflight` limits admitted logical calls, including those waiting for their session
-lock. Additional requests wait within their own deadline. Per-account serialization
+lock. Additional requests wait within their own deadline. Since 1.3.0 response-cache hits are
+answered before admission and neither take nor wait for a permit (see
+[hits before admission](RESPONSE_CACHE.md#hits-before-admission)); misses are admitted as before. Per-account serialization
 still applies when `session_lock` is true; increasing regional concurrency does not
 implicitly enable concurrent use of one game session. Each region owns its semaphore.
 

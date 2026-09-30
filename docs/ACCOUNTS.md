@@ -57,6 +57,12 @@ gRPC status: they describe the proxy's version headers, not the account (see
 other code, or none, still disables the account. Exhaustion returns 503. The failed logical request is never automatically
 replayed with another account; a later request can select another healthy account.
 
+Response-cache hits lease no account: since 1.3.0 they are answered before account selection, are
+never counted in `active_calls` and never touch health, so a hit cannot re-enable a cooling
+account. With every account cooling or disabled, a retained entry may still answer inside a
+configured `stale_while_revalidate_ms` window (see
+[hits before admission](RESPONSE_CACHE.md#hits-before-admission)).
+
 Path-class faults (transport and protocol failures, deadlines, and gRPC 14 without an
 application code) may belong to the shared upstream path rather than to the account, so each
 region tracks them separately (see

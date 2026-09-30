@@ -98,6 +98,24 @@ const CLIENT_UPDATE_REQUIRED: &str = "CLIENT_UPDATE_REQUIRED";
 pub(crate) fn version_signal(code: Option<&str>) -> bool {
     matches!(code, Some(MASTER_VERSION_MISMATCH | CLIENT_UPDATE_REQUIRED))
 }
+/// Outcome of the response-cache lookup that runs before admission.
+enum Precheck {
+    /// A fresh or in-window stale entry answers the call.
+    Hit(Value),
+    /// Nothing is retained under this key; the admitted call need not look it up again.
+    Miss(String),
+    /// The lookup did not apply or did not finish; the admitted call looks itself.
+    Skipped,
+}
+/// Account-relative ranking fields never leave shared response storage or shared executions.
+fn strip_account_fields(route: &str, value: &mut Value) {
+    if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("myRank");
+            object.remove("myScore");
+        }
+    }
+}
 /// What a call needs before its RPC can carry usable version headers.
 #[derive(Clone, Copy, PartialEq)]
 enum VersionNeed {
@@ -563,6 +581,13 @@ impl GameClient {
         let stale = s.snapshot_stale || (Utc::now() - snapshot.observed_at).num_seconds() > 300;
         Ok(json!({"snapshot":snapshot,"stale":stale}))
     }
+    #[cfg(test)]
+    pub(crate) fn cool_down_accounts_for_test(&self, duration: Duration) {
+        self.accounts
+            .lock()
+            .unwrap()
+            .cool_down_all_for_test(duration);
+    }
     pub fn account_status(&self) -> Result<Value, AppError> {
         let mut status = {
             let pool = self
@@ -775,6 +800,19 @@ impl GameClient {
                 return Err(AppError::UnsupportedRegionOperation);
             }
             let deadline = tokio::time::Instant::now() + self.timeout;
+            // Response-cache hits are answered first, so they never wait for or hold a shared
+            // execution, admission, the protocol barrier or an account lease.
+            let mut checked = None;
+            if name.is_none() && refresh_key.is_none() && !identity_only {
+                match self
+                    .cached_before_admission(route, &input, expected_protocol, deadline)
+                    .await
+                {
+                    Precheck::Hit(value) => return Ok(value),
+                    Precheck::Miss(key) => checked = Some(key),
+                    Precheck::Skipped => {}
+                }
+            }
             // Identical public reads share one execution, before admission, the protocol barrier
             // and account selection, so a joined caller holds none of them. Named-account and
             // cache-refresh calls always run on their own.
@@ -784,24 +822,35 @@ impl GameClient {
                     .flights
                     .run(key, deadline, Err(AppError::Timeout), || async move {
                         let mut result = self
-                            .call_admitted(route, input, None, None, expected_protocol, deadline)
+                            .call_admitted(
+                                route,
+                                input,
+                                None,
+                                None,
+                                expected_protocol,
+                                checked,
+                                deadline,
+                            )
                             .await;
                         // A shared outcome never carries account-relative ranking fields.
-                        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-                            if let Some(object) =
-                                result.as_mut().ok().and_then(Value::as_object_mut)
-                            {
-                                object.remove("myRank");
-                                object.remove("myScore");
-                            }
+                        if let Ok(value) = &mut result {
+                            strip_account_fields(route, value);
                         }
                         result.map(Arc::new)
                     })
                     .await
                     .map(|value| Value::clone(&value));
             }
-            self.call_admitted(route, input, name, refresh_key, expected_protocol, deadline)
-                .await
+            self.call_admitted(
+                route,
+                input,
+                name,
+                refresh_key,
+                expected_protocol,
+                checked,
+                deadline,
+            )
+            .await
         })
     }
     /// Public reads that share one execution among identical concurrent callers. Rankings spend
@@ -843,8 +892,137 @@ impl GameClient {
         self.flight_key(route, &json!({}), expected_protocol)
             .unwrap()
     }
+    /// Response-cache lookup before admission, the protocol barrier and account leasing. The key
+    /// is the one the admitted call would use with the account `select` would lease now, so a
+    /// hit never counts as an active call or reports account health. Calls that need a version
+    /// first, during known maintenance or with a mismatched peer schema skip it and take the
+    /// admitted path, which answers them as before. With every account cooling or disabled, an
+    /// entry retained for any pool account may answer inside the stale window, never refreshed.
+    async fn cached_before_admission(
+        self: &Arc<Self>,
+        route: &str,
+        input: &Value,
+        expected_protocol: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Precheck {
+        if self.response_cache.ttl(route).is_none() {
+            return Precheck::Skipped;
+        }
+        let lookup = async {
+            // No protocol barrier: keys embed the protocol and account generations, so a snapshot
+            // taken during a reload only yields a key no writer produced.
+            let Ok(protocol) = self.protocol.read().map(|p| p.clone()) else {
+                return Precheck::Skipped;
+            };
+            if expected_protocol.is_some_and(|expected| protocol.status.sha256 != expected) {
+                return Precheck::Skipped;
+            }
+            // An age-only refresh keeps the current key, as for callers that do not wait for it.
+            if !matches!(
+                self.version_need(route).await,
+                VersionNeed::Fresh | VersionNeed::Refresh { wait: false }
+            ) {
+                return Precheck::Skipped;
+            }
+            let (account, quarantined) = if authenticated(route) {
+                let Ok(pool) = self.accounts.lock() else {
+                    return Precheck::Skipped;
+                };
+                match pool.peek_public() {
+                    Some(account) => (Some(account), None),
+                    None => (None, Some(pool.rotation())),
+                }
+            } else {
+                (None, None)
+            };
+            if let Some(rotation) = quarantined {
+                return self
+                    .retained_while_quarantined(&protocol, route, input, &rotation, deadline)
+                    .await;
+            }
+            let Ok(Some(key)) = self
+                .response_cache_key(&protocol, route, input, account.as_deref())
+                .await
+            else {
+                return Precheck::Skipped;
+            };
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+            match tokio::time::timeout(budget, self.response_cache.get_with_state(&key)).await {
+                Err(_) => Precheck::Skipped,
+                Ok(None) => Precheck::Miss(key),
+                Ok(Some(mut cached)) => {
+                    if cached.stale {
+                        self.spawn_refresh(&key, route, input, account.map(|a| a.name.clone()));
+                    }
+                    strip_account_fields(route, &mut cached.value);
+                    Precheck::Hit(cached.value)
+                }
+            }
+        };
+        tokio::time::timeout_at(deadline, lookup)
+            .await
+            .unwrap_or(Precheck::Skipped)
+    }
+    /// With no account available, the first entry still retained for the same public query
+    /// under any pool account's scope, in rotation order; only inside a configured stale window.
+    /// Such a hit neither refreshes nor re-enables an account.
+    async fn retained_while_quarantined(
+        &self,
+        protocol: &ProtocolBundle,
+        route: &str,
+        input: &Value,
+        rotation: &[Arc<crate::accounts::Account>],
+        deadline: tokio::time::Instant,
+    ) -> Precheck {
+        if self.response_cache.stale_window() == 0 {
+            return Precheck::Skipped;
+        }
+        let mut keys = Vec::with_capacity(rotation.len());
+        for account in rotation {
+            let Ok(Some(key)) = self
+                .response_cache_key(protocol, route, input, Some(account))
+                .await
+            else {
+                return Precheck::Skipped;
+            };
+            keys.push(key);
+        }
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
+        match tokio::time::timeout(budget, self.response_cache.get_any_with_state(&keys)).await {
+            Ok(Some(mut cached)) => {
+                strip_account_fields(route, &mut cached.value);
+                Precheck::Hit(cached.value)
+            }
+            _ => Precheck::Skipped,
+        }
+    }
+    /// Refreshes a stale entry in the background, at most once per key at a time, pinned to the
+    /// account whose scope keyed it. The refresh is an ordinary admitted call.
+    fn spawn_refresh(
+        self: &Arc<Self>,
+        key: &str,
+        route: &str,
+        input: &Value,
+        account_name: Option<String>,
+    ) {
+        let Some(guard) = self.response_cache.try_refresh_guard(key) else {
+            return;
+        };
+        let client = self.clone();
+        let key = key.to_owned();
+        let route = route.to_owned();
+        let input = input.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let _ = client
+                .call_selected(&route, input, account_name.as_deref(), Some(key), None)
+                .await;
+        });
+    }
     /// One admitted logical call: inflight permit, protocol barrier, account or anonymous slot,
-    /// response cache, the upstream RPC and the resulting state.
+    /// response cache, the upstream RPC and the resulting state. `checked` is a key the
+    /// pre-admission lookup already found empty.
+    #[allow(clippy::too_many_arguments)]
     async fn call_admitted(
         self: &Arc<Self>,
         route: &str,
@@ -852,6 +1030,7 @@ impl GameClient {
         name: Option<&str>,
         refresh_key: Option<String>,
         expected_protocol: Option<&str>,
+        checked: Option<String>,
         deadline: tokio::time::Instant,
     ) -> Result<Value, AppError> {
         let global = self.config.region.family() == "global";
@@ -912,29 +1091,21 @@ impl GameClient {
                 {
                     return Err(AppError::ProtocolDefinition);
                 }
-                if let Some(key) = &cache_key {
+                // A key the pre-admission lookup found empty is not read again: a concurrent
+                // fill is caught by the fill-guard recheck (one already stale is fetched anew).
+                if let Some(key) = cache_key
+                    .as_ref()
+                    .filter(|key| checked.as_ref() != Some(*key))
+                {
                     if refresh_key.is_none() {
                         if let Some(cached) = self.read_cached_state(key, route, deadline).await {
                             if cached.stale {
-                                if let Some(guard) = self.response_cache.try_refresh_guard(key) {
-                                    let client = self.clone();
-                                    let key = key.clone();
-                                    let route = route.to_owned();
-                                    let input = input.clone();
-                                    let account_name = account.map(|a| a.name.clone());
-                                    tokio::spawn(async move {
-                                        let _guard = guard;
-                                        let _ = client
-                                            .call_selected(
-                                                &route,
-                                                input,
-                                                account_name.as_deref(),
-                                                Some(key),
-                                                None,
-                                            )
-                                            .await;
-                                    });
-                                }
+                                self.spawn_refresh(
+                                    key,
+                                    route,
+                                    &input,
+                                    account.map(|a| a.name.clone()),
+                                );
                             }
                             return Ok(cached.value);
                         }
@@ -1041,12 +1212,7 @@ impl GameClient {
                 let mut value = response?;
                 if let Some(key) = cache_key {
                     // Account-relative ranking fields must never enter shared response storage.
-                    if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-                        if let Some(object) = value.as_object_mut() {
-                            object.remove("myRank");
-                            object.remove("myScore");
-                        }
-                    }
+                    strip_account_fields(route, &mut value);
                     let budget =
                         deadline.saturating_duration_since(tokio::time::Instant::now()) / 4;
                     let _ = tokio::time::timeout(
@@ -1387,12 +1553,7 @@ impl GameClient {
         let mut value = tokio::time::timeout(budget, self.response_cache.get(key))
             .await
             .ok()??;
-        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-            if let Some(object) = value.as_object_mut() {
-                object.remove("myRank");
-                object.remove("myScore");
-            }
-        }
+        strip_account_fields(route, &mut value);
         Some(value)
     }
     async fn read_cached_state(
@@ -1405,12 +1566,7 @@ impl GameClient {
         let mut cached = tokio::time::timeout(budget, self.response_cache.get_with_state(key))
             .await
             .ok()??;
-        if matches!(route, MUSIC_RANKING | CHALLENGE_RANKING) {
-            if let Some(object) = cached.value.as_object_mut() {
-                object.remove("myRank");
-                object.remove("myScore");
-            }
-        }
+        strip_account_fields(route, &mut cached.value);
         Some(cached)
     }
     async fn response_cache_key(

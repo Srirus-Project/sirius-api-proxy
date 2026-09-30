@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -114,9 +114,10 @@ struct Entry {
     retain_ms: u64,
     value: Value,
 }
+/// Entries are shared handles, so a read parses outside the region-wide lock.
 #[derive(Default)]
 struct Memory {
-    entries: BTreeMap<String, Vec<u8>>,
+    entries: BTreeMap<String, Arc<[u8]>>,
     bytes: usize,
 }
 pub struct Cached {
@@ -129,6 +130,20 @@ pub struct Cache {
     refreshes: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
     memory: Mutex<Memory>,
     redis: Option<redis::aio::ConnectionManager>,
+}
+/// Keys per pipelined Redis read in [`Cache::get_any_with_state`].
+const ANY_CHUNK: usize = 4;
+/// A stored entry that is still retained; `limit` rejects values longer than the read bound.
+fn decode(bytes: &[u8], limit: Option<usize>) -> Option<Cached> {
+    if limit.is_some_and(|limit| bytes.len() > limit) {
+        return None;
+    }
+    let entry: Entry = serde_json::from_slice(bytes).ok()?;
+    let now = now_ms();
+    (entry.retain_ms.max(entry.expires_ms) > now).then_some(Cached {
+        stale: entry.expires_ms <= now,
+        value: entry.value,
+    })
 }
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -248,21 +263,24 @@ impl Cache {
             .map(|entry| entry.value)
     }
     pub async fn get_with_state(&self, key: &str) -> Option<Cached> {
-        let bytes = match &self.config {
-            Config::Disabled => return None,
+        match &self.config {
+            Config::Disabled => None,
             Config::Memory { .. } => {
-                let mut memory = self.memory.lock().ok()?;
-                let bytes = memory.entries.get(key)?.clone();
-                let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-                if entry.retain_ms.max(entry.expires_ms) <= now_ms() {
-                    memory.entries.remove(key);
-                    memory.bytes -= bytes.len();
-                    return None;
+                let bytes = self.memory.lock().ok()?.entries.get(key)?.clone();
+                let cached = decode(&bytes, None);
+                if cached.is_none() {
+                    // Hard-expired: drop it unless a newer fill has replaced it meanwhile.
+                    let mut memory = self.memory.lock().ok()?;
+                    if memory
+                        .entries
+                        .get(key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &bytes))
+                    {
+                        memory.entries.remove(key);
+                        memory.bytes -= bytes.len();
+                    }
                 }
-                return Some(Cached {
-                    stale: entry.expires_ms <= now_ms(),
-                    value: entry.value,
-                });
+                cached
             }
             Config::Redis {
                 namespace,
@@ -283,17 +301,54 @@ impl Cache {
                 .await
                 .ok()?
                 .ok()?;
-                if bytes.len() > *max_entry_bytes {
-                    return None;
-                }
-                bytes
+                decode(&bytes, Some(*max_entry_bytes))
             }
+        }
+    }
+    /// The first retained entry (fresh or stale) among `keys`, in order. Redis reads use
+    /// pipelines of at most [`ANY_CHUNK`] bounded GETRANGEs (never MGET, which has no per-value
+    /// bound), each under the operation timeout, and stop at the first chunk with an entry.
+    pub async fn get_any_with_state(&self, keys: &[String]) -> Option<Cached> {
+        let Config::Redis {
+            namespace,
+            max_entry_bytes,
+            operation_timeout_ms,
+            ..
+        } = &self.config
+        else {
+            for key in keys {
+                if let Some(cached) = self.get_with_state(key).await {
+                    return Some(cached);
+                }
+            }
+            return None;
         };
-        let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-        (entry.retain_ms.max(entry.expires_ms) > now_ms()).then_some(Cached {
-            stale: entry.expires_ms <= now_ms(),
-            value: entry.value,
-        })
+        let connection = self.redis.as_ref()?;
+        for chunk in keys.chunks(ANY_CHUNK) {
+            let mut pipe = redis::pipe();
+            for key in chunk {
+                pipe.cmd("GETRANGE")
+                    .arg(format!("{namespace}:{key}"))
+                    .arg(0)
+                    .arg(*max_entry_bytes);
+            }
+            let mut connection = connection.clone();
+            let Ok(Ok(values)) = tokio::time::timeout(
+                Duration::from_millis(*operation_timeout_ms),
+                pipe.query_async::<Vec<Vec<u8>>>(&mut connection),
+            )
+            .await
+            else {
+                return None;
+            };
+            if let Some(cached) = values
+                .iter()
+                .find_map(|bytes| decode(bytes, Some(*max_entry_bytes)))
+            {
+                return Some(cached);
+            }
+        }
+        None
     }
     pub async fn put(&self, key: String, value: &Value) {
         self.put_with_ttl(key, value, None).await;
@@ -345,7 +400,7 @@ impl Cache {
                     memory.bytes -= removed.len();
                 }
                 memory.bytes += bytes.len();
-                memory.entries.insert(key, bytes);
+                memory.entries.insert(key, bytes.into());
             }
             Config::Redis {
                 namespace,

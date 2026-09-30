@@ -403,6 +403,19 @@ These generic capabilities are intentionally not restored in their original form
    refresh keeps the previous header for 30 s instead of failing the call; detection keys on the
    application code, found statically in the JP 1.0.3 and Global 1.0.1 clients, because the gRPC
    status that comes with it and whether the game enforces freshness at all are unverified.
+15. **Response-cache hits are answered before admission, with per-account keys kept.** The
+   original reads its cache first and returns a hit before coalescing or any upstream work
+   (`Haruki-Sekai-API@9a53714:src/api/apis.rs:203-221`). Before 1.3.0 Sirius looked up the cache
+   only after the regional admission permit, the protocol barrier, account selection and the
+   Version bootstrap, so during an outage a hit queued behind stuck permits and, with every
+   account quarantined, even an in-window stale entry answered 503. Since 1.3.0
+   `GameClient::cached_before_admission` (`src/client.rs`) runs first, keyed exactly as the
+   admitted call would be, with the account that `Pool::peek_public` reports without leasing it
+   (`src/accounts.rs`). Differences: keys stay per account; named-account calls, refreshes, known
+   maintenance, a needed Version bootstrap or a reported stale header, and a mismatched peer
+   schema skip the early hit; the quarantine fallback reads other accounts' retained entries only
+   with an explicit stale window, through bounded GETRANGE pipelines of at most four keys (not
+   MGET), and never refreshes or reports health. No configuration is added.
 
 ## Original fields that were ignored by the original itself
 
@@ -521,3 +534,4 @@ classification and evidence:
 - **Version header freshness:** new [Decision 14](#decisions); Decision 9 notes that
   `CLIENT_UPDATE_REQUIRED` no longer penalizes accounts. `upstream.version_max_age_seconds` is
   added to the reverse check, whose `upstream` line references are updated.
+- **Cache hits before admission:** new [Decision 15](#decisions). No field is added or changed.

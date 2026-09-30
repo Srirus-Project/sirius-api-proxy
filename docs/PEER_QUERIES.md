@@ -60,7 +60,12 @@ mutation field. Unknown fields/operations fail validation. Request bodies are li
 Each accepted query executes on this node's local GameClient, under its normal admission,
 timeout, account serialization and response-cache policies. It never invokes another node.
 The schema hash is rechecked after acquiring admission and the protocol read barrier, preventing
-a reload from changing a queued request's contract before execution. Identical concurrent
+a reload from changing a queued request's contract before execution. Since 1.3.0 a query whose
+schema hash equals the executor's current one may be answered from the executor's response cache
+before admission ([hits before admission](RESPONSE_CACHE.md#hits-before-admission)), including a
+retained entry inside the stale window while every local account is quarantined, where it would
+otherwise get `unavailable_before_dispatch`. A different hash never reads the cache and still gets
+`identity_mismatch`. Identical concurrent
 queries with the same identity share one local execution like local public reads
 ([shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)); each still receives its own
 reply with its own `request_id`, and the wire format is unchanged.

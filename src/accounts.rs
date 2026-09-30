@@ -544,6 +544,31 @@ impl Pool {
     pub(crate) fn find(&self, name: &str) -> Option<Arc<Account>> {
         self.entries.iter().find(|a| a.name == name).cloned()
     }
+    /// The available account a public call would lease next: rotation from `next`, fewest
+    /// active calls first.
+    fn public_index(&self) -> Option<usize> {
+        (0..self.entries.len())
+            .map(|offset| (self.next + offset) % self.entries.len())
+            .filter(|&i| self.entries[i].available())
+            .min_by_key(|&i| self.entries[i].active.load(Ordering::Relaxed))
+    }
+    /// The account `select(None, false)` would lease right now, without leasing it: neither
+    /// the rotation nor the active count moves.
+    pub(crate) fn peek_public(&self) -> Option<Arc<Account>> {
+        self.public_index().map(|i| self.entries[i].clone())
+    }
+    /// Every account in rotation order, whatever its health.
+    pub(crate) fn rotation(&self) -> Vec<Arc<Account>> {
+        (0..self.entries.len())
+            .map(|offset| self.entries[(self.next + offset) % self.entries.len()].clone())
+            .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn cool_down_all_for_test(&self, duration: Duration) {
+        for account in &self.entries {
+            account.cool_down(Instant::now() + duration);
+        }
+    }
     pub fn select(&mut self, name: Option<&str>, private: bool) -> Result<Lease, AppError> {
         let index = if let Some(name) = name {
             self.entries
@@ -553,11 +578,7 @@ impl Pool {
         } else if private {
             0
         } else {
-            (0..self.entries.len())
-                .map(|offset| (self.next + offset) % self.entries.len())
-                .filter(|&i| self.entries[i].available())
-                .min_by_key(|&i| self.entries[i].active.load(Ordering::Relaxed))
-                .ok_or(AppError::AccountUnavailable)?
+            self.public_index().ok_or(AppError::AccountUnavailable)?
         };
         let account = self
             .entries

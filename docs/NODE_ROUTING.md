@@ -89,7 +89,9 @@ background workers. Master table HTTP reads remain local snapshot reads.
 
 `/system` returns the selected executor's observation. Remote observations never update the local
 resource snapshot, account pool or CDN credentials. Each executor owns its local response cache;
-there is no new shared cross-node cache. Ranking account-relative fields remain stripped at the
+there is no new shared cross-node cache. The router's own admission (`max_inflight`) still applies
+to every routed query; a response-cache hit skips only the executor GameClient's admission
+([hits before admission](RESPONSE_CACHE.md#hits-before-admission)). Ranking account-relative fields remain stripped at the
 public boundary. Schema reload changes the identity used for subsequent peer requests; an old
 identity queued at the executor is rejected before dispatch.
 
