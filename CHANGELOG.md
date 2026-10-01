@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.2
+
+- JP protocol 1.0.4 is the default (`protocol/sirius/1.0.4`, native codecs). It is the same
+  ten-RPC subset as 1.0.3, extracted from the official 1.0.4 client, and only adds definitions:
+  `Announcement.platform` (`AnnouncementPlatform`), the costume fields of `PlayerData` and
+  `Notification` (new `entity/character_costume.proto`) and
+  `ResourceType.RESOURCE_TYPE_CHARACTER_UNLOCKED_COSTUME`. Before, a 1.3.1 service dropped these
+  fields. The JP examples use `client_version: 1.0.4`, which the JP server now requires.
+  `protocol/sirius/1.0.3` stays for a restart-based rollback; a running service on 1.0.4 cannot
+  hot-reload back to 1.0.3 (that would remove fields).
+- The reduced test baseline `tests/fixtures/proxy-descriptors.pb` is regenerated for 1.0.4 from
+  the client's embedded descriptors with the same reduction that reproduces the 1.0.3 baseline
+  byte for byte.
+- JP resource snapshots now report `protocol_version` and `client_version` 1.0.4. A JP asset
+  updater profile must set both to 1.0.4 (the updater's JP default is still 1.0.3).
+- Live-verified with a JP 1.0.4 guest account (2026-10-01): Whoami, own player data, profile,
+  event/song/challenge rankings, and the JP `PLAYER_NOT_FOUND` → 404 mapping from 1.3.0.
+
 ## 1.3.1
 
 - Global accounts: an `SDK_REFUSED` login now reports the SDK's numeric refusal code as

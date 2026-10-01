@@ -1,0 +1,15 @@
+syntax = "proto3";
+package entity;
+message Stamp {
+  int64 id = 1;
+  repeated .entity.FavoriteIndex favorites = 2;
+  optional int64 got_at = 3;
+}
+message FavoriteIndex {
+  int32 favorite_id = 1;
+  int32 slot_index = 2;
+}
+message StampFavoriteName {
+  int32 favorite_id = 1;
+  string name = 2;
+}

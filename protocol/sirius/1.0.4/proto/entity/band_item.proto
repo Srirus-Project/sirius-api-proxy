@@ -1,0 +1,6 @@
+syntax = "proto3";
+package entity;
+message BandItem {
+  int64 master_id = 1;
+  int32 level = 2;
+}

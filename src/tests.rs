@@ -1295,7 +1295,11 @@ fn copy_protocol_bundle() -> tempfile::TempDir {
         &crate::config::default_protocol_directory().join("proto"),
         &temp.path().join("proto"),
     );
-    std::fs::write(temp.path().join("bundle.json"), r#"{"version":"1.0.3"}"#).unwrap();
+    std::fs::copy(
+        crate::config::default_protocol_directory().join("bundle.json"),
+        temp.path().join("bundle.json"),
+    )
+    .unwrap();
     temp
 }
 fn edit_version_proto(bundle: &std::path::Path, old: &str, new: &str) {
@@ -1311,7 +1315,7 @@ fn proto_sources_compile_against_independent_proxy_descriptor_baseline() {
         crate::protocol::ProtocolBundle::load(&crate::config::default_protocol_directory())
             .unwrap();
     let original = pool();
-    assert_eq!(loaded.pool.files().len(), 46);
+    assert_eq!(loaded.pool.files().len(), 47);
     assert_eq!(loaded.pool.services().len(), 6);
     assert_eq!(
         loaded.pool.all_messages().len(),
@@ -1605,6 +1609,39 @@ fn native_codecs_match_independent_wire_and_dynamic_json_for_all_exposed_routes(
     }
 }
 
+#[test]
+fn jp_1_0_4_fields_decode_natively_and_dynamically() {
+    let loaded =
+        crate::protocol::ProtocolBundle::load(&crate::config::default_protocol_directory())
+            .unwrap();
+    assert_eq!(loaded.status.version, "1.0.4");
+    assert_eq!(loaded.status.codec, "native");
+    let cases = [
+        (
+            crate::client::ANNOUNCEMENT,
+            "app.announcement.GetResponse",
+            json!({"announcement":{"title":"t","platform":"ANNOUNCEMENT_PLATFORM_ANDROID"}}),
+            "/announcement/platform",
+            json!("ANNOUNCEMENT_PLATFORM_ANDROID"),
+        ),
+        (
+            crate::client::PLAYER_DATA,
+            "app.player.GetPlayerDataResponse",
+            json!({"playerData":{"characterCurrentCostumes":[{"characterId":"7","costumeTarget":2,"costumeGroupId":"9"}],
+                "characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]},
+                "notification":{"characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]}}),
+            "/playerData/characterCurrentCostumes/0/costumeGroupId",
+            json!("9"),
+        ),
+    ];
+    for (route, name, value, pointer, expected) in cases {
+        let bytes = message(name, value);
+        let dynamic = loaded.decode(route, &bytes).unwrap();
+        assert_eq!(dynamic.pointer(pointer), Some(&expected), "{route}");
+        let native = crate::native::decode("jp", route, &bytes).unwrap().unwrap();
+        assert_eq!(native, dynamic, "{route}");
+    }
+}
 #[test]
 fn native_selection_uses_content_not_path_and_dynamic_startup_supports_new_fields() {
     let directory = copy_protocol_bundle();

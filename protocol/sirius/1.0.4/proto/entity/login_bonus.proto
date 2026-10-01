@@ -1,0 +1,8 @@
+syntax = "proto3";
+package entity;
+message LoginBonusSheet {
+  int64 login_bonus_id = 1;
+  int64 sheet_no = 2;
+  int64 slot_no = 3;
+  int32 login_days = 4;
+}

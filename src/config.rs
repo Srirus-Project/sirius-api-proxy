@@ -198,7 +198,7 @@ fn default_session_lock() -> bool {
 }
 
 pub fn default_protocol_directory() -> std::path::PathBuf {
-    "protocol/sirius/1.0.3".into()
+    "protocol/sirius/1.0.4".into()
 }
 
 #[derive(Clone, Deserialize)]

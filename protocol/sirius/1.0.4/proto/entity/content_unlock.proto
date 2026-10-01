@@ -1,0 +1,5 @@
+syntax = "proto3";
+package entity;
+message ContentUnlock {
+  int64 master_id = 1;
+}

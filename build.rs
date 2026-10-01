@@ -24,7 +24,7 @@ fn rust_type(message: prost_reflect::MessageDescriptor) -> String {
     )
 }
 fn main() {
-    generate("jp", "protocol/sirius/1.0.3");
+    generate("jp", "protocol/sirius/1.0.4");
     generate("global", "protocol/global/1.0.1");
 }
 fn generate(family: &str, path: &str) {

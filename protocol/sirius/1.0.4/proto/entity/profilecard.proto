@@ -1,0 +1,19 @@
+syntax = "proto3";
+package entity;
+message ProfileCardDetail {
+  int32 slot = 1;
+  string name = 2;
+  bool is_setting = 3;
+  repeated .entity.ProfileObject profile_objects = 4;
+}
+message ProfileObject {
+  int32 index = 1;
+  string profile_object_json = 2;
+  string thumbnail_url = 3;
+  int32 disp_order = 4;
+}
+message SimpleProfileCard {
+  int32 slot = 1;
+  string name = 2;
+  repeated string thumbnail_url = 3;
+}

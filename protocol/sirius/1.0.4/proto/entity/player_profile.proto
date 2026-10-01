@@ -1,0 +1,14 @@
+syntax = "proto3";
+package entity;
+import "entity/deck.proto";
+import "entity/profilecard.proto";
+message PlayerSimpleProfile {
+  string id = 1;
+  string name = 2;
+  int32 rank_exp = 3;
+  int64 last_updated_at = 4;
+  .entity.DeckMemberCardDetail favorite_member_card = 5;
+  int64 profile_id = 6;
+  int64 favorite_member_card_master_id = 7;
+  .entity.SimpleProfileCard profile_card = 8;
+}

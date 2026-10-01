@@ -1,0 +1,13 @@
+syntax = "proto3";
+package entity;
+import "entity/player_profile.proto";
+message Friends {
+  .entity.FriendProfiles accepted = 1;
+  .entity.FriendProfiles pending_sent = 2;
+  .entity.FriendProfiles receive = 3;
+}
+message FriendProfiles {
+  int32 limit = 2;
+  repeated .entity.PlayerSimpleProfile player_profiles = 3;
+  reserved 1;
+}

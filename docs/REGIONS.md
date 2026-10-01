@@ -7,7 +7,7 @@ one protocol family and cannot switch regions or account identity.
 
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
-| `jp` | Japan | Not inferred | `iOS` | JP 1.0.3 | Existing JP proxy, verified download/export pipeline and Master data |
+| `jp` | Japan | Not inferred | `iOS` | JP 1.0.4 | Existing JP proxy, verified download/export pipeline and Master data |
 | `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, version, SDK guest accounts and the JP proxy operations (see [Global operations](#global-operations)), Master data and resource snapshots |
 | `en` | EN Region | 3 | `Android` | Global 1.0.1 | Same as `hk` |
 | `kr` | Korea | 4 | `Android` | Global 1.0.1 | Same as `hk` |
@@ -28,7 +28,8 @@ never paste the whole list into an endpoint. No automatic endpoint switching is 
 Omitting `region` preserves JP behavior. `platform` accepts exactly `iOS` or `Android`; when
 omitted it follows the table. A Global instance selects `protocol/global/1.0.1` by default;
 an explicit protocol path must have the matching family. The existing JP default path remains
-`protocol/sirius/1.0.3`. Both bundles generate native prost/pbjson codecs at build time. Exact
+`protocol/sirius/1.0.4` (since 1.3.2; `protocol/sirius/1.0.3` stays in the repository and image for a
+restart-based rollback). Both bundles generate native prost/pbjson codecs at build time. Exact
 fingerprints select native codecs; compatible changed definitions use dynamic startup/reload.
 
 `GET /api/v1/regions` reports the selected region and capability/reservation metadata.
@@ -81,11 +82,15 @@ Notes:
   gRPC 2 or 7; the account is not penalized. The evidence is static, from the iOS 1.0.3 (10042)
   client: it maps `x-sirius-error-code` `PLAYER_NOT_FOUND` to its friend-player-not-found error,
   only the FindByProfileID, friend-request withdrawal, unlink and report wrappers (each taking a
-  target player) expect it, and it reads application codes only on gRPC 2 or 7. It is not
-  live-verified because no JP account exists. Any other status stays 502. JP `event_deck` stays
+  target player) expect it, and it reads application codes only on gRPC 2 or 7. Live-verified on
+  2026-10-01 with a JP 1.0.4 guest account: an unknown profile ID answers 404 `not_found` and the
+  account keeps 0 failures. Any other status stays 502. JP `event_deck` stays
   502 because its client wrapper expects no code; whether the JP server sends
   `PLAYER_NOT_FOUND` there is not proven either way, so gRPC 7 on it still disables the account
-  as any gRPC 7 does. `PLAYER_NOT_EXISTS` is a different code and is not mapped.
+  as any gRPC 7 does. `PLAYER_NOT_EXISTS` is a different code and is not mapped. Live on
+  2026-10-01, JP `GetDeck` for the top-ranked players of event 1 answered gRPC 2 without an
+  application code to a fresh guest account (the request has the official client's shape: the
+  ranking entry's profile ID and the event ID); it stays 502 and does not penalize the account.
 - The client's descriptor names `ServerInfo` field 8 `areaID`. The proxy validates it by field
   number and keeps publishing it as `areaId` in `/api/v1/servers`.
 - `GetPlayerData` responses include the Global-only fields `chatReportUsedToday` and `roomIds`.
@@ -257,8 +262,10 @@ Data written by earlier builds:
 ## Asset updater
 
 Configure the same region, platform, client version and protocol version as the proxy.
-`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR; it can be pinned explicitly
-when deploying a new verified bundle. `cdn_roots` matches the entire HTTPS base URL, including
+`protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR in the asset updater; it can be
+pinned explicitly when deploying a new verified bundle. Since API 1.3.2 JP snapshots report
+`protocol_version: 1.0.4` and `client_version: 1.0.4`, so a JP updater profile must set both to
+1.0.4 until the updater's own default follows. `cdn_roots` matches the entire HTTPS base URL, including
 its path. Username/password environment references belong only to that configured base URL.
 Redirects remain disabled and unknown roots/references are rejected before CDN requests.
 

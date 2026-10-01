@@ -27,7 +27,7 @@ A request contains a UUID `request_id`, an exact `identity` and a typed `operati
     "region": "jp",
     "environment": "release",
     "platform": "iOS",
-    "client_version": "1.0.3",
+    "client_version": "1.0.4",
     "protocol_sha256": "<configured bundle's semantic fingerprint>"
   },
   "operation": { "type": "version" }

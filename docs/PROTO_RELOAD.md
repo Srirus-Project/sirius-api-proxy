@@ -39,8 +39,8 @@ are not recorded in the repository.
 ## Bundle layout
 
 ```text
-protocol/sirius/1.0.3/
-  bundle.json                 # {"version":"1.0.3"}
+protocol/sirius/1.0.4/
+  bundle.json                 # {"version":"1.0.4"}
   proto/
     app/...
     entity/...

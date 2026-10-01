@@ -1,0 +1,17 @@
+syntax = "proto3";
+package entity;
+message Event {
+  int64 event_id = 1;
+  int32 point = 2;
+  int32 medal = 3;
+  int32 box_gacha_step = 4;
+}
+message EventBoxGachaReward {
+  int64 event_id = 1;
+  int64 reward_id = 2;
+  int32 count = 3;
+}
+message ChallengeLive {
+  int64 event_id = 1;
+  int32 point = 2;
+}

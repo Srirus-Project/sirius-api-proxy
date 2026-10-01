@@ -1,0 +1,15 @@
+syntax = "proto3";
+package entity;
+message MemberCard {
+  int32 id = 1 [deprecated = true];
+  int64 master_id = 2;
+  int32 exp = 3;
+  int32 awake_count = 4;
+  int32 card_rank = 5;
+  int32 leader_skill_level = 6;
+  int32 live_skill_level = 7;
+  int32 performance_skill_level = 8;
+  int64 gain_at = 9;
+  int32 link_skill_level = 10;
+  int32 gekisou_skill_level = 11;
+}

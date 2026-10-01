@@ -1,0 +1,41 @@
+syntax = "proto3";
+package app.event;
+import "entity/deck.proto";
+import "entity/player_profile.proto";
+message GetDeckRequest {
+  string player_id = 1;
+  int64 event_id = 2;
+}
+message GetDeckResponse {
+  .entity.DeckDetail deck = 1;
+}
+message GetRankingListRequest {
+  int64 event_id = 1;
+  repeated int32 ranks = 2;
+}
+message EventRankingEntry {
+  .entity.PlayerSimpleProfile profile = 1;
+  int32 rank = 2;
+  int32 point = 3;
+}
+message GetRankingListResponse {
+  repeated .app.event.EventRankingEntry ranking = 1;
+}
+message GetChallengeMusicRankingRequest {
+  int64 challenge_music_id = 1;
+}
+message ChallengeLiveRankingPlayer {
+  .entity.PlayerSimpleProfile player_data = 1;
+  int32 score = 3;
+  .entity.DeckDetail high_score_deck = 4;
+}
+message GetChallengeMusicRankingResponse {
+  repeated .app.event.ChallengeLiveRankingPlayer players = 1;
+  int32 my_rank = 2;
+  int32 my_score = 3;
+}
+service EventService {
+  rpc GetDeck (.app.event.GetDeckRequest) returns (.app.event.GetDeckResponse);
+  rpc GetRankingList (.app.event.GetRankingListRequest) returns (.app.event.GetRankingListResponse);
+  rpc GetChallengeMusicRanking (.app.event.GetChallengeMusicRankingRequest) returns (.app.event.GetChallengeMusicRankingResponse);
+}
