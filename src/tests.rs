@@ -12013,6 +12013,9 @@ async fn master_git_refuses_unowned_locked_and_linked_destinations() {
         master_git::commit(&source, &state, registry_scope()).await,
         Err(master_git::Error::Locked)
     ));
+    // Unlock explicitly, as `file_lock::Exclusive` does: a concurrent test forking a Git child
+    // shares this open file description until exec, and closing alone would leave it locked.
+    owner.unlock().unwrap();
     drop(owner);
     let linked = root.path().join("linked");
     std::os::unix::fs::symlink(&state, &linked).unwrap();
@@ -12030,10 +12033,12 @@ async fn master_git_refuses_unowned_locked_and_linked_destinations() {
         state.join("repository.git"),
     )
     .unwrap();
-    assert!(matches!(
-        master_git::commit(&source, &state, registry_scope()).await,
-        Err(master_git::Error::Ownership)
-    ));
+    let result = master_git::commit(&source, &state, registry_scope()).await;
+    assert!(
+        matches!(result, Err(master_git::Error::Ownership)),
+        "{:?}",
+        result.err()
+    );
 }
 
 #[cfg(unix)]
@@ -18702,6 +18707,8 @@ async fn master_git_adopt_respects_owner_lock_and_ownership() {
         master_git::adopt(&state, registry_scope(), &unreachable).await,
         Err(master_git::Error::Locked)
     ));
+    // Explicit unlock: see master_git_refuses_unowned_locked_and_linked_destinations.
+    owner.unlock().unwrap();
     drop(owner);
     let occupied = root.path().join("occupied");
     std::fs::create_dir(&occupied).unwrap();
