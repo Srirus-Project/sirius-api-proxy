@@ -19694,6 +19694,21 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
             .state_directory = directory;
     });
     assert!(state_is_snapshot.validate().is_err());
+    // Regions share one SDK session per identity, so one SDK state directory.
+    let sdk_state = |hk: &str, en: &str| {
+        let (hk, en) = (hk.to_owned(), en.to_owned());
+        mutate(&move |m| {
+            for (region, directory) in [("hk", &hk), ("en", &en)] {
+                m.regions.get_mut(region).unwrap().global_login =
+                    Some(crate::global_account::LoginConfig {
+                        state_directory: Some(directory.into()),
+                        ..Default::default()
+                    });
+            }
+        })
+    };
+    assert!(sdk_state("/data/sdk", "/data/sdk").validate().is_ok());
+    assert!(sdk_state("/data/sdk", "/data/other").validate().is_err());
     let shared_remote = mutate(&|m| {
         let remote = m.regions["jp"].master_git.as_ref().unwrap().remote.clone();
         m.regions
@@ -20403,6 +20418,8 @@ mod global_accounts {
         url: String,
         requests: SdkRequests,
         codes: Arc<Mutex<VecDeque<i64>>>,
+        /// Scripted `id_token`s of successful `cache.login` answers (default REFRESHED_ID_TOKEN).
+        tokens: Arc<Mutex<VecDeque<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for SdkMock {
@@ -20423,11 +20440,13 @@ mod global_accounts {
     async fn sdk_mock() -> SdkMock {
         let requests: SdkRequests = Arc::new(Mutex::new(Vec::new()));
         let codes = Arc::new(Mutex::new(VecDeque::new()));
-        let (seen, scripted) = (requests.clone(), codes.clone());
+        let tokens = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (seen, scripted, scripted_tokens) = (requests.clone(), codes.clone(), tokens.clone());
         let app = axum::Router::new().fallback(
             move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
                 let seen = seen.clone();
                 let scripted = scripted.clone();
+                let scripted_tokens = scripted_tokens.clone();
                 async move {
                     let form = url::form_urlencoded::parse(&body)
                         .into_owned()
@@ -20455,8 +20474,13 @@ mod global_accounts {
                         json!({"code": 0, "data": {"uid": UID.parse::<u64>().unwrap(), "access_key": ACCESS_KEY,
                                "id_token": ID_TOKEN, "is_tourist": 1}})
                     } else {
+                        let id_token = scripted_tokens
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| REFRESHED_ID_TOKEN.into());
                         json!({"code": 0, "data": {"uid": map.get("uid").cloned().unwrap_or_default(),
-                               "id_token": REFRESHED_ID_TOKEN}})
+                               "id_token": id_token}})
                     };
                     axum::response::IntoResponse::into_response(axum::Json(body))
                 }
@@ -20467,6 +20491,7 @@ mod global_accounts {
             url,
             requests,
             codes,
+            tokens,
             task,
         }
     }
@@ -21164,11 +21189,18 @@ mod global_accounts {
         // No PlayerLogin (or Version) after an SDK refusal, and no SDK retry.
         assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
         assert_eq!(e.sdk.requests.lock().unwrap().len(), 1);
-        // Reload restores the account (operator action); the SDK identity is revalidated.
+        // A CAPTCHA is a refusal of the identity: a reload does not retry it before
+        // sdk_refusal_retry_seconds; a restart without a state directory does.
+        assert_eq!(s["sdk_session"], "refused");
         c.reload_accounts().await.unwrap();
-        c.call(PLAYER_DATA, json!({})).await.unwrap();
-        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(&c)["last_error_code"], "SDK_CAPTCHA");
         assert!(status(&c).get("last_sdk_code").is_none());
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), 1);
+        let restarted = GameClient::for_test(e.cfg.clone());
+        restarted.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert!(status(&restarted).get("last_sdk_code").is_none());
     }
 
     #[tokio::test]
@@ -21181,8 +21213,20 @@ mod global_accounts {
         assert_eq!(s["disabled"], true);
         assert_eq!(s["last_error_code"], "SDK_REFUSED");
         assert_eq!(s["last_sdk_code"], 500_001);
+        assert_eq!(s["sdk_session"], "refused");
+        // A reload does not retry a refused identity before sdk_refusal_retry_seconds.
+        c.reload_accounts().await.unwrap();
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(status(&c)["last_sdk_code"], 500_001);
+        // A replaced identity file (new access key) starts a new SDK session.
+        let path = e.cfg.accounts[0].global_identity_file.clone().unwrap();
+        let mut identity: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        identity["sdk"]["access_key"] = json!("SECRETACCESSKEY-new");
+        write_private(&path, &identity);
         c.reload_accounts().await.unwrap();
         c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
         assert!(status(&c).get("last_sdk_code").is_none());
     }
 
@@ -21929,6 +21973,366 @@ regions:
         assert_eq!(count(&e.f, PLAYER_LOGIN), 3);
         assert_eq!(count(&e.f, V), 1);
         assert_eq!(status(&c)["session_state"], "active");
+    }
+
+    /// A JWT-shaped `id_token` expiring `seconds` from now (payload `{"exp": ..}`).
+    fn jwt(seconds: i64) -> String {
+        use base64::Engine;
+        let payload = json!({"exp": chrono::Utc::now().timestamp() + seconds, "sub": "fixture"});
+        format!(
+            "eyJhbGciOiJSUzI1NiJ9.{}.SECRETSIGNATURE",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+    /// `idToken` of each PlayerLogin a fixture received, in order.
+    fn login_id_tokens(f: &Fixture) -> Vec<String> {
+        f.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == PLAYER_LOGIN)
+            .map(|r| {
+                let request = DynamicMessage::decode(
+                    global_pool()
+                        .get_message_by_name("app.playerlogin.PlayerLoginRequest")
+                        .unwrap(),
+                    &r.2[5..],
+                )
+                .unwrap();
+                serde_json::to_value(request).unwrap()["idToken"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+    /// Regions of one deployment: one SDK mock and identity, a game mock per region.
+    struct Shared {
+        dir: tempfile::TempDir,
+        sdk: SdkMock,
+        identity: PathBuf,
+        regions: Vec<(Arc<Upstream>, Fixture, Config)>,
+    }
+    async fn shared(state: bool) -> Shared {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = sdk_mock().await;
+        let identity = identity_file(dir.path(), json!({}));
+        let mut regions = Vec::new();
+        for region in [Region::Hk, Region::En] {
+            let script = Upstream::new(region.name());
+            let f = upstream(script.clone()).await;
+            let mut cfg = global_config(region, &f, &sdk, &identity);
+            if state {
+                cfg.global_login.as_mut().unwrap().state_directory =
+                    Some(dir.path().join("sdk-state"));
+            }
+            regions.push((script, f, cfg));
+        }
+        Shared {
+            dir,
+            sdk,
+            identity,
+            regions,
+        }
+    }
+    impl Shared {
+        /// A (re)started deployment: fresh clients sharing fresh sessions.
+        fn start(&self) -> Vec<Arc<GameClient>> {
+            let directory = self.regions[0]
+                .2
+                .global_login
+                .as_ref()
+                .unwrap()
+                .state_directory
+                .clone();
+            let sessions = crate::sdk_session::SdkSessions::open(directory.as_deref()).unwrap();
+            self.regions
+                .iter()
+                .map(|(_, _, cfg)| {
+                    GameClient::for_test_with_sdk_sessions(cfg.clone(), sessions.clone())
+                })
+                .collect()
+        }
+        fn state_files(&self) -> Vec<PathBuf> {
+            std::fs::read_dir(self.dir.path().join("sdk-state"))
+                .map(|d| {
+                    d.map(|e| e.unwrap().path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn regions_share_one_cache_login_per_identity() {
+        let d = shared(false).await;
+        let clients = d.start();
+        let (hk, en) = (&clients[0], &clients[1]);
+        assert_eq!(status(hk)["sdk_session"], "none");
+        // Concurrent first logins of both regions: one cache.login, one PlayerLogin each.
+        let (a, b) = tokio::join!(
+            hk.call(PLAYER_DATA, json!({})),
+            en.call(PLAYER_DATA, json!({}))
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for (_, f, _) in &d.regions {
+            assert_eq!(count(f, PLAYER_LOGIN), 1);
+            assert_eq!(login_id_tokens(f), [REFRESHED_ID_TOKEN]);
+        }
+        assert_eq!(status(hk)["sdk_session"], "valid");
+        assert_eq!(status(en)["sdk_session"], "valid");
+        // TOKEN_* in one region makes the shared identity stale: the next login of any region
+        // revalidates once, and the other region's session is untouched.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(hk.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(en)["sdk_session"], "stale");
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&d.regions[0].1, PLAYER_LOGIN), 2);
+        assert_eq!(count(&d.regions[1].1, PLAYER_LOGIN), 1);
+        assert_eq!(status(en)["sdk_session"], "valid");
+        // Clients built on their own (no shared registry) keep separate sessions.
+        let alone = GameClient::for_test(d.regions[1].2.clone());
+        alone.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 3);
+        assert!(d.state_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiring_id_token_is_revalidated_instead_of_shared() {
+        let d = shared(false).await;
+        d.sdk.tokens.lock().unwrap().extend([jwt(120), jwt(7200)]);
+        let clients = d.start();
+        clients[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(status(&clients[1])["sdk_session"], "expired");
+        // Within the expiry margin: the second region revalidates instead of sending it.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&clients[0])["sdk_session"], "valid");
+    }
+
+    #[tokio::test]
+    async fn persisted_sdk_session_skips_cache_login_after_restart() {
+        let d = shared(true).await;
+        let token = jwt(7200);
+        d.sdk.tokens.lock().unwrap().push_back(token.clone());
+        let first = d.start();
+        first[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        let files = d.state_files();
+        assert_eq!(files.len(), 1);
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(!text.contains(ACCESS_KEY));
+        assert!(!text.contains(UDID));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(first);
+        // Restart: both regions log in with the persisted id_token and no SDK request.
+        let second = d.start();
+        assert_eq!(status(&second[1])["sdk_session"], "valid");
+        second[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        second[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(
+            login_id_tokens(&d.regions[0].1),
+            [token.clone(), token.clone()]
+        );
+        assert_eq!(
+            login_id_tokens(&d.regions[1].1),
+            std::slice::from_ref(&token)
+        );
+        let verified = d.start()[1]
+            .verify_global_account("en-guest", false)
+            .await
+            .unwrap();
+        assert_eq!(verified["sdk_cache_login"], "reused");
+        // TOKEN_* drops the persisted id_token: the next start revalidates.
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_EXPIRED"));
+        assert!(second[1].call(PLAYER_DATA, json!({})).await.is_err());
+        drop(second);
+        let third = d.start();
+        assert_eq!(status(&third[0])["sdk_session"], "none");
+        third[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // A state file of a replaced identity (another access key) is ignored.
+        drop(third);
+        let mut identity: Value =
+            serde_json::from_slice(&std::fs::read(&d.identity).unwrap()).unwrap();
+        identity["sdk"]["access_key"] = json!("SECRETACCESSKEY-replaced");
+        write_private(&d.identity, &identity);
+        assert_eq!(status(&d.start()[0])["sdk_session"], "none");
+    }
+
+    #[tokio::test]
+    async fn sdk_refusal_stops_every_region_and_survives_restart() {
+        let d = shared(true).await;
+        d.sdk.codes.lock().unwrap().push_back(900200);
+        let first = d.start();
+        assert!(matches!(
+            first[0].call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        // The other region is disabled by the shared refusal without an SDK request.
+        assert!(first[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for client in &first {
+            let s = status(client);
+            assert_eq!(s["disabled"], true);
+            assert_eq!(s["last_error_code"], "SDK_REFUSED");
+            assert_eq!(s["last_sdk_code"], 900200);
+            assert_eq!(s["sdk_session"], "refused");
+        }
+        for (_, f, _) in &d.regions {
+            assert_eq!(count(f, PLAYER_LOGIN), 0);
+        }
+        drop(first);
+        // A restart honours the persisted refusal: still nothing is sent.
+        let second = d.start();
+        assert!(second[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(status(&second[1])["last_sdk_code"], 900200);
+        drop(second);
+        // After sdk_refusal_retry_seconds one cache.login may try again.
+        let file = d.state_files().pop().unwrap();
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        state["refusal"]["at"] = json!(chrono::Utc::now() - chrono::Duration::days(2));
+        write_private(&file, &state);
+        let third = d.start();
+        third[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&third[0])["sdk_session"], "valid");
+    }
+
+    #[tokio::test]
+    async fn regions_waiting_on_a_failed_cache_login_do_not_repeat_it() {
+        let d = shared(false).await;
+        d.sdk.codes.lock().unwrap().push_back(SDK_HTTP_ERROR);
+        let clients = d.start();
+        let (a, b) = tokio::join!(
+            clients[0].call(PLAYER_DATA, json!({})),
+            clients[1].call(PLAYER_DATA, json!({}))
+        );
+        assert!(a.is_err() && b.is_err());
+        // One SDK request for both regions; neither account is disabled.
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for client in &clients {
+            assert_eq!(status(client)["disabled"], false);
+        }
+        // The next request tries once more.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        clients[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn token_signal_of_an_older_generation_keeps_the_newer_sdk_session() {
+        let d = shared(false).await;
+        let clients = d.start();
+        let (hk, en) = (&clients[0], &clients[1]);
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        // hk's TOKEN_* revalidates (generation 2); en's session still uses generation 1.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(hk.call(PLAYER_DATA, json!({})).await.is_err());
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // A late TOKEN_* on en's older session does not invalidate hk's newer id_token.
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_EXPIRED"));
+        assert!(en.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(en)["sdk_session"], "valid");
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&d.regions[1].1, PLAYER_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn processes_sharing_a_state_directory_keep_each_others_refusal() {
+        let d = shared(true).await;
+        d.sdk.tokens.lock().unwrap().push_back(jwt(7200));
+        // The service has a valid session; a separate process (verify) then gets refused.
+        let service = d.start();
+        service[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        let other = d.start();
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(other[1].call(PLAYER_DATA, json!({})).await.is_err());
+        d.sdk.codes.lock().unwrap().push_back(900200);
+        assert!(other[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // The service's next write keeps the newer refusal instead of overwriting it, and its
+        // next login adopts it without an SDK request.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(service[0].call(PLAYER_DATA, json!({})).await.is_err());
+        assert!(service[0].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&service[0])["last_sdk_code"], 900200);
+        let file = d.state_files().pop().unwrap();
+        let state: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(state["refusal"]["code"], 900200);
+        assert_eq!(state["id_token"], "");
+    }
+
+    #[test]
+    fn sdk_state_settings_are_bounded() {
+        let mut login = LoginConfig::default();
+        assert!(login.state_directory.is_none());
+        assert_eq!(login.sdk_refusal_retry_seconds, 86_400);
+        login.validate().unwrap();
+        for retry in [3_599, 30 * 86_400 + 1] {
+            login.sdk_refusal_retry_seconds = retry;
+            assert!(login.validate().is_err());
+        }
+        login.sdk_refusal_retry_seconds = 3_600;
+        login.state_directory = Some(PathBuf::new());
+        assert!(login.validate().is_err());
+        login.state_directory = Some("/var/lib/sirius/sdk".into());
+        login.validate().unwrap();
+        let parsed: LoginConfig = yaml_serde::from_str(
+            "state_directory: /data/sdk-sessions\nsdk_refusal_retry_seconds: 172800\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.state_directory.as_deref(),
+            Some(Path::new("/data/sdk-sessions"))
+        );
+        assert_eq!(parsed.sdk_refusal_retry_seconds, 172_800);
     }
 }
 

@@ -175,6 +175,8 @@ pub struct GameClient {
     sdk_path: Option<PathHealth>,
     /// Master table read admission, shared by every region of the process.
     table_reads: crate::master_admission::Gate,
+    /// Global SDK sessions, shared by every region of the deployment.
+    sdk_sessions: Arc<crate::sdk_session::SdkSessions>,
 }
 /// One upstream attempt on a path. Its outcome is recorded when it is dropped, so an attempt
 /// abandoned at the logical deadline still counts as a timeout; one cancelled earlier, or never
@@ -221,9 +223,21 @@ fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
 impl GameClient {
     pub fn new(config: Config) -> Result<Arc<Self>, AppError> {
         config.validate()?;
-        Self::build(config, false)
+        Self::build(config, false, None)
     }
-    fn build(config: Config, test_http: bool) -> Result<Arc<Self>, AppError> {
+    /// A region of a deployment whose regions share `sdk_sessions`.
+    pub(crate) fn with_sdk_sessions(
+        config: Config,
+        sdk_sessions: Arc<crate::sdk_session::SdkSessions>,
+    ) -> Result<Arc<Self>, AppError> {
+        config.validate()?;
+        Self::build(config, false, Some(sdk_sessions))
+    }
+    fn build(
+        config: Config,
+        test_http: bool,
+        sdk_sessions: Option<Arc<crate::sdk_session::SdkSessions>>,
+    ) -> Result<Arc<Self>, AppError> {
         let protocol = ProtocolBundle::load(&config.protocol_path())?;
         if protocol.status.family != config.region.family() {
             return Err(AppError::ProtocolDefinition);
@@ -259,7 +273,16 @@ impl GameClient {
                 .http2_keep_alive_while_idle(false);
         }
         let http = http.build(connector);
-        let accounts = crate::accounts::Pool::load(&config, 1)?;
+        let sdk_sessions = match sdk_sessions {
+            Some(sessions) => sessions,
+            None => crate::sdk_session::SdkSessions::open(
+                config
+                    .global_login
+                    .as_ref()
+                    .and_then(|l| l.state_directory.as_deref()),
+            )?,
+        };
+        let accounts = crate::accounts::Pool::load_with(&config, 1, &sdk_sessions)?;
         let sdk = sdk_client(&config)?;
         // Path health outlives account and protocol reloads.
         let path = PathHealth::new(&config.account_pool, true);
@@ -344,6 +367,7 @@ impl GameClient {
             path,
             sdk_path,
             table_reads: crate::master_admission::Gate::tables(),
+            sdk_sessions,
         }))
     }
     pub(crate) fn table_reads(&self) -> &crate::master_admission::Gate {
@@ -354,7 +378,14 @@ impl GameClient {
     }
     #[cfg(test)]
     pub(crate) fn for_test(config: Config) -> Arc<Self> {
-        Self::build(config, true).unwrap()
+        Self::build(config, true, None).unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test_with_sdk_sessions(
+        config: Config,
+        sdk_sessions: Arc<crate::sdk_session::SdkSessions>,
+    ) -> Arc<Self> {
+        Self::build(config, true, Some(sdk_sessions)).unwrap()
     }
     #[cfg(test)]
     pub(crate) fn test_path(&self, sdk: bool) -> &PathHealth {
@@ -724,10 +755,12 @@ impl GameClient {
             .checked_add(1)
             .ok_or(AppError::AccountUnavailable)?;
         let config = self.config.clone();
-        let candidate =
-            tokio::task::spawn_blocking(move || crate::accounts::Pool::load(&config, generation))
-                .await
-                .map_err(|_| AppError::AccountUnavailable)??;
+        let sessions = self.sdk_sessions.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            crate::accounts::Pool::load_with(&config, generation, &sessions)
+        })
+        .await
+        .map_err(|_| AppError::AccountUnavailable)??;
         // Activation drains logical calls before replacing locks and credentials.
         let _calls = self.protocol_calls.write().await;
         {
@@ -1352,10 +1385,87 @@ impl GameClient {
             }
         }
     }
+    /// SDK `cache.login` of `g`'s identity, under its revalidation lock. An open SDK path refuses
+    /// before the attempt is counted: it spends no login.
+    async fn revalidate(
+        &self,
+        account: &crate::accounts::Account,
+        g: &crate::global_account::GlobalAccount,
+        sdk: &crate::global_sdk::SdkClient,
+        now: std::time::Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<(crate::global_sdk::SdkAccount, u64), AppError> {
+        let region = self.config.region.name();
+        let _sdk_ticket = self
+            .sdk_path
+            .as_ref()
+            .and_then(PathHealth::admit)
+            .ok_or(AppError::UpstreamUnavailable)?;
+        g.state().attempts.push_back(now);
+        let base = g.sdk.base().unwrap_or_else(|| g.identity.sdk.clone());
+        let mut attempt = UpstreamAttempt {
+            client: self,
+            sdk: true,
+            source: None,
+            deadline,
+            sent: true,
+            outcome: None,
+            code: None,
+        };
+        let outcome = tokio::time::timeout_at(deadline, sdk.cache_login(&g.identity.device, &base))
+            .await
+            .unwrap_or(Err(crate::global_sdk::SdkError::Transport));
+        g.sdk.completed();
+        attempt.outcome = Some(match &outcome {
+            Err(error) if error.transient() => Some(Outcome::Fault(error.code())),
+            Err(crate::global_sdk::SdkError::Config) => None,
+            _ => Some(Outcome::Healthy),
+        });
+        drop(attempt);
+        match outcome {
+            Ok(refreshed) => {
+                let generation = g.sdk.validated(refreshed.clone());
+                Ok((refreshed, generation))
+            }
+            Err(error) => {
+                {
+                    let mut s = g.state();
+                    s.last_error_code = Some(error.code().into());
+                    s.last_sdk_code = error.sdk_code();
+                }
+                // Shared with every region and kept across restarts (with a state directory).
+                match error {
+                    crate::global_sdk::SdkError::Refused(code) => g.sdk.refused(code),
+                    crate::global_sdk::SdkError::Captcha => {
+                        g.sdk.refused(crate::global_sdk::CAPTCHA_CODE)
+                    }
+                    _ => {}
+                }
+                // Transient failures belong to the SDK path; the login interval and daily
+                // cap already bound this account's retries.
+                if !error.transient() {
+                    account.disable();
+                }
+                tracing::warn!(
+                    error_code = error.code(),
+                    sdk_code = error.sdk_code(),
+                    account = %account.name,
+                    region,
+                    "Global SDK cache.login failed; no retry"
+                );
+                Err(if tokio::time::Instant::now() >= deadline {
+                    AppError::Timeout
+                } else {
+                    AppError::AccountUnavailable
+                })
+            }
+        }
+    }
     /// Game headers for `account`. A Global account without a session logs in first: SDK
-    /// `cache.login` (first login of the process, or after a TOKEN_* signal) and PlayerLogin,
-    /// bounded by the login interval and daily cap. The caller holds the account's session
-    /// lock, so concurrent calls trigger at most one login. Nothing here is retried.
+    /// `cache.login` unless the identity's shared session is still valid (another region, or
+    /// a persisted session, revalidated it and no TOKEN_* signal or expiry intervened), then
+    /// PlayerLogin, bounded by the login interval and daily cap. The caller holds the account's
+    /// session lock, so concurrent calls trigger at most one login. Nothing here is retried.
     async fn account_auth(
         &self,
         protocol: &ProtocolBundle,
@@ -1374,7 +1484,14 @@ impl GameClient {
         let policy = &self.config.account_pool;
         let region = self.config.region.name();
         let now = std::time::Instant::now();
-        let (revalidate, base) = {
+        let refusal_retry = chrono::Duration::seconds(login.sdk_refusal_retry_seconds as i64);
+        // A refused identity (in any region, before a restart too) is not retried before the
+        // refusal retry time: repeating it only deepens a risk-control block.
+        if let Some(refusal) = g.sdk.refusal(Utc::now(), refusal_retry) {
+            sdk_refused(account, g, refusal.code, region);
+            return Err(AppError::AccountUnavailable);
+        }
+        {
             let mut state = g.state();
             if let Some(until) = state.next_allowed(now, login) {
                 drop(state);
@@ -1387,79 +1504,38 @@ impl GameClient {
                 );
                 return Err(AppError::AccountUnavailable);
             }
-            (
-                state.sdk.is_none() || state.sdk_stale,
-                state.sdk.clone().unwrap_or_else(|| g.identity.sdk.clone()),
-            )
-        };
-        // An open SDK path refuses before the attempt is counted: it spends no login. The
-        // caller holds the account's session lock, so no other login starts in between.
-        let _sdk_ticket = if revalidate {
-            Some(
-                self.sdk_path
-                    .as_ref()
-                    .and_then(PathHealth::admit)
-                    .ok_or(AppError::UpstreamUnavailable)?,
-            )
-        } else {
-            None
-        };
-        g.state().attempts.push_back(now);
-        let sdk_account = if revalidate {
-            let mut attempt = UpstreamAttempt {
-                client: self,
-                sdk: true,
-                source: None,
-                deadline,
-                sent: true,
-                outcome: None,
-                code: None,
-            };
-            let outcome =
-                tokio::time::timeout_at(deadline, sdk.cache_login(&g.identity.device, &base))
+        }
+        let (sdk_account, generation) = match g.sdk.reusable(Utc::now()) {
+            Some(shared) => {
+                g.state().attempts.push_back(now);
+                shared
+            }
+            None => {
+                // One cache.login per identity at a time across regions (and processes sharing
+                // the state directory); a waiter reuses the result instead of sending its own.
+                let seen = g.sdk.attempts();
+                let _revalidation = tokio::time::timeout_at(deadline, g.sdk.login.lock())
                     .await
-                    .unwrap_or(Err(crate::global_sdk::SdkError::Transport));
-            attempt.outcome = Some(match &outcome {
-                Err(error) if error.transient() => Some(Outcome::Fault(error.code())),
-                Err(crate::global_sdk::SdkError::Config) => None,
-                _ => Some(Outcome::Healthy),
-            });
-            drop(attempt);
-            match outcome {
-                Ok(refreshed) => {
-                    let mut state = g.state();
-                    state.sdk = Some(refreshed.clone());
-                    state.sdk_stale = false;
-                    refreshed
+                    .map_err(|_| AppError::Timeout)?;
+                let _exclusive = g.sdk.exclusive(deadline).await?;
+                if let Some(refusal) = g.sdk.refusal(Utc::now(), refusal_retry) {
+                    sdk_refused(account, g, refusal.code, region);
+                    return Err(AppError::AccountUnavailable);
                 }
-                Err(error) => {
-                    {
-                        let mut s = g.state();
-                        s.last_error_code = Some(error.code().into());
-                        s.last_sdk_code = error.sdk_code();
+                match g.sdk.reusable(Utc::now()) {
+                    Some(shared) => {
+                        g.state().attempts.push_back(now);
+                        shared
                     }
-                    // Transient failures belong to the SDK path; the login interval and daily
-                    // cap already bound this account's retries.
-                    if !error.transient() {
-                        account.disable();
-                    }
-                    tracing::warn!(
-                        error_code = error.code(),
-                        sdk_code = error.sdk_code(),
-                        account = %account.name,
-                        region,
-                        "Global SDK cache.login failed; no retry"
-                    );
-                    return Err(if tokio::time::Instant::now() >= deadline {
-                        AppError::Timeout
-                    } else {
-                        AppError::AccountUnavailable
-                    });
+                    // A cache.login of another region completed and failed since this request
+                    // began: repeating it at once would only multiply SDK requests. The next
+                    // request may try.
+                    None if g.sdk.attempts() != seen => return Err(AppError::UpstreamUnavailable),
+                    None => self.revalidate(account, g, sdk, now, deadline).await?,
                 }
             }
-        } else {
-            base
         };
+        g.state().sdk_generation = generation;
         let request = crate::global_account::login_request(
             &sdk_account,
             &g.identity.device,
@@ -1531,7 +1607,8 @@ impl GameClient {
         state.last_login_at = Some(Utc::now());
         Ok(auth)
     }
-    /// One-shot login check for `global-account verify`: SDK `cache.login` and PlayerLogin once
+    /// One-shot login check for `global-account verify`: SDK `cache.login` (or the persisted
+    /// SDK session while it is valid: `sdk_cache_login` is then `reused`) and PlayerLogin once
     /// (the process has no session yet), without Whoami or any other RPC. The summary carries
     /// no token; the player ID only when `show_player_id` is set.
     pub async fn verify_global_account(
@@ -1542,6 +1619,12 @@ impl GameClient {
         if self.config.region.family() != "global" {
             return Err(AppError::UnsupportedRegionOperation);
         }
+        let revalidations = self
+            .accounts
+            .lock()
+            .map_err(|_| AppError::AccountUnavailable)?
+            .find(name)
+            .and_then(|a| a.global().map(|g| g.sdk.revalidations()));
         let identity = self
             .call_selected(WHOAMI, json!({}), Some(name), None, None)
             .await?;
@@ -1557,7 +1640,7 @@ impl GameClient {
         let mut summary = json!({
             "region": self.config.region,
             "account": name,
-            "sdk_cache_login": "ok",
+            "sdk_cache_login": if Some(g.sdk.revalidations()) == revalidations { "reused" } else { "ok" },
             "player_login": "ok",
             "credential_received": true,
             "new_player": session.is_new_user,
@@ -2154,6 +2237,33 @@ fn application_code(md: &HeaderMap) -> Option<String> {
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
         })
         .map(str::to_owned)
+}
+/// Disables an account whose SDK identity is under a refusal received earlier (possibly by
+/// another region or before a restart), without sending anything.
+fn sdk_refused(
+    account: &crate::accounts::Account,
+    g: &crate::global_account::GlobalAccount,
+    code: i64,
+    region: &str,
+) {
+    let error = if code == crate::global_sdk::CAPTCHA_CODE {
+        crate::global_sdk::SdkError::Captcha
+    } else {
+        crate::global_sdk::SdkError::Refused(code)
+    };
+    {
+        let mut s = g.state();
+        s.last_error_code = Some(error.code().into());
+        s.last_sdk_code = error.sdk_code();
+    }
+    account.disable();
+    tracing::warn!(
+        error_code = error.code(),
+        sdk_code = error.sdk_code(),
+        account = %account.name,
+        region,
+        "Global SDK identity is under an earlier refusal; not retried before sdk_refusal_retry_seconds"
+    );
 }
 /// SDK client for Global identity accounts. It uses the upstream proxy of game calls, if any.
 fn sdk_client(config: &Config) -> Result<Option<crate::global_sdk::SdkClient>, AppError> {

@@ -131,6 +131,8 @@ global_login:
   max_logins_per_day: 24               # 1..100, per account in any rolling 24 hours
   aegis_cooldown_seconds: 900          # 60..86400, after a login queue signal
   concurrent_device_limit: 3           # 1..100 CONCURRENT_DEVICE signals per 24 h disable
+  state_directory: /var/lib/sirius/sdk-sessions  # optional; SDK sessions survive restarts
+  sdk_refusal_retry_seconds: 86400     # 3600..2592000, before a refused identity is retried
 ```
 
 Rules checked at startup:
@@ -147,7 +149,10 @@ Rules checked at startup:
 - The SDK app key is read from `sdk_app_key_env` at startup. It ships inside the APK but is
   treated as a secret: it never appears in configuration, logs or responses.
 - One SDK identity may appear at most once per region. The same file may be referenced by the
-  `hk`, `en` and `kr` profiles: one SDK identity has an independent player on each server.
+  `hk`, `en` and `kr` profiles: one SDK identity has an independent player on each server, and
+  the regions of one deployment share its SDK session (see [Shared SDK sessions](#shared-sdk-sessions)).
+- In a multi-region deployment every region's `global_login.state_directory` must be the same
+  (or absent everywhere).
 
 ### Identity file
 
@@ -185,7 +190,8 @@ Nothing is sent at startup. The first authenticated request of an account, while
 account's session lock, performs:
 
 1. SDK `POST /gapi/client/cache.login` (signed like the Android SDK). The uid must not change;
-   the original `access_key` is kept, a new `id_token` is used when returned.
+   the original `access_key` is kept, a new `id_token` is used when returned. It is skipped
+   while the identity's [shared SDK session](#shared-sdk-sessions) is valid.
 2. `PlayerLoginService/PlayerLogin` on the region's API endpoint with `area_id` 6,
    `global_channel_id` 2001, `brand_id` 5, `platform` 0 (omitted), `client_package`
    `com.bilibili.sirius` and the Unity device values. It sends only `x-platform`,
@@ -210,7 +216,7 @@ request that received a signal is never replayed.
 
 | Signal | Effect |
 | --- | --- |
-| `TOKEN_*`, or gRPC 16 without a code | Drop the session; the next request runs `cache.login` and PlayerLogin again |
+| `TOKEN_*`, or gRPC 16 without a code | Drop the session and mark the shared SDK session stale; the next request runs `cache.login` and PlayerLogin again |
 | `PLAYER_NOT_*`, except `PLAYER_NOT_FOUND` on `profile`/`event_deck` (the looked-up player: 404, session kept) | Drop the session; the next request runs PlayerLogin again |
 | A second `TOKEN_*`/`PLAYER_NOT_*`/16 before any successful call | Disable the account |
 | `CONCURRENT_DEVICE` | Drop the session and cool down for `cooldown_seconds`; the `concurrent_device_limit`-th signal in 24 h disables |
@@ -219,21 +225,67 @@ request that received a signal is never replayed.
 | `UNDER_MAINTENANCE` | Recorded as maintenance; no account penalty |
 | `MASTER_VERSION_MISMATCH` / `CLIENT_UPDATE_REQUIRED` | Recorded in `last_error_code`; no session drop, no penalty (a failed PlayerLogin still answers 503 and counts toward the login limits); a mismatch refreshes the Master version before the next call |
 | gRPC 7 without a code | Disable the account |
-| SDK code 200007 (CAPTCHA), other nonzero SDK codes, a changed uid | Disable the account; complete verification in the official client |
+| A changed uid | Disable the account |
+| SDK code 200007 (`SDK_CAPTCHA`) and other nonzero SDK codes (`SDK_REFUSED`, for example 900200 risk control) | Disable the account in every region that uses the identity; no `cache.login` of the identity for `sdk_refusal_retry_seconds`, across reloads and (with `state_directory`) restarts. For a CAPTCHA, complete verification in the official client first |
 | SDK transport failure, deadline or malformed response (`SDK_TRANSPORT`, `SDK_PROTOCOL`) | Recorded as `last_error_code`; counts toward the SDK path, never cools the account (the login interval and daily cap bound retries). `failure_threshold` consecutive failures open the SDK path |
 | gRPC 8/13 | Transient failure, as for JP |
 | Transport, deadline, malformed responses, gRPC 14 without a code | Path-class fault, attributed as for JP |
 
 A disabled account stays disabled until `POST .../accounts/reload` or a restart. Reloading
-re-reads the identity file.
+re-reads the identity file. An identity under an SDK refusal is disabled again on its next
+login until `sdk_refusal_retry_seconds` have passed, unless its identity file now holds another
+access key.
 
 `GET /internal/v1/accounts` adds these fields for Global accounts: `session_state` (`none`,
 `active`, `relogin_pending`, `cooling` or `disabled`), `last_login_at`, `logins_24h` and
 `last_error_code` (an application or SDK code such as `TOKEN_ILLEGAL` or `SDK_CAPTCHA`, never
 text) and, after `SDK_REFUSED`, `last_sdk_code` (the SDK's numeric refusal code, also logged as
-`sdk_code`; it tells an invalidated identity from a risk-control block). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
+`sdk_code`; it tells an invalidated identity from a risk-control block), and `sdk_session`
+(the identity's shared SDK session: `none`, `valid`, `stale`, `expired` or `refused`). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
 or response cache keys. Response cache keys use the account name and SDK uid (hashed), not the
 rotating credential, so a re-login keeps cached public responses.
+
+### Shared SDK sessions
+
+An SDK identity is one Bilibili account. The official client revalidates it with `cache.login`
+once per launch and then logs in to a single server. The proxy used to revalidate the same
+identity separately in each region, and again after every restart. In production that meant
+three SDK logins within a second per restart. On 2026-10-01 two identities were blocked by the
+SDK's risk control (code 900200, "账号存在异常行为，暂时无法登录") after a day of restarts and
+checks. Since 1.3.3:
+
+- The regions of one deployment share one SDK session per identity (keyed by uid and access
+  key; a replaced identity file with another access key is a new session). `cache.login` runs at
+  most once at a time per identity. A region that needs a session while another region is
+  revalidating waits and reuses the result. If that `cache.login` failed (transport, deadline),
+  the waiting request answers 503 `upstream_unavailable` instead of repeating it; the next
+  request may try again.
+- A shared session is reused while it is not stale and its `id_token` has not expired. JWT
+  `exp`, 2 hours for Global guests, minus a 5-minute margin. A token without `exp` is reused
+  until a `TOKEN_*` signal. A `TOKEN_*` signal marks the session stale only if the failed game
+  session used the current `id_token`; a late signal about a token that another region has
+  already replaced changes nothing.
+- An SDK refusal (`SDK_REFUSED` or `SDK_CAPTCHA`) is shared. Every region disables the account without sending
+  anything, and no `cache.login` of the identity is sent for `sdk_refusal_retry_seconds`
+  (default 24 h). After that, the next login tries once.
+- With `state_directory`, each identity's session and refusal are kept in
+  `sdk-session-<hash>.json`, with a `.lock` file next to it. Files are written atomically. On
+  Unix they are 0600, and the directory is created 0700 if it is missing; on Windows, protect
+  the directory with ACLs. Processes sharing the directory (the service and
+  `global-account verify`) hold the lock file around `cache.login` and read each other's
+  results. A newer refusal written by one process is never overwritten by another. They hold the uid, the `id_token`, `mid`, an access-key
+  fingerprint and the refusal, never the access key itself. A restart within the `id_token`
+  lifetime logs in to the game without any SDK request. A restart under a refusal sends
+  nothing. A file of another uid or access key, or a malformed one, is ignored with a warning.
+- The game session (PlayerLogin credential) is not persisted. Each region still runs PlayerLogin
+  after a restart, on the first authenticated request.
+- Without `state_directory`, sessions and refusals live in memory only and a restart starts
+  over.
+
+Operations: after a deploy, read `GET /internal/v1/<region>/accounts`; it never logs in. Do not
+probe `/internal/v1/<region>/account` in every region, because each probe can log the first
+account in. To retry a refused identity early, stop the service, delete its state file and
+start again.
 
 ### Bootstrap and verification
 

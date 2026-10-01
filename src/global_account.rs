@@ -44,6 +44,13 @@ pub struct LoginConfig {
     pub aegis_cooldown_seconds: u64,
     /// `CONCURRENT_DEVICE` signals per rolling 24 hours that disable the account.
     pub concurrent_device_limit: u32,
+    /// Directory keeping each SDK identity's revalidated session and refusal across restarts
+    /// (see [`crate::sdk_session`]). Without it they live in memory only. Every region of a
+    /// deployment must name the same directory.
+    pub state_directory: Option<PathBuf>,
+    /// How long an SDK refusal stops logins of the identity in every region, restarts
+    /// included, before one `cache.login` may try again.
+    pub sdk_refusal_retry_seconds: u64,
 }
 impl Default for LoginConfig {
     fn default() -> Self {
@@ -55,6 +62,8 @@ impl Default for LoginConfig {
             max_logins_per_day: 24,
             aegis_cooldown_seconds: 900,
             concurrent_device_limit: 3,
+            state_directory: None,
+            sdk_refusal_retry_seconds: 86_400,
         }
     }
 }
@@ -71,6 +80,11 @@ impl LoginConfig {
             || !(1..=100).contains(&self.max_logins_per_day)
             || !(60..=86_400).contains(&self.aegis_cooldown_seconds)
             || !(1..=100).contains(&self.concurrent_device_limit)
+            || !(3_600..=30 * 86_400).contains(&self.sdk_refusal_retry_seconds)
+            || self
+                .state_directory
+                .as_ref()
+                .is_some_and(|d| d.as_os_str().is_empty())
         {
             return Err(AppError::Config(
                 "global_login values exceed supported bounds",
@@ -185,10 +199,9 @@ pub(crate) struct Session {
 #[derive(Default)]
 pub(crate) struct LoginState {
     pub session: Option<Arc<Session>>,
-    /// SDK identity revalidated by `cache.login` in this process (refreshed `id_token`).
-    pub sdk: Option<SdkAccount>,
-    /// Set by TOKEN_* signals: the next login starts with `cache.login` again.
-    pub sdk_stale: bool,
+    /// Generation of the shared SDK session the last PlayerLogin used (see
+    /// [`crate::sdk_session::SdkSession::mark_stale`]).
+    pub sdk_generation: u64,
     /// Login attempts (SDK + PlayerLogin) within the last 24 hours.
     pub attempts: VecDeque<Instant>,
     pub last_login_at: Option<DateTime<Utc>>,
@@ -232,16 +245,23 @@ impl LoginState {
     }
 }
 
-/// One configured Global account: its identity, optional region pin and login state.
+/// One configured Global account: its identity, optional region pin, login state and the SDK
+/// session it shares with the other regions' accounts of the same identity.
 pub(crate) struct GlobalAccount {
     pub identity: Identity,
     pub expected_player_id: Option<String>,
+    pub sdk: Arc<crate::sdk_session::SdkSession>,
     pub state: std::sync::Mutex<LoginState>,
 }
 impl GlobalAccount {
-    pub fn new(identity: Identity, region: Region) -> Self {
+    pub fn new(
+        identity: Identity,
+        region: Region,
+        sessions: &crate::sdk_session::SdkSessions,
+    ) -> Self {
         Self {
             expected_player_id: identity.players.get(region.name()).cloned(),
+            sdk: sessions.session(&identity.sdk),
             identity,
             state: std::sync::Mutex::new(LoginState::default()),
         }

@@ -156,6 +156,10 @@ pub struct AccountStatus {
     /// Global only: the SDK's numeric code when `last_error_code` is `SDK_REFUSED`.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_sdk_code: Option<i64>,
+    /// Global only: the identity's SDK session, shared by every region: `none`, `valid`,
+    /// `stale`, `expired` or `refused`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sdk_session: Option<&'static str>,
 }
 pub(crate) struct Pool {
     entries: Vec<Arc<Account>>,
@@ -384,9 +388,12 @@ impl Account {
             s.last_sdk_code = None;
         }
         let invalidate = |sdk_stale: bool| {
+            if sdk_stale {
+                let generation = g.state().sdk_generation;
+                g.sdk.mark_stale(generation);
+            }
             let mut s = g.state();
             s.session = None;
-            s.sdk_stale |= sdk_stale;
             s.invalidations = s.invalidations.saturating_add(1);
             s.invalidations
         };
@@ -437,7 +444,21 @@ impl Account {
     }
 }
 impl Pool {
+    /// Loads with memory-only SDK sessions of its own.
+    #[cfg(test)]
     pub fn load(config: &Config, generation: u64) -> Result<Self, AppError> {
+        Self::load_with(
+            config,
+            generation,
+            &*crate::sdk_session::SdkSessions::open(None)?,
+        )
+    }
+    /// Loads with the deployment's shared SDK sessions.
+    pub(crate) fn load_with(
+        config: &Config,
+        generation: u64,
+        sessions: &crate::sdk_session::SdkSessions,
+    ) -> Result<Self, AppError> {
         validate(config)?;
         let legacy;
         let entries = if config.accounts.is_empty() {
@@ -466,7 +487,11 @@ impl Pool {
                 if !ids.insert(format!("global:{}", identity.sdk.uid)) {
                     return Err(AppError::Config("invalid or duplicate account identity"));
                 }
-                Source::Global(Box::new(GlobalAccount::new(identity, config.region)))
+                Source::Global(Box::new(GlobalAccount::new(
+                    identity,
+                    config.region,
+                    sessions,
+                )))
             } else {
                 let credentials = if let Some(path) = &c.credentials_file {
                     let bytes = read_private_file(
@@ -620,6 +645,7 @@ impl Pool {
                     logins_24h: None,
                     last_error_code: None,
                     last_sdk_code: None,
+                    sdk_session: None,
                 };
                 if let Some(g) = a.global() {
                     let mut s = g.state();
@@ -639,6 +665,7 @@ impl Pool {
                     status.logins_24h = Some(s.attempts.len());
                     status.last_error_code = s.last_error_code.clone();
                     status.last_sdk_code = s.last_sdk_code;
+                    status.sdk_session = Some(g.sdk.label(chrono::Utc::now()));
                 }
                 status
             })

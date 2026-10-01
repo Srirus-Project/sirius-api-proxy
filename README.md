@@ -20,7 +20,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
-The full proxy baseline is JP 1.0.4 (an additive update of iOS 1.0.3, extracted from the Android client); Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version (**1.3.2**) is
+The full proxy baseline is JP 1.0.4 (an additive update of iOS 1.0.3, extracted from the Android client); Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version (**1.3.3**) is
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 

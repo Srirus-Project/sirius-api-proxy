@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.3.3
+
+- Global accounts: the regions of a deployment share one SDK session per identity.
+  - Before, each region ran its own `cache.login` for the same identity, and again after every
+    restart: three SDK logins within a second per restart. On 2026-10-01 production identities
+    were blocked by the SDK's risk control (code 900200).
+  - Now `cache.login` runs once per identity and the other regions reuse the result while the
+    `id_token` is valid (JWT `exp` minus 5 minutes) and no `TOKEN_*` signal marked it stale.
+- An SDK refusal (`SDK_REFUSED`, and now also `SDK_CAPTCHA`) is shared too. Every region
+  disables the account without sending anything, and the identity is not retried for
+  `global_login.sdk_refusal_retry_seconds` (default 86400; 3600..2592000), across account
+  reloads too.
+- A request that waited for another region's `cache.login` does not repeat it when it failed;
+  it answers 503 `upstream_unavailable`. A `TOKEN_*` signal about an `id_token` that another
+  region has already replaced no longer invalidates the new one.
+  - Before, a reload retried at once. A reload still starts a new session when the identity
+    file holds another access key.
+- New optional `global_login.state_directory` keeps each identity's SDK session and refusal
+  across restarts.
+  - Files are private and atomic, and never hold the access key. A restart within the `id_token`
+    lifetime sends no SDK request; a restart under a refusal sends nothing.
+  - `global-account verify` and the service share it safely. They serialize `cache.login` with a
+    lock file and keep each other's newer refusal.
+  - Every region of a deployment must name the same directory.
+- Account status adds `sdk_session` (`none`, `valid`, `stale`, `expired`, `refused`).
+  `global-account verify` reports `sdk_cache_login: reused` when it reused a persisted session.
+
 ## 1.3.2
 
 - JP protocol 1.0.4 is the default (`protocol/sirius/1.0.4`, native codecs). It is the same
