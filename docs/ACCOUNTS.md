@@ -230,7 +230,8 @@ re-reads the identity file.
 `GET /internal/v1/accounts` adds these fields for Global accounts: `session_state` (`none`,
 `active`, `relogin_pending`, `cooling` or `disabled`), `last_login_at`, `logins_24h` and
 `last_error_code` (an application or SDK code such as `TOKEN_ILLEGAL` or `SDK_CAPTCHA`, never
-text). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
+text) and, after `SDK_REFUSED`, `last_sdk_code` (the SDK's numeric refusal code, also logged as
+`sdk_code`; it tells an invalidated identity from a risk-control block). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
 or response cache keys. Response cache keys use the account name and SDK uid (hashed), not the
 rotating credential, so a re-login keeps cached public responses.
 

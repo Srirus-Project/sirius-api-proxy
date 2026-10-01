@@ -1433,7 +1433,11 @@ impl GameClient {
                     refreshed
                 }
                 Err(error) => {
-                    g.state().last_error_code = Some(error.code().into());
+                    {
+                        let mut s = g.state();
+                        s.last_error_code = Some(error.code().into());
+                        s.last_sdk_code = error.sdk_code();
+                    }
                     // Transient failures belong to the SDK path; the login interval and daily
                     // cap already bound this account's retries.
                     if !error.transient() {
@@ -1441,6 +1445,7 @@ impl GameClient {
                     }
                     tracing::warn!(
                         error_code = error.code(),
+                        sdk_code = error.sdk_code(),
                         account = %account.name,
                         region,
                         "Global SDK cache.login failed; no retry"
@@ -1495,7 +1500,11 @@ impl GameClient {
             .as_ref()
             .is_some_and(|expected| expected != &session.player_id)
         {
-            g.state().last_error_code = Some("PLAYER_MISMATCH".into());
+            {
+                let mut s = g.state();
+                s.last_error_code = Some("PLAYER_MISMATCH".into());
+                s.last_sdk_code = None;
+            }
             account.disable();
             tracing::error!(
                 error_code = "PLAYER_MISMATCH",

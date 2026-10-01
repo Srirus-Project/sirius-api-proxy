@@ -149,6 +149,7 @@ fn permitted(name: &str) -> bool {
             | "profile"
             | "target"
             | "node"
+            | "sdk_code"
             | "cooldown_ms"
             | "failover"
     )

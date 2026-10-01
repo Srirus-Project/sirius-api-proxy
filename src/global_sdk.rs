@@ -155,6 +155,14 @@ impl SdkError {
             Self::Protocol => "SDK_PROTOCOL",
         }
     }
+    /// The SDK's numeric refusal code. It is not secret and tells an operator why the SDK
+    /// refused (for example an invalidated access key versus a risk-control block).
+    pub fn sdk_code(self) -> Option<i64> {
+        match self {
+            Self::Refused(code) => Some(code),
+            _ => None,
+        }
+    }
     /// Transient failures count toward the SDK path health and never cool an account; all
     /// others need an operator.
     pub fn transient(self) -> bool {

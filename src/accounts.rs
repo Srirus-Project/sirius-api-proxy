@@ -153,6 +153,9 @@ pub struct AccountStatus {
     /// Global only: last application or SDK error class (`[A-Z0-9_]`), never text.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error_code: Option<String>,
+    /// Global only: the SDK's numeric code when `last_error_code` is `SDK_REFUSED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_sdk_code: Option<i64>,
 }
 pub(crate) struct Pool {
     entries: Vec<Arc<Account>>,
@@ -361,6 +364,7 @@ impl Account {
                 let mut s = g.state();
                 s.invalidations = 0;
                 s.last_error_code = None;
+                s.last_sdk_code = None;
                 return;
             }
             Err(error) => error,
@@ -375,7 +379,9 @@ impl Account {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         });
         if let Some(code) = code {
-            g.state().last_error_code = Some(code.to_owned());
+            let mut s = g.state();
+            s.last_error_code = Some(code.to_owned());
+            s.last_sdk_code = None;
         }
         let invalidate = |sdk_stale: bool| {
             let mut s = g.state();
@@ -613,6 +619,7 @@ impl Pool {
                     last_login_at: None,
                     logins_24h: None,
                     last_error_code: None,
+                    last_sdk_code: None,
                 };
                 if let Some(g) = a.global() {
                     let mut s = g.state();
@@ -631,6 +638,7 @@ impl Pool {
                     status.last_login_at = s.last_login_at;
                     status.logins_24h = Some(s.attempts.len());
                     status.last_error_code = s.last_error_code.clone();
+                    status.last_sdk_code = s.last_sdk_code;
                 }
                 status
             })

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+
+- Global accounts: an `SDK_REFUSED` login now reports the SDK's numeric refusal code as
+  `last_sdk_code` in the account status and as `sdk_code` in the warning, so an operator can tell
+  why the SDK refused an identity. Previously only `SDK_REFUSED` was visible.
+
 ## 1.3.0
 
 The remaining batches of the second comparison with the original (Haruki-Sekai-API `9a53714`), adapted

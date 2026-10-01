@@ -21131,6 +21131,22 @@ mod global_accounts {
         c.reload_accounts().await.unwrap();
         c.call(PLAYER_DATA, json!({})).await.unwrap();
         assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert!(status(&c).get("last_sdk_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_refusal_reports_the_numeric_sdk_code_for_the_operator() {
+        let e = env(Region::En).await;
+        e.sdk.codes.lock().unwrap().push_back(500_001);
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let s = status(&c);
+        assert_eq!(s["disabled"], true);
+        assert_eq!(s["last_error_code"], "SDK_REFUSED");
+        assert_eq!(s["last_sdk_code"], 500_001);
+        c.reload_accounts().await.unwrap();
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert!(status(&c).get("last_sdk_code").is_none());
     }
 
     #[tokio::test]

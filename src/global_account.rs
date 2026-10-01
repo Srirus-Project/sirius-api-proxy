@@ -193,6 +193,8 @@ pub(crate) struct LoginState {
     pub attempts: VecDeque<Instant>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub last_error_code: Option<String>,
+    /// The SDK's numeric code when the last error was `SDK_REFUSED`.
+    pub last_sdk_code: Option<i64>,
     /// Session invalidations since the last successful authenticated call.
     pub invalidations: u32,
     pub concurrent_device: VecDeque<Instant>,
