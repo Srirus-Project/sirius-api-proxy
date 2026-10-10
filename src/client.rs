@@ -2296,6 +2296,7 @@ fn sdk_client(config: &Config) -> Result<Option<crate::global_sdk::SdkClient>, A
     crate::global_sdk::SdkClient::new(
         &login.sdk_origin,
         key,
+        &config.client_version,
         Duration::from_millis(login.sdk_timeout_ms),
         proxy,
     )

@@ -319,6 +319,8 @@ pub struct BootstrapOptions {
     pub identity_file: PathBuf,
     pub sdk_origin: String,
     pub app_key_env: String,
+    /// The client version sent as the SDK `app_ver` (the current Global APK version name).
+    pub client_version: String,
     /// Without it the command is an offline plan and sends nothing.
     pub create_sdk_guest: bool,
 }
@@ -341,7 +343,7 @@ fn write_private(path: &Path, value: &Value) -> Result<(), &'static str> {
         .and_then(|_| file.sync_all())
         .map_err(|_| "cannot write the private output file")
 }
-fn attempt_marker(identity: &Path) -> PathBuf {
+pub(crate) fn attempt_marker(identity: &Path) -> PathBuf {
     let mut name = identity.as_os_str().to_owned();
     name.push(".attempt.json");
     PathBuf::from(name)
@@ -364,6 +366,9 @@ pub async fn bootstrap(options: &BootstrapOptions) -> Result<Value, &'static str
     let device: Device =
         serde_json::from_slice(&device_bytes).map_err(|_| "invalid device file")?;
     device.validate()?;
+    if semver::Version::parse(&options.client_version).is_err() {
+        return Err("the client version must be a version such as 1.0.3");
+    }
     if !crate::global_sdk::origin_allowed(&options.sdk_origin) {
         return Err("the SDK origin must be one of the official SDK HTTPS origins");
     }
@@ -400,8 +405,14 @@ pub async fn bootstrap(options: &BootstrapOptions) -> Result<Value, &'static str
     }
     let app_key = crate::config::secret(&options.app_key_env)
         .map_err(|_| "the SDK app key environment variable is missing or invalid")?;
-    let client = SdkClient::new(&options.sdk_origin, app_key, Duration::from_secs(25), None)
-        .map_err(|_| "invalid SDK client configuration")?;
+    let client = SdkClient::new(
+        &options.sdk_origin,
+        app_key,
+        &options.client_version,
+        Duration::from_secs(25),
+        None,
+    )
+    .map_err(|_| "invalid SDK client configuration")?;
     write_private(
         &marker,
         &json!({"operation": "tourist.login", "origin": options.sdk_origin, "at": Utc::now(), "retries": 0}),

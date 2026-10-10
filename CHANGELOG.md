@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.4
+
+- Global accounts: the SDK `app_ver` parameter follows the region's `client_version` instead of
+  the fixed `1.0.1`. The official client sends its APK version name, so after the 1.0.2 update
+  the proxy kept presenting an outdated SDK client. The other SDK parameters, the signature and
+  the headers are unchanged in the Global 1.0.3 APK.
+- `global-account bootstrap` requires `--client-version` and rejects an invalid one before
+  anything is sent.
+- Documented that the SDK's server configuration disables guest login for players
+  (`config_tourist_login_switch: 0`) and that guest identities have been refused since 2026-10-01.
+
 ## 1.3.3
 
 - Global accounts: the regions of a deployment share one SDK session per identity.

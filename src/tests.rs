@@ -20632,6 +20632,7 @@ mod global_accounts {
         assert_eq!(
             global_sdk::form_encode(&global_sdk::prepare(
                 &device,
+                "1.0.1",
                 "synthetic-secret",
                 1_700_000_000_123,
                 None
@@ -20647,6 +20648,7 @@ mod global_accounts {
         assert_eq!(
             global_sdk::form_encode(&global_sdk::prepare(
                 &device,
+                "1.0.1",
                 "synthetic-secret",
                 1_700_000_000_123,
                 Some(&cached)
@@ -20776,7 +20778,8 @@ mod global_accounts {
             );
         let (url, task) = super::peer_http_server(app).await;
         let client =
-            global_sdk::SdkClient::new(&url, APP_KEY.into(), Duration::from_secs(5), None).unwrap();
+            global_sdk::SdkClient::new(&url, APP_KEY.into(), "1.0.3", Duration::from_secs(5), None)
+                .unwrap();
         let device: global_sdk::Device = serde_json::from_value(device()).unwrap();
         assert_eq!(
             client.tourist_login(&device).await.err(),
@@ -20795,6 +20798,16 @@ mod global_accounts {
         assert!(global_sdk::SdkClient::new(
             "https://example.com",
             "k".into(),
+            "1.0.3",
+            Duration::from_secs(5),
+            None
+        )
+        .is_err());
+        // The SDK app_ver is the client version and must be a version.
+        assert!(global_sdk::SdkClient::new(
+            global_sdk::DEFAULT_SDK_ORIGIN,
+            "k".into(),
+            "latest",
             Duration::from_secs(5),
             None
         )
@@ -20820,6 +20833,7 @@ mod global_accounts {
             identity_file: identity.clone(),
             sdk_origin: sdk.url.clone(),
             app_key_env: app_key_env(),
+            client_version: "1.0.3".into(),
             create_sdk_guest: false,
         };
         let plan = bootstrap(&options).await.unwrap();
@@ -20827,6 +20841,12 @@ mod global_accounts {
         assert!(sdk.requests.lock().unwrap().is_empty());
         assert!(!identity.exists());
         options.create_sdk_guest = true;
+        // An invalid client version fails before anything is sent or marked.
+        options.client_version = "latest".into();
+        assert!(bootstrap(&options).await.is_err());
+        assert!(sdk.requests.lock().unwrap().is_empty());
+        assert!(!crate::global_account::attempt_marker(&identity).exists());
+        options.client_version = "1.0.3".into();
         let created = bootstrap(&options).await.unwrap();
         assert_eq!(created["sdk_guest_created"], true);
         assert!(!created.to_string().contains(ACCESS_KEY));
@@ -20841,6 +20861,7 @@ mod global_accounts {
             assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
             assert_eq!(form["channel_id"], "100");
             assert_eq!(form["platform"], "google");
+            assert_eq!(form["app_ver"], "1.0.3");
             assert_eq!(form["udid"], UDID);
             assert!(!form.contains_key("access_key"));
         }
@@ -20962,6 +20983,15 @@ mod global_accounts {
         assert_eq!(login.1["x-player-bid"], UID);
         assert_eq!(login.1["x-platform"], "android");
         assert_eq!(login.1["x-client-version"], "1.0.1");
+        // The SDK app_ver follows the configured client version.
+        {
+            let requests = e.sdk.requests.lock().unwrap();
+            let cache = requests
+                .iter()
+                .find(|r| r.0 == global_sdk::CACHE_LOGIN)
+                .unwrap();
+            assert_eq!(cache.2["app_ver"], "1.0.1");
+        }
         let request = DynamicMessage::decode(
             global_pool()
                 .get_message_by_name("app.playerlogin.PlayerLoginRequest")

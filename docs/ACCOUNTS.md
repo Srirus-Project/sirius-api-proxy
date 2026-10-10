@@ -189,7 +189,8 @@ writes it.
 Nothing is sent at startup. The first authenticated request of an account, while holding the
 account's session lock, performs:
 
-1. SDK `POST /gapi/client/cache.login` (signed like the Android SDK). The uid must not change;
+1. SDK `POST /gapi/client/cache.login` (signed like the Android SDK; `app_ver` is the profile's
+   `client_version`, the APK version name the official client sends). The uid must not change;
    the original `access_key` is kept, a new `id_token` is used when returned. It is skipped
    while the identity's [shared SDK session](#shared-sdk-sessions) is valid.
 2. `PlayerLoginService/PlayerLogin` on the region's API endpoint with `area_id` 6,
@@ -299,10 +300,13 @@ Both commands are one-shot and never retry.
    ```bash
    export SIRIUS_GLOBAL_SDK_APP_KEY=...   # the APK one_appkey
    sirius-api-proxy global-account bootstrap --device device.json \
-     --identity /secure/dir/guest-1.json [--sdk-origin https://l12-sdk-login-intl.biligame.net]
+     --identity /secure/dir/guest-1.json --client-version 1.0.3 \
+     [--sdk-origin https://l12-sdk-login-intl.biligame.net]
    sirius-api-proxy global-account bootstrap --device device.json \
-     --identity /secure/dir/guest-1.json --create-sdk-guest
+     --identity /secure/dir/guest-1.json --client-version 1.0.3 --create-sdk-guest
    ```
+
+   `--client-version` is the current Global APK version; it is sent as the SDK `app_ver`.
 
    The directory must be private to its owner (0700). The command writes
    `guest-1.json.attempt.json` before the request and `guest-1.json` (mode 0600) after a
@@ -339,6 +343,13 @@ enabling Global accounts:
   logs the other session out (`CONCURRENT_DEVICE`);
 - do not bypass CAPTCHAs or login queues;
 - review the terms before offering the service to others.
+
+Guest login is not offered to players. The SDK's server configuration (`/gapi/client/config`,
+read on 2026-10-11) has `config_tourist_login_switch: 0`, which is also the APK default, so the
+official client's login menu shows no guest button and players sign in with Google, Apple or
+e-mail. `tourist.login` still answered on 2026-09-27, but every guest identity tried since
+2026-10-01 has been refused with 900200, including identities on their first `cache.login`.
+Expect guest identities to be blocked.
 
 Live verification status: SDK `tourist.login`/`cache.login`, PlayerLogin and GetPlayerData were
 verified against production on all three servers. Profile, ranking, event deck and announcement

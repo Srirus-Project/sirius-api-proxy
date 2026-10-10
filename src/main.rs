@@ -373,7 +373,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const GLOBAL_ACCOUNT_USAGE: &str = "usage: sirius-api-proxy global-account bootstrap --device DEVICE_FILE --identity IDENTITY_FILE [--sdk-origin ORIGIN] [--sdk-app-key-env NAME] [--create-sdk-guest]\n       sirius-api-proxy global-account verify --account NAME [--region hk|en|kr] [--show-player-id]";
+const GLOBAL_ACCOUNT_USAGE: &str = "usage: sirius-api-proxy global-account bootstrap --device DEVICE_FILE --identity IDENTITY_FILE --client-version VERSION [--sdk-origin ORIGIN] [--sdk-app-key-env NAME] [--create-sdk-guest]\n       sirius-api-proxy global-account verify --account NAME [--region hk|en|kr] [--show-player-id]";
 
 /// One-shot Global account operations. `bootstrap` creates an SDK guest identity only with
 /// `--create-sdk-guest`; `verify` performs SDK cache.login and PlayerLogin once for a configured
@@ -391,7 +391,7 @@ async fn global_account(args: &[String]) -> Result<(), Box<dyn std::error::Error
                 }
             }
             "--device" | "--identity" | "--sdk-origin" | "--sdk-app-key-env" | "--account"
-            | "--region" => {
+            | "--region" | "--client-version" => {
                 let value = rest.next().ok_or(GLOBAL_ACCOUNT_USAGE)?;
                 if values.insert(arg, value).is_some() {
                     return Err(GLOBAL_ACCOUNT_USAGE.into());
@@ -422,6 +422,10 @@ async fn global_account(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     .copied()
                     .unwrap_or("SIRIUS_GLOBAL_SDK_APP_KEY")
                     .into(),
+                client_version: values
+                    .get("--client-version")
+                    .ok_or(GLOBAL_ACCOUNT_USAGE)?
+                    .to_string(),
                 create_sdk_guest: flags.contains("--create-sdk-guest"),
             };
             let summary = sirius_api_proxy::global_account::bootstrap(&options).await?;
@@ -435,6 +439,7 @@ async fn global_account(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     "--identity",
                     "--sdk-origin",
                     "--sdk-app-key-env",
+                    "--client-version",
                 ]
                 .iter()
                 .any(|k| values.contains_key(k))

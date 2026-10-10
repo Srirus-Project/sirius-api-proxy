@@ -1,6 +1,6 @@
 //! Global (HK/EN/KR) OneSDK guest requests: `tourist.login` creates a guest identity and
-//! `cache.login` revalidates one. Signing and form encoding follow the Global 1.0.1 Android SDK
-//! (Google channel). Requests go only to the three official HTTPS origins, never follow
+//! `cache.login` revalidates one. Signing and form encoding follow the Global Android SDK
+//! (Google channel; checked against 1.0.1 and 1.0.3). Requests go only to the three official HTTPS origins, never follow
 //! redirects, are never retried and read at most 1 MiB. No value handled here implements Debug,
 //! and nothing here logs request or response contents.
 use md5::{Digest, Md5};
@@ -22,13 +22,15 @@ pub const CAPTCHA_CODE: i64 = 200007;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const USER_AGENT: &str = "Mozilla/5.0 BSGameSDK";
 const ONE_SDK_VERSION: &str = "1.25.0";
-/// Fixed parameters of the Global 1.0.1 Google-channel APK (resources and SDK constants).
+/// Fixed parameters of the Global Google-channel APK (resources and SDK constants, unchanged
+/// from 1.0.1 to 1.0.3). `app_ver`, the APK version name, follows the configured client version.
 /// The HTTP `channel_id` is always 100; it is not the OneSDK global channel 2001.
-const FIXED_PARAMETERS: [(&str, &str); 11] = [
+const LEADING_PARAMETERS: [(&str, &str); 3] = [
     ("game_id", "17703"),
     ("server_id", "16841"),
     ("merchant_id", "1045"),
-    ("app_ver", "1.0.1"),
+];
+const FIXED_PARAMETERS: [(&str, &str); 7] = [
     ("sdk_ver", "4.2.12"),
     ("channel_id", "100"),
     ("platform", "google"),
@@ -233,15 +235,19 @@ pub fn form_encode(parameters: &[(String, String)]) -> String {
     out
 }
 
-/// Signed parameters for `tourist.login` (`cached` = None) or `cache.login`.
+/// Signed parameters for `tourist.login` (`cached` = None) or `cache.login`. `app_ver` is the
+/// client version the request presents (the APK version name).
 pub fn prepare(
     device: &Device,
+    app_ver: &str,
     app_key: &str,
     timestamp_ms: u128,
     cached: Option<&SdkAccount>,
 ) -> Vec<(String, String)> {
-    let mut parameters = FIXED_PARAMETERS
+    let mut parameters = LEADING_PARAMETERS
         .iter()
+        .chain(&[("app_ver", app_ver)])
+        .chain(FIXED_PARAMETERS.iter())
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .chain(
             device
@@ -336,15 +342,21 @@ pub struct SdkClient {
     http: reqwest::Client,
     origin: String,
     app_key: String,
+    app_ver: String,
 }
 impl SdkClient {
+    /// `app_ver` is the client version (semver) the deployment presents to the game.
     pub fn new(
         origin: &str,
         app_key: String,
+        app_ver: &str,
         timeout: Duration,
         proxy: Option<reqwest::Proxy>,
     ) -> Result<Self, SdkError> {
-        if !origin_allowed(origin) || app_key.trim().is_empty() {
+        if !origin_allowed(origin)
+            || app_key.trim().is_empty()
+            || semver::Version::parse(app_ver).is_err()
+        {
             return Err(SdkError::Config);
         }
         let mut builder = reqwest::Client::builder()
@@ -361,6 +373,7 @@ impl SdkClient {
             http: builder.build().map_err(|_| SdkError::Config)?,
             origin: origin.to_owned(),
             app_key,
+            app_ver: app_ver.to_owned(),
         })
     }
     fn now_ms() -> u128 {
@@ -372,7 +385,7 @@ impl SdkClient {
     /// Create a new guest identity. Sent exactly once; never retried.
     pub async fn tourist_login(&self, device: &Device) -> Result<SdkAccount, SdkError> {
         device.validate().map_err(|_| SdkError::Config)?;
-        let parameters = prepare(device, &self.app_key, Self::now_ms(), None);
+        let parameters = prepare(device, &self.app_ver, &self.app_key, Self::now_ms(), None);
         let body = self.post(TOURIST_LOGIN, form_encode(&parameters)).await?;
         interpret(&body, None)
     }
@@ -383,7 +396,13 @@ impl SdkClient {
         account: &SdkAccount,
     ) -> Result<SdkAccount, SdkError> {
         device.validate().map_err(|_| SdkError::Config)?;
-        let parameters = prepare(device, &self.app_key, Self::now_ms(), Some(account));
+        let parameters = prepare(
+            device,
+            &self.app_ver,
+            &self.app_key,
+            Self::now_ms(),
+            Some(account),
+        );
         let body = self.post(CACHE_LOGIN, form_encode(&parameters)).await?;
         interpret(&body, Some(account))
     }
