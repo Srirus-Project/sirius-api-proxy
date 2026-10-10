@@ -1,0 +1,6 @@
+syntax = "proto3";
+package entity;
+message Invitation {
+  repeated string new_invitation_player_ids = 1;
+  bool is_invitation_code_input_already = 2;
+}

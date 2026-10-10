@@ -1892,7 +1892,7 @@ fn region_config_defaults_and_reserved_cn_fail_closed() {
     assert!(cfg.validate().is_ok());
     assert_eq!(
         cfg.protocol_path(),
-        std::path::PathBuf::from("protocol/global/1.0.1")
+        crate::config::default_global_protocol_directory()
     );
     cfg.region = Region::Cn;
     assert!(matches!(cfg.validate(), Err(AppError::Config(_))));
@@ -1908,9 +1908,60 @@ fn region_config_defaults_and_reserved_cn_fail_closed() {
     }
 }
 #[test]
+fn global_1_0_3_fields_decode_natively_and_dynamically() {
+    let loaded =
+        crate::protocol::ProtocolBundle::load(&crate::config::default_global_protocol_directory())
+            .unwrap();
+    assert_eq!(loaded.status.version, "1.0.3");
+    assert_eq!(loaded.status.family, "global");
+    assert_eq!(loaded.status.codec, "native");
+    let dynamic = crate::protocol::ProtocolBundle {
+        pool: loaded.pool.clone(),
+        status: crate::protocol::ProtocolStatus {
+            codec: "dynamic",
+            ..loaded.status.clone()
+        },
+    };
+    // 1.0.1 stays loadable for a restart-based rollback; it has its own fingerprint, so it runs
+    // with dynamic codecs and drops the 1.0.3 fields.
+    let rollback =
+        crate::protocol::ProtocolBundle::load(std::path::Path::new("protocol/global/1.0.1"))
+            .unwrap();
+    assert_eq!(rollback.status.version, "1.0.1");
+    assert_eq!(rollback.status.family, "global");
+    assert_eq!(rollback.status.codec, "dynamic");
+    let cases = [
+        (
+            crate::routes::ANNOUNCEMENT,
+            json!({"announcement":{"title":"t","platform":"ANNOUNCEMENT_PLATFORM_ANDROID"}}),
+            "/announcement/platform",
+            json!("ANNOUNCEMENT_PLATFORM_ANDROID"),
+        ),
+        (
+            crate::routes::PLAYER_DATA,
+            json!({"playerData":{"characterCurrentCostumes":[{"characterId":"7","costumeTarget":2,"costumeGroupId":"9"}],
+                "characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]},
+                "notification":{"characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]}}),
+            "/playerData/characterCurrentCostumes/0/costumeGroupId",
+            json!("9"),
+        ),
+    ];
+    for (route, value, pointer, expected) in cases {
+        let method = crate::protocol::method(&loaded.pool, route).unwrap();
+        let bytes = DynamicMessage::deserialize(method.output(), value)
+            .unwrap()
+            .encode_to_vec();
+        let native = loaded.decode(route, &bytes).unwrap();
+        assert_eq!(native.pointer(pointer), Some(&expected), "{route}");
+        assert_eq!(native, dynamic.decode(route, &bytes).unwrap(), "{route}");
+        let old = rollback.decode(route, &bytes).unwrap();
+        assert_eq!(old.pointer(pointer), None, "{route}");
+    }
+}
+#[test]
 fn global_native_codec_and_protocol_family_are_independent() {
     let bundle =
-        crate::protocol::ProtocolBundle::load(std::path::Path::new("protocol/global/1.0.1"))
+        crate::protocol::ProtocolBundle::load(&crate::config::default_global_protocol_directory())
             .unwrap();
     assert_eq!(bundle.status.codec, "native");
     assert_eq!(bundle.status.family, "global");
@@ -2041,7 +2092,8 @@ fn known_region_endpoints_cannot_be_relabelled() {
 #[tokio::test]
 async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     let temp = tempfile::tempdir().unwrap();
-    let source = std::path::Path::new("protocol/global/1.0.1");
+    let source = crate::config::default_global_protocol_directory();
+    let source = source.as_path();
     copy_tree(source, temp.path());
     let mut cfg = config();
     cfg.region = crate::region::Region::En;
@@ -2059,7 +2111,7 @@ async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     assert_eq!(changed.family, "global");
     std::fs::write(
         temp.path().join("bundle.json"),
-        r#"{"version":"1.0.1","family":"jp"}"#,
+        r#"{"version":"1.0.3","family":"jp"}"#,
     )
     .unwrap();
     assert!(c.reload_protocol().await.is_err());
@@ -20036,7 +20088,7 @@ async fn global_resource_snapshot_uses_version_body_and_anonymous_catalog_hash()
         assert_eq!(value["schema_version"], 3, "{n}");
         assert_eq!(value["region"], n);
         assert_eq!(value["platform"], "Android");
-        assert_eq!(value["protocol_version"], "1.0.1");
+        assert_eq!(value["protocol_version"], "1.0.3");
         assert_eq!(value["master_version"], "master-fixture");
         assert_eq!(value["resource_version"], "1.0.0.104");
         assert_eq!(value["platform_hash"], SYNTHETIC_CATALOG_HASH);
@@ -20259,9 +20311,11 @@ mod global_accounts {
     fn global_pool() -> &'static DescriptorPool {
         static POOL: std::sync::OnceLock<DescriptorPool> = std::sync::OnceLock::new();
         POOL.get_or_init(|| {
-            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1"))
-                .unwrap()
-                .pool
+            crate::protocol::ProtocolBundle::load(
+                &crate::config::default_global_protocol_directory(),
+            )
+            .unwrap()
+            .pool
         })
     }
     fn gmsg(name: &str, value: Value) -> Vec<u8> {
@@ -20661,8 +20715,10 @@ mod global_accounts {
 
     #[test]
     fn player_login_wire_format_matches_verified_probe_bytes() {
-        let bundle =
-            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1")).unwrap();
+        let bundle = crate::protocol::ProtocolBundle::load(
+            &crate::config::default_global_protocol_directory(),
+        )
+        .unwrap();
         assert_eq!(bundle.status.codec, "native");
         let sdk = global_sdk::SdkAccount {
             uid: "4242".into(),
@@ -24742,7 +24798,11 @@ fn perf_stages() {
     let mut ranking = None;
     for (family, directory, routes) in [
         ("jp", crate::config::default_protocol_directory(), ROUTES),
-        ("global", "protocol/global/1.0.1".into(), GLOBAL_ROUTES),
+        (
+            "global",
+            crate::config::default_global_protocol_directory(),
+            GLOBAL_ROUTES,
+        ),
     ] {
         let native = ProtocolBundle::load(&directory).unwrap();
         assert_eq!(native.status.codec, "native");

@@ -1,0 +1,48 @@
+syntax = "proto3";
+package entity;
+message LiveScore {
+  int32 high_score = 1;
+  int32 clear_status = 2;
+  int64 music_id = 3;
+  int32 difficulty = 4;
+  int32 mode = 5;
+  int32 max_combo = 6;
+}
+message LiveMusicReward {
+  int64 music_id = 1;
+  int32 score_rank_reward_gained = 2;
+  int32 combo_reward_gained = 3;
+}
+message LiveMusicComboReward {
+  int64 music_id = 1;
+  int32 difficulty = 2;
+  int32 combo_reward_gained = 3;
+}
+message LiveSkip {
+  int32 count = 1;
+  int64 last_skip = 2;
+}
+message LiveMusic {
+  int64 music_id = 1;
+  int64 got_at = 2;
+}
+message LiveSetting {
+  bytes setting_all = 1;
+}
+message LiveLaneSkin {
+  int64 master_id = 1;
+}
+message LiveNoteSkin {
+  int64 master_id = 1;
+}
+message LiveNoteEffectSkin {
+  int64 master_id = 1;
+}
+message LiveNoteSeGroup {
+  int64 master_id = 1;
+}
+message LiveStampReward {
+  int32 live_completed = 1;
+  int32 reward_gained = 2;
+  int64 last_live_completed_at = 3;
+}

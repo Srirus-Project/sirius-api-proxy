@@ -1,0 +1,25 @@
+syntax = "proto3";
+package app.player;
+import "entity/player.proto";
+import "entity/notification.proto";
+import "entity/limitation.proto";
+import "entity/friend.proto";
+import "entity/invitation.proto";
+message GetPlayerDataRequest {
+}
+message GetPlayerDataResponse {
+  .entity.PlayerData player_data = 1;
+  .entity.Notification notification = 2;
+  .entity.Limitation limitation = 3;
+  .entity.Friends friends = 4;
+  .entity.Invitation invitation = 5;
+  int64 accountid = 6;
+  int64 world_room_id = 7;
+  string iap_google_account_binding = 8;
+  string iap_apple_account_binding = 9;
+  int32 chat_report_used_today = 100;
+  repeated int64 room_ids = 101;
+}
+service PlayerService {
+  rpc GetPlayerData (.app.player.GetPlayerDataRequest) returns (.app.player.GetPlayerDataResponse);
+}

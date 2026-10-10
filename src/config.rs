@@ -201,6 +201,10 @@ pub fn default_protocol_directory() -> std::path::PathBuf {
     "protocol/sirius/1.0.4".into()
 }
 
+pub fn default_global_protocol_directory() -> std::path::PathBuf {
+    "protocol/global/1.0.3".into()
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasterUpdateConfig {
@@ -304,7 +308,7 @@ impl Config {
         if self.region.family() == "global"
             && self.protocol_directory == default_protocol_directory()
         {
-            "protocol/global/1.0.1".into()
+            default_global_protocol_directory()
         } else {
             self.protocol_directory.clone()
         }

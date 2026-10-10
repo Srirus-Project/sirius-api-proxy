@@ -1,0 +1,13 @@
+syntax = "proto3";
+package entity;
+enum LimitationType {
+  NONE = 0;
+  WARNING = 1;
+  BAN_BILLING = 2;
+  BAN_ACCOUNT = 3;
+}
+message Limitation {
+  .entity.LimitationType limitation_type = 1;
+  string message = 2;
+  int64 limitation_id = 3;
+}

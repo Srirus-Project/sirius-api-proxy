@@ -1,0 +1,25 @@
+syntax = "proto3";
+package entity;
+message MissionCounter {
+  int32 mission_type = 1;
+  int64 param_1 = 2;
+  int64 param_2 = 3;
+  int64 progress = 4;
+}
+message MissionProgress {
+  int64 mission_id = 1;
+  int64 start_count = 2;
+  bool is_completed = 3;
+  bool is_received = 4;
+  int64 start_at = 5;
+}
+message CharacterMissionReceived {
+  int64 character_id = 1;
+  repeated int64 mission_ids = 2;
+}
+message PlayerMissionData {
+  repeated .entity.MissionCounter mission_counters = 1;
+  repeated .entity.MissionProgress normal_missions = 2;
+  repeated .entity.MissionProgress limited_missions = 3;
+  repeated .entity.CharacterMissionReceived character_missions = 4;
+}

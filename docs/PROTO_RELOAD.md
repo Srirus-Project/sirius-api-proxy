@@ -102,7 +102,7 @@ unused game RPCs/types and custom options other than skip_authentication.
 ## Protocol families
 
 JP manifests may omit `family` (default `jp`). Global manifests must specify
-`{"version":"1.0.1","family":"global"}`. The selected region fixes the family; startup
+`{"version":"1.0.3","family":"global"}`. The selected region fixes the family; startup
 and reload reject mismatches. Each family has an independently generated native fingerprint.
 Changing family or region requires a separately configured instance, not a hot reload.
 The Global route allowlist is Version, GetServerList, the JP read RPCs except Whoami, and the

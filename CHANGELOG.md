@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.6
+
+- Global protocol 1.0.3 is the default for HK/EN/KR (`protocol/global/1.0.3`, native codecs). It
+  is the same eleven-RPC subset as 1.0.1, extracted from the official Global 1.0.3 Android client,
+  and only adds definitions, the same ones JP gained in 1.0.4: `Announcement.platform`
+  (`AnnouncementPlatform`), the costume fields of `PlayerData` and `Notification` (new
+  `entity/character_costume.proto`) and `ResourceType.RESOURCE_TYPE_CHARACTER_UNLOCKED_COSTUME`.
+  Before, these fields were dropped. `PlayerLogin`, `GetServerList` and the other messages are
+  unchanged. `protocol/global/1.0.1` stays for a restart-based rollback; a running service on
+  1.0.3 cannot hot-reload back to 1.0.1.
+- HK/EN/KR resource snapshots from the default bundle report `protocol_version` 1.0.3. Asset
+  updater profiles must set `protocol_version: 1.0.3` together with the proxy switch.
+- The examples use the current client versions: JP 1.0.5 and Global 1.0.3. The JP 1.0.5 client
+  embeds the same protocol as 1.0.4 (its string literal table is identical), so JP stays on
+  `protocol/sirius/1.0.4`.
+
 ## 1.3.5
 
 - Global SDK keepalive. Each `cache.login` extends the SDK `access_key` to 30 days after the call,

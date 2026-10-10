@@ -103,7 +103,7 @@ impl Region {
         match self {
             Self::Jp => "1.0.4",
             Self::Cn => "",
-            _ => "1.0.1",
+            _ => "1.0.3",
         }
     }
     pub fn matches_known_service(self, host: &str, path: &str) -> bool {

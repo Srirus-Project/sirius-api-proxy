@@ -8,9 +8,9 @@ one protocol family and cannot switch regions or account identity.
 | Region | Game selection | Area ID | Default platform | Protocol family | Current capability |
 | --- | --- | --- | --- | --- | --- |
 | `jp` | Japan | Not inferred | `iOS` | JP 1.0.4 | Existing JP proxy, verified download/export pipeline and Master data |
-| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.1 | Server discovery, version, SDK guest accounts and the JP proxy operations (see [Global operations](#global-operations)), Master data and resource snapshots |
-| `en` | EN Region | 3 | `Android` | Global 1.0.1 | Same as `hk` |
-| `kr` | Korea | 4 | `Android` | Global 1.0.1 | Same as `hk` |
+| `hk` | TW/HK/MO | 2 | `Android` | Global 1.0.3 | Server discovery, version, SDK guest accounts and the JP proxy operations (see [Global operations](#global-operations)), Master data and resource snapshots |
+| `en` | EN Region | 3 | `Android` | Global 1.0.3 | Same as `hk` |
+| `kr` | Korea | 4 | `Android` | Global 1.0.3 | Same as `hk` |
 | `cn` | Reserved | Unknown | Not operational | Not supplied | Configuration is recognized but startup/check rejects it |
 
 The Traditional Chinese (TW/HK/MO) region is `hk`, the identifier the game itself uses (CDN
@@ -26,7 +26,8 @@ never paste the whole list into an endpoint. No automatic endpoint switching is 
 ## API proxy
 
 Omitting `region` preserves JP behavior. `platform` accepts exactly `iOS` or `Android`; when
-omitted it follows the table. A Global instance selects `protocol/global/1.0.1` by default;
+omitted it follows the table. A Global instance selects `protocol/global/1.0.3` by default (since 1.3.6;
+`protocol/global/1.0.1` stays in the repository and image for a restart-based rollback);
 an explicit protocol path must have the matching family. The existing JP default path remains
 `protocol/sirius/1.0.4` (since 1.3.2; `protocol/sirius/1.0.3` stays in the repository and image for a
 restart-based rollback). Both bundles generate native prost/pbjson codecs at build time. Exact
@@ -265,7 +266,10 @@ Configure the same region, platform, client version and protocol version as the 
 `protocol_version` defaults to 1.0.3 for JP and 1.0.1 for HK/EN/KR in the asset updater; it can be
 pinned explicitly when deploying a new verified bundle. Since API 1.3.2 JP snapshots report
 `protocol_version: 1.0.4` and `client_version: 1.0.4`, so a JP updater profile must set both to
-1.0.4 until the updater's own default follows. `cdn_roots` matches the entire HTTPS base URL, including
+1.0.4 until the updater's own default follows. Likewise, since API 1.3.6 HK/EN/KR snapshots from the
+default Global bundle report `protocol_version: 1.0.3`; switch the proxy bundle and the updater
+profiles' `protocol_version` together. The updater's export cache is scoped by client and protocol
+version, so the first job after the switch exports every bundle again. `cdn_roots` matches the entire HTTPS base URL, including
 its path. Username/password environment references belong only to that configured base URL.
 Redirects remain disabled and unknown roots/references are rejected before CDN requests.
 
