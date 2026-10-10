@@ -71,6 +71,7 @@ pub struct Prepared {
     pub notifiers: Vec<crate::master_notify::Worker>,
     pub syncers: Vec<Arc<crate::master_sync::Syncer>>,
     pub asset_dispatchers: Vec<crate::asset_dispatch::Worker>,
+    pub sdk_keepalives: Vec<crate::sdk_keepalive::Worker>,
 }
 
 impl DeploymentConfig {
@@ -343,6 +344,7 @@ impl DeploymentConfig {
         let mut updaters = Vec::new();
         let mut syncers = Vec::new();
         let mut asset_dispatchers = Vec::new();
+        let mut sdk_keepalives = Vec::new();
         // One SDK session per Global identity for the whole deployment (validated: every
         // region names the same state directory).
         let sdk_sessions = crate::sdk_session::SdkSessions::open(
@@ -355,6 +357,7 @@ impl DeploymentConfig {
             configs.into_iter().zip(tokens).zip(peer_tokens)
         {
             let client = GameClient::with_sdk_sessions(c.clone(), sdk_sessions.clone())?;
+            sdk_keepalives.extend(crate::sdk_keepalive::Worker::for_client(client.clone()));
             let dispatcher = if c.asset_dispatch.is_some() {
                 Some(crate::asset_dispatch::Worker::new(c, client.clone())?)
             } else {
@@ -427,6 +430,7 @@ impl DeploymentConfig {
             git_publishers,
             database_publishers,
             asset_dispatchers,
+            sdk_keepalives,
         })
     }
 }

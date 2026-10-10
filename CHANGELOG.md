@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.5
+
+- Global SDK keepalive. Each `cache.login` extends the SDK `access_key` to 30 days after the call,
+  and the SDK has no refresh token. A region whose game session stays up, or an idle deployment,
+  never sends `cache.login`, so the key could lapse.
+  - Each region with Global accounts now checks once an hour (first check one hour after
+    startup). It revalidates identities whose last successful `cache.login` is
+    `global_login.sdk_keepalive_seconds` old (default 20 days; 1..28 days).
+  - Regions sharing an identity revalidate it once. The keepalive keeps the game session,
+    respects the login interval and daily cap, and skips refused or disabled identities and
+    identities never revalidated by the deployment.
+- The persisted SDK session keeps the time of the last `cache.login` even after its `id_token`
+  expires or a `TOKEN_*` signal drops it, so the keepalive works across restarts.
+- Account status adds `sdk_validated_at`, the identity's last successful `cache.login`.
+
 ## 1.3.4
 
 - Global accounts: the SDK `app_ver` parameter follows the region's `client_version` instead of

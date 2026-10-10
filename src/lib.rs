@@ -26,6 +26,7 @@ pub mod accounts;
 
 pub mod global_account;
 pub mod global_sdk;
+pub mod sdk_keepalive;
 mod sdk_session;
 
 pub mod response_cache;

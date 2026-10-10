@@ -22370,6 +22370,85 @@ regions:
             Some(Path::new("/data/sdk-sessions"))
         );
         assert_eq!(parsed.sdk_refusal_retry_seconds, 172_800);
+        // Keepalive: 20 days by default, 1..28 days (the access_key lapses after 30).
+        assert_eq!(login.sdk_keepalive_seconds, 20 * 86_400);
+        for keepalive in [86_399, 28 * 86_400 + 1] {
+            login.sdk_keepalive_seconds = keepalive;
+            assert!(login.validate().is_err());
+        }
+        login.sdk_keepalive_seconds = 86_400;
+        login.validate().unwrap();
+        let parsed: LoginConfig = yaml_serde::from_str("sdk_keepalive_seconds: 604800\n").unwrap();
+        assert_eq!(parsed.sdk_keepalive_seconds, 604_800);
+    }
+
+    /// Rewrites the deployment's persisted SDK session as last revalidated `days` ago, and
+    /// optionally refused just now.
+    fn age_state(d: &Shared, days: i64, refused: bool) {
+        let files = d.state_files();
+        assert_eq!(files.len(), 1);
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        state["validated_at"] = json!(chrono::Utc::now() - chrono::Duration::days(days));
+        if refused {
+            state["refusal"] = json!({"code": 900200, "at": chrono::Utc::now()});
+        }
+        write_private(&files[0], &state);
+    }
+
+    #[tokio::test]
+    async fn sdk_keepalive_revalidates_an_old_identity_once_across_regions() {
+        let d = shared(true).await;
+        // Never revalidated by this deployment: nothing is sent.
+        let fresh = d.start();
+        assert_eq!(fresh[0].sdk_keepalive().await, 0);
+        assert!(crate::sdk_keepalive::Worker::for_client(fresh[0].clone()).is_some());
+        fresh[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert!(status(&fresh[0])["sdk_validated_at"].is_string());
+        // Recently revalidated: not due.
+        assert_eq!(fresh[1].sdk_keepalive().await, 0);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        drop(fresh);
+        // 21 days later (restart in between): both regions check concurrently, one
+        // cache.login, no PlayerLogin, and the identity is fresh again.
+        age_state(&d, 21, false);
+        let clients = d.start();
+        // The persisted id_token cannot be reused (it carries no exp), yet the time of the last
+        // cache.login survives the restart and drives the keepalive.
+        assert_eq!(status(&clients[0])["sdk_session"], "none");
+        assert!(status(&clients[0])["sdk_validated_at"].is_string());
+        let logins: Vec<usize> = d
+            .regions
+            .iter()
+            .map(|(_, f, _)| count(f, PLAYER_LOGIN))
+            .collect();
+        let (a, b) = tokio::join!(clients[0].sdk_keepalive(), clients[1].sdk_keepalive());
+        assert_eq!(a + b, 1);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        let after: Vec<usize> = d
+            .regions
+            .iter()
+            .map(|(_, f, _)| count(f, PLAYER_LOGIN))
+            .collect();
+        assert_eq!(after, logins);
+        let validated: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(status(&clients[1])["sdk_validated_at"].clone()).unwrap();
+        assert!(chrono::Utc::now() - validated < chrono::Duration::minutes(1));
+        assert_eq!(clients[0].sdk_keepalive().await, 0);
+        // The revalidated session serves the next login without another cache.login.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_keepalive_never_revalidates_a_refused_identity() {
+        let d = shared(true).await;
+        d.start()[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        age_state(&d, 25, true);
+        let clients = d.start();
+        assert_eq!(status(&clients[0])["sdk_session"], "refused");
+        assert_eq!(clients[0].sdk_keepalive().await, 0);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
     }
 }
 

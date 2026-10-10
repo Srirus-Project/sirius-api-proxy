@@ -344,6 +344,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     workers.extend(
         prepared
+            .sdk_keepalives
+            .into_iter()
+            .map(|worker| tokio::spawn(worker.run(receiver.clone()))),
+    );
+    workers.extend(
+        prepared
             .database_publishers
             .into_iter()
             .map(|worker| tokio::spawn(worker.run(receiver.clone()))),

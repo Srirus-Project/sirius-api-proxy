@@ -51,6 +51,10 @@ pub struct LoginConfig {
     /// How long an SDK refusal stops logins of the identity in every region, restarts
     /// included, before one `cache.login` may try again.
     pub sdk_refusal_retry_seconds: u64,
+    /// A revalidated identity whose last successful `cache.login` is this old is revalidated
+    /// in the background. Each `cache.login` extends the SDK `access_key` to 30 days, so an
+    /// identity whose game session stays up (or that serves no request) does not lapse.
+    pub sdk_keepalive_seconds: u64,
 }
 impl Default for LoginConfig {
     fn default() -> Self {
@@ -64,6 +68,7 @@ impl Default for LoginConfig {
             concurrent_device_limit: 3,
             state_directory: None,
             sdk_refusal_retry_seconds: 86_400,
+            sdk_keepalive_seconds: 20 * 86_400,
         }
     }
 }
@@ -81,6 +86,7 @@ impl LoginConfig {
             || !(60..=86_400).contains(&self.aegis_cooldown_seconds)
             || !(1..=100).contains(&self.concurrent_device_limit)
             || !(3_600..=30 * 86_400).contains(&self.sdk_refusal_retry_seconds)
+            || !(86_400..=28 * 86_400).contains(&self.sdk_keepalive_seconds)
             || self
                 .state_directory
                 .as_ref()

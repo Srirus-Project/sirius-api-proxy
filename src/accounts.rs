@@ -160,6 +160,10 @@ pub struct AccountStatus {
     /// `stale`, `expired` or `refused`.
     #[serde(skip_serializing_if = "Option::is_none")]
     sdk_session: Option<&'static str>,
+    /// Global only: the identity's last successful `cache.login`. The SDK `access_key` lapses
+    /// 30 days after it; `global_login.sdk_keepalive_seconds` revalidates before that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sdk_validated_at: Option<DateTime<Utc>>,
 }
 pub(crate) struct Pool {
     entries: Vec<Arc<Account>>,
@@ -326,6 +330,9 @@ impl Account {
     }
     fn health(&self) -> std::sync::MutexGuard<'_, Health> {
         self.health.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.health().disabled
     }
     pub(crate) fn disable(&self) {
         self.health().disabled = true;
@@ -572,6 +579,10 @@ impl Pool {
             account.revoke_path_failures(streak, policy);
         }
     }
+    /// Every account of the pool, in configuration order.
+    pub(crate) fn all(&self) -> Vec<Arc<Account>> {
+        self.entries.clone()
+    }
     pub(crate) fn find(&self, name: &str) -> Option<Arc<Account>> {
         self.entries.iter().find(|a| a.name == name).cloned()
     }
@@ -646,6 +657,7 @@ impl Pool {
                     last_error_code: None,
                     last_sdk_code: None,
                     sdk_session: None,
+                    sdk_validated_at: None,
                 };
                 if let Some(g) = a.global() {
                     let mut s = g.state();
@@ -666,6 +678,7 @@ impl Pool {
                     status.last_error_code = s.last_error_code.clone();
                     status.last_sdk_code = s.last_sdk_code;
                     status.sdk_session = Some(g.sdk.label(chrono::Utc::now()));
+                    status.sdk_validated_at = g.sdk.validated_at();
                 }
                 status
             })

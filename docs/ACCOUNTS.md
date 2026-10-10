@@ -133,6 +133,7 @@ global_login:
   concurrent_device_limit: 3           # 1..100 CONCURRENT_DEVICE signals per 24 h disable
   state_directory: /var/lib/sirius/sdk-sessions  # optional; SDK sessions survive restarts
   sdk_refusal_retry_seconds: 86400     # 3600..2592000, before a refused identity is retried
+  sdk_keepalive_seconds: 1728000       # 86400..2419200, background cache.login after this long
 ```
 
 Rules checked at startup:
@@ -242,7 +243,9 @@ access key.
 `last_error_code` (an application or SDK code such as `TOKEN_ILLEGAL` or `SDK_CAPTCHA`, never
 text) and, after `SDK_REFUSED`, `last_sdk_code` (the SDK's numeric refusal code, also logged as
 `sdk_code`; it tells an invalidated identity from a risk-control block), and `sdk_session`
-(the identity's shared SDK session: `none`, `valid`, `stale`, `expired` or `refused`). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
+(the identity's shared SDK session: `none`, `valid`, `stale`, `expired` or `refused`), and
+`sdk_validated_at` (the identity's last successful `cache.login`; its SDK `access_key` lapses
+30 days later unless another one follows). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
 or response cache keys. Response cache keys use the account name and SDK uid (hashed), not the
 rotating credential, so a re-login keeps cached public responses.
 
@@ -282,6 +285,27 @@ checks. Since 1.3.3:
   after a restart, on the first authenticated request.
 - Without `state_directory`, sessions and refusals live in memory only and a restart starts
   over.
+
+### SDK keepalive
+
+The SDK `access_key` lapses 30 days after the identity's last `cache.login`, and every
+`cache.login` moves that date to 30 days after the call (the key itself is unchanged; measured
+2026-10-11). The SDK has no refresh token, so this is the only renewal. A region whose game
+session stays up never sends `cache.login`, and an idle deployment sends nothing, so since 1.3.5
+each region with Global accounts checks once an hour (the first check one hour after startup)
+and revalidates an identity whose last successful `cache.login` is `sdk_keepalive_seconds` old
+(default 20 days).
+
+- Only identities this deployment has revalidated before are kept alive. With
+  `state_directory` the time of the last `cache.login` survives restarts, even when the
+  persisted `id_token` has expired; without it, the keepalive starts after the first login of
+  each process.
+- The regions sharing an identity serialize on its revalidation lock and check again after
+  acquiring it, so one identity is revalidated once. The keepalive keeps the game session and
+  counts toward `login_min_interval_seconds` and `max_logins_per_day`; while either forbids a
+  login, or the SDK path is open, it waits for a later check.
+- A refused or disabled identity is never kept alive. A refusal during a keepalive is handled
+  like any other `cache.login` refusal.
 
 Operations: after a deploy, read `GET /internal/v1/<region>/accounts`; it never logs in. Do not
 probe `/internal/v1/<region>/account` in every region, because each probe can log the first

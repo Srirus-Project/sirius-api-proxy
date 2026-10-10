@@ -1461,6 +1461,69 @@ impl GameClient {
             }
         }
     }
+    /// Whether this region's pool holds a Global account (and so may need SDK keepalive).
+    pub fn has_global_accounts(&self) -> bool {
+        self.config.global_login.is_some()
+            && self.sdk.is_some()
+            && self
+                .accounts
+                .lock()
+                .is_ok_and(|pool| pool.all().iter().any(|a| a.global().is_some()))
+    }
+    /// Background SDK keepalive: one `cache.login` of every Global identity of this region whose
+    /// last successful `cache.login` is at least `global_login.sdk_keepalive_seconds` old. The
+    /// game session is kept. Regions sharing the identity serialize on its revalidation lock
+    /// and re-check after acquiring it, so one identity is revalidated once. Refused
+    /// identities, identities never revalidated here, an open SDK path and the login interval
+    /// or daily cap all skip it until a later check. Returns the identities revalidated.
+    pub async fn sdk_keepalive(&self) -> usize {
+        let (Some(login), Some(sdk)) = (&self.config.global_login, &self.sdk) else {
+            return 0;
+        };
+        let interval = chrono::Duration::seconds(login.sdk_keepalive_seconds as i64);
+        let accounts = match self.accounts.lock() {
+            Ok(pool) => pool.all(),
+            Err(_) => return 0,
+        };
+        let mut revalidated = 0;
+        for account in accounts {
+            let Some(g) = account.global() else {
+                continue;
+            };
+            if account.is_disabled() || !g.sdk.keepalive_due(Utc::now(), interval) {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(login.sdk_timeout_ms * 2);
+            let Ok(_revalidation) = tokio::time::timeout_at(deadline, g.sdk.login.lock()).await
+            else {
+                continue;
+            };
+            let Ok(_exclusive) = g.sdk.exclusive(deadline).await else {
+                continue;
+            };
+            // Another region (or process) may have revalidated while this one waited.
+            if !g.sdk.keepalive_due(Utc::now(), interval)
+                || g.state().next_allowed(now, login).is_some()
+            {
+                continue;
+            }
+            if self
+                .revalidate(&account, g, sdk, now, deadline)
+                .await
+                .is_ok()
+            {
+                revalidated += 1;
+                tracing::info!(
+                    account = %account.name,
+                    region = self.config.region.name(),
+                    "Global SDK keepalive cache.login succeeded"
+                );
+            }
+        }
+        revalidated
+    }
     /// Game headers for `account`. A Global account without a session logs in first: SDK
     /// `cache.login` unless the identity's shared session is still valid (another region, or
     /// a persisted session, revalidated it and no TOKEN_* signal or expiry intervened), then

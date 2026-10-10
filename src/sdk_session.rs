@@ -151,6 +151,18 @@ impl SdkSession {
     pub fn completed(&self) {
         self.attempts.fetch_add(1, Ordering::Relaxed);
     }
+    /// When the last successful `cache.login` of the identity happened, if any.
+    pub fn validated_at(&self) -> Option<DateTime<Utc>> {
+        lock(&self.state).validated_at
+    }
+    /// Whether a background `cache.login` should keep the identity alive: it was revalidated
+    /// before (in this process or, with a state directory, before a restart, whether or not
+    /// its id_token is still reusable), at least `interval` ago, and is not refused. An
+    /// identity this deployment never revalidated is left alone.
+    pub fn keepalive_due(&self, now: DateTime<Utc>, interval: chrono::Duration) -> bool {
+        let s = lock(&self.state);
+        s.refusal.is_none() && s.validated_at.is_some_and(|at| now - at >= interval)
+    }
     pub fn revalidations(&self) -> u64 {
         self.revalidations.load(Ordering::Relaxed)
     }
@@ -265,10 +277,12 @@ impl SdkSession {
             s.generation += 1;
             s.stale = false;
             s.refusal = Some(refusal);
-        } else if let (Some(account), Some(at)) = (disk.account, disk.validated_at) {
-            if newer(at) {
+        } else if let Some(at) = disk.validated_at.filter(|at| newer(*at)) {
+            // The time of the last successful cache.login is adopted even when its id_token
+            // can no longer be reused: SDK keepalive is measured from it.
+            s.validated_at = Some(at);
+            if let Some(account) = disk.account {
                 s.account = Some(account);
-                s.validated_at = Some(at);
                 s.generation += 1;
                 s.stale = false;
                 s.refusal = None;
@@ -289,7 +303,7 @@ impl SdkSession {
             access_key_fingerprint: self.access_key_fingerprint.clone(),
             id_token: account.map(|a| a.id_token.clone()).unwrap_or_default(),
             mid: account.and_then(|a| a.mid.clone()),
-            validated_at: account.and(s.validated_at),
+            validated_at: s.validated_at,
             refusal: s.refusal,
         };
         if write_private(file, &persisted).is_err() {
